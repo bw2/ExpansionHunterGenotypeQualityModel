@@ -3,6 +3,8 @@ data/
 data_eval*/
 results/
 model/
+report/
+plots/
 _downloads/
 *.parquet
 *.npz
@@ -20,3 +22,7 @@ __pycache__/
 *.log
 .memory/
 .DS_Store
+
+# Legacy reference code + local code-review artifacts (not committed)
+original/
+.code_review_local/

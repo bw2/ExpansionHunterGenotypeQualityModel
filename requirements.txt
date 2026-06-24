@@ -2,5 +2,4 @@ numpy
 pandas
 pyarrow
 scikit-learn
-joblib
-ijson
+matplotlib
