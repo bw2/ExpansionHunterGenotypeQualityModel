@@ -1,0 +1,22 @@
+# Data + model artifacts — never commit (multi-GB; rebuilt from sources)
+data/
+data_eval*/
+results/
+model/
+_downloads/
+*.parquet
+*.npz
+*.joblib
+*.json.gz
+*.cram
+*.crai
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Logs / scratch / editor
+*.log
+.memory/
+.DS_Store
