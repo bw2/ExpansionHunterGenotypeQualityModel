@@ -53,6 +53,17 @@ class RoundTripTest(unittest.TestCase):
         qreg = M.train_q_median(self.Xtr, self.ttr, self.Xca, self.tca)
         self.assertTrue(np.all(M.predict_lcf(qreg, self.Xca) > 0))
 
+    def test_vectorized_json_inference_matches_sklearn(self):
+        # The vectorized JSON evaluator (used to APPLY the exported model, e.g. on held-out
+        # samples) must reproduce sklearn's predictions through the serialized dict.
+        qreg = M.train_q_median(self.Xtr, self.ttr, self.Xca, self.tca)
+        dmodel = M.train_direction(self.Xtr, self.ytr, self.Xca, self.yca)
+        comp = M.compile_genotyping_regime(M.serialize_genotyping_regime(qreg, dmodel))
+        np.testing.assert_allclose(M.predict_lcf_json(comp, self.Xca),
+                                   M.predict_lcf(qreg, self.Xca), atol=1e-9)
+        np.testing.assert_allclose(M.predict_proba_json(comp, self.Xca),
+                                   M.predict_proba(dmodel, self.Xca), atol=1e-9)
+
 
 if __name__ == "__main__":
     unittest.main()

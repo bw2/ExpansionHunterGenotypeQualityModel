@@ -127,7 +127,14 @@ def _load_truth_tsv(tsv_path, variant):
 
 
 def _join_truth(json_df, tsv_df):
-    """Left-joins truth onto the JSON rows by ``(locus_id, allele_rank)`` (keys asserted unique)."""
+    """Left-joins truth onto the JSON rows by ``(locus_id, allele_rank)`` (keys asserted unique).
+
+    A leading ``chr`` is stripped from both locus ids before the join: some catalogs emit
+    ``chr1-..`` LocusIds in the JSON while the truth TSV uses ``1-..`` (or vice versa), and the
+    two must compare equal.
+    """
+    json_df["locus_id"] = json_df["locus_id"].astype(str).str.replace(r"^chr", "", regex=True)
+    tsv_df["LocusId"] = tsv_df["LocusId"].astype(str).str.replace(r"^chr", "", regex=True)
     assert not json_df.duplicated(["locus_id", "allele_rank"]).any(), \
         "JSON (locus_id, allele_rank) key is not unique"
     assert not tsv_df.duplicated(["LocusId", "allele_rank"]).any(), \
@@ -158,9 +165,6 @@ def build_combo(branch, variant, subdir, sample, cov_label, data_dir, force):
     json_df = pd.DataFrame(rows)
     tsv_df = _load_truth_tsv(tsv_local, variant)
     merged = _join_truth(json_df, tsv_df)
-    merged["sample"] = sample
-    merged["coverage"] = float(int(cov_label.rstrip("x")))  # nominal run coverage
-    merged["source"] = "real"
     merged = merged.drop(columns=["sample_id"])
     for c in merged.select_dtypes("float64").columns:
         merged[c] = merged[c].astype("float32")
@@ -181,17 +185,19 @@ def _chrom_from_locus(locus_id):
     return chrom.where(chrom.isin(VALID_CHROMS))
 
 
-def assemble_branch(data_dir, branch, subdir):
-    """Assembles one branch's per-combo parquets, labels + filters, writes data/parquet/<branch>."""
-    parts = sorted(glob.glob(os.path.join(data_dir, subdir, "*.parquet")))
-    if not parts:
-        print("\n%s branch: no per-combo parquets in %s/ -- skipping" % (branch, subdir))
-        return
-    df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
-    if branch == "quick":
-        df = df[df["genotyping_branch"] == "quick"].reset_index(drop=True)
+def label_and_filter(df):
+    """Adds ``chrom`` + the q/direction labels and drops unusable rows.
 
-    n0 = len(df)
+    Drops chrM/unknown contigs, negative-control loci, missing/non-positive ``eh``/``true``,
+    missing motif, and impure (<0.9) / missing-purity rows, then derives the labels +
+    genotyping-regime routing via ``features.add_labels``. Shared by the training-pool assembly
+    and the held-out-sample benchmark so both apply identical filtering.
+
+    Returns:
+        A ``(kept_df, drop_counts)`` tuple. ``kept_df`` has ``chrom`` + the label columns added and
+        the heavy ``locus_id`` / ``is_negative_locus`` columns dropped.
+    """
+    df = df.copy()
     df["chrom"] = _chrom_from_locus(df["locus_id"])
     eh = pd.to_numeric(df["eh"], errors="coerce")
     true = pd.to_numeric(df["true"], errors="coerce")
@@ -215,6 +221,21 @@ def assemble_branch(data_dir, branch, subdir):
     df = df[keep].reset_index(drop=True)
     features.add_labels(df)
     df = df.drop(columns=[c for c in ("locus_id", "is_negative_locus") if c in df.columns])
+    return df, drops
+
+
+def assemble_branch(data_dir, branch, subdir):
+    """Assembles one branch's per-combo parquets, labels + filters, writes data/parquet/<branch>."""
+    parts = sorted(glob.glob(os.path.join(data_dir, subdir, "*.parquet")))
+    if not parts:
+        print("\n%s branch: no per-combo parquets in %s/ -- skipping" % (branch, subdir))
+        return
+    df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+    if branch == "quick":
+        df = df[df["genotyping_branch"] == "quick"].reset_index(drop=True)
+
+    n0 = len(df)
+    df, drops = label_and_filter(df)
 
     out_path = os.path.join(data_dir, "parquet", "%s.parquet" % branch)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)

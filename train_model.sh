@@ -28,6 +28,14 @@ echo "==== [2/3] train + export model ======================================="
 echo "==== [3/3] evaluate (5-fold CV) + HTML report ========================="
 "$PYTHON" report.py --data-dir "$DATA_DIR" --model "$MODEL_OUT" --cv-train-cap "$CV_TRAIN_CAP"
 
+# Optional external validation: apply the exported model to the 43 held-out HPRC samples and
+# fold the results into the report. Off by default (a ~7-8 GB download). Enable with RUN_HOLDOUT43=1.
+if [ "${RUN_HOLDOUT43:-0}" = "1" ]; then
+  echo "==== [4] external held-out benchmark (43 HPRC samples) ================"
+  "$PYTHON" holdout43.py --model "$MODEL_OUT"
+  "$PYTHON" report.py --data-dir "$DATA_DIR" --model "$MODEL_OUT" --render-only
+fi
+
 echo "======================================================================="
 echo "DONE"
 echo "  model:  $MODEL_OUT"

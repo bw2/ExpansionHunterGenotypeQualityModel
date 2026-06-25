@@ -141,7 +141,6 @@ def extract_variant_rows(variant, locus_result, sample_id):
             "motif_size": motif_size,
             "ref_size_bp": ref_size_bp,
             "num_repeats_in_reference": num_ref,
-            "coverage": locus_result.get("Coverage"),
             "eh": eh,
             "eh_minus_ref": (eh - num_ref) if num_ref is not None else None,
             "ci_start": ci_lo,

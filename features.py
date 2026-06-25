@@ -40,10 +40,35 @@ QUICK_FEATURES = [
 # Full branch adds the two full-only flank-normalized depth columns.
 FULL_FEATURES = QUICK_FEATURES + ["left_flank_norm_depth", "right_flank_norm_depth"]
 
-# Engineered columns and the raw inputs they derive from (NOT present in the parquet
-# as features; rebuilt by ``add_engineered``).
-ENGINEERED_FEATURES = ("ci_asymmetry", "ci_over_eh")
+# Raw CI/eh columns the engineered features derive from (NOT present in the parquet
+# as features; the engineered ci_asymmetry/ci_over_eh are rebuilt by ``add_engineered``).
 ENGINEERED_RAW_INPUTS = ("ci_start", "ci_end", "ci_width", "eh")
+
+# Human-readable definition of every model feature (for the report's glossary).
+FEATURE_DEFINITIONS = {
+    "motif_size": "Repeat-unit length in bp.",
+    "num_repeats_in_reference": "Reference allele size in repeat units (ref_size_bp / motif_size).",
+    "ref_size_bp": "Reference repeat-region length in bp.",
+    "eh": "ExpansionHunter's called allele size (repeat units) -- the label being corrected.",
+    "eh_minus_ref": "eh minus num_repeats_in_reference (expansion/contraction vs the reference).",
+    "allele_rank": "0-based allele index within the genotype (size-sorted).",
+    "ci_width": "Width of EH's genotype confidence interval for this allele (repeats).",
+    "ci_asymmetry": "Engineered: CI skew around the call, ((ci_end-eh)-(eh-ci_start))/(ci_width+1).",
+    "ci_over_eh": "Engineered: relative CI width, ci_width/(eh+1).",
+    "spanning_total": "Total spanning reads at the locus.",
+    "hq_unamb_total": "Total high-quality unambiguous reads at the locus.",
+    "spanning_at_called": "Spanning reads supporting the called size.",
+    "spanning_above_called": "Spanning reads larger than the called size.",
+    "flanking_above_called": "Flanking reads larger than the called size.",
+    "support_frac": "Fraction of spanning reads at the call (spanning_at_called / spanning_total).",
+    "depth": "Per-allele read depth (AlleleQualityMetrics).",
+    "hq_unambiguous_reads": "Per-allele high-quality unambiguous read count.",
+    "strand_bias_phred": "Strand-bias binomial Phred score for this allele.",
+    "mean_inserted_bases": "Mean inserted bases within the repeat for this allele.",
+    "mean_deleted_bases": "Mean deleted bases within the repeat for this allele.",
+    "left_flank_norm_depth": "Left-flank-normalized depth (full branch only).",
+    "right_flank_norm_depth": "Right-flank-normalized depth (full branch only).",
+}
 
 # Direction class coding -- also the output column order of every probability vector.
 OK, TOO_LONG, TOO_SHORT = 0, 1, 2
@@ -155,13 +180,12 @@ def add_labels(df):
     """Adds the q/direction targets and routing columns to a joined frame in place.
 
     Expects numeric-coercible ``eh``, ``true``, ``motif_size``, ``genotyping_branch``
-    and ``spanning_at_called``. Adds ``q``, ``t``, ``allele_bp``, ``tol_repeats``,
+    and ``spanning_at_called``. Adds ``t``, ``allele_bp``, ``tol_repeats``,
     ``dir_code``, ``direction`` and ``genotyping_regime``. Returns the same ``df``.
     """
     eh = pd.to_numeric(df["eh"], errors="coerce").to_numpy(dtype=float)
     true = pd.to_numeric(df["true"], errors="coerce").to_numpy(dtype=float)
     motif = pd.to_numeric(df["motif_size"], errors="coerce").to_numpy(dtype=float)
-    df["q"] = eh / true
     df["t"] = np.log(eh) - np.log(true)
     df["allele_bp"] = (motif * np.round(true)).astype("float32")
     tol = tol_repeats(df["allele_bp"].to_numpy())

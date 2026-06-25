@@ -54,7 +54,7 @@ class EngineeredTest(unittest.TestCase):
 
 class BuildMatrixTest(unittest.TestCase):
     def _raw_row(self):
-        row = {c: 1.0 for c in features.FULL_FEATURES if c not in features.ENGINEERED_FEATURES}
+        row = {c: 1.0 for c in features.FULL_FEATURES if c not in ("ci_asymmetry", "ci_over_eh")}
         row.update({"ci_start": 1.0, "ci_end": 3.0})  # engineered inputs
         return pd.DataFrame([row])
 
@@ -80,7 +80,7 @@ class AddLabelsTest(unittest.TestCase):
                            "genotyping_branch": ["quick", "full"], "spanning_at_called": [4, 0]})
         features.add_labels(df)
         self.assertAlmostEqual(df["t"].iloc[0], 0.0)
-        self.assertAlmostEqual(df["q"].iloc[1], 3.0)
+        self.assertAlmostEqual(df["t"].iloc[1], np.log(3.0))  # eh/true = 30/10 = 3
         # allele_bp = 3 * round(10) = 30 -> tol 0 -> eh==true OK ; row1 dr=+20 -> TOO_LONG
         self.assertEqual(df["dir_code"].iloc[0], features.OK)
         self.assertEqual(df["direction"].iloc[1], "TOO_LONG")

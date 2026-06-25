@@ -7,10 +7,10 @@ units. Truth may be fractional, so every "exact match" is taken against
 
 - ``q_metrics``        -- point accuracy of the LCF-recovered truth
   ``true_pred = eh / LCF`` vs the raw-EH baseline.
-- ``direction_metrics``-- 3-class ``[P_OK, P_TOO_LONG, P_TOO_SHORT]`` log-loss,
-  one-vs-rest ROC-AUCs, calibration error, P_OK accuracy, and the confusion matrix.
+- ``direction_metrics``-- 3-class ``[pOk, pTooLong, pTooShort]`` log-loss,
+  one-vs-rest ROC-AUCs, calibration error, pOk accuracy, and the confusion matrix.
 - ``gated_mae``        -- the deployment metric: raw-EH MAE vs the MAE after
-  applying the LCF only where ``P_OK < 0.5`` (the recommended gate).
+  applying the LCF only where ``pOk < 0.5`` (the recommended gate).
 
 Pure functions, no module-level mutable state.
 """
@@ -70,6 +70,8 @@ def q_metrics(eh, true, true_pred, t_true, t_pred, tol):
         "mae_t": float(np.mean(np.abs(t_true - t_pred))),
         "mae_true": mae_true,
         "mae_eh": mae_eh,
+        "median_ae_true": float(np.median(np.abs(true - true_pred))),
+        "median_ae_eh": float(np.median(np.abs(true - eh))),
         "dist_reduction": float(1.0 - mae_true / mae_eh) if mae_eh > 0 else float("nan"),
         "exact_match_rate": float(np.mean(np.round(true_pred) == np.round(true))),
         "eh_exact_match_rate": float(np.mean(np.round(eh) == np.round(true))),
@@ -83,7 +85,7 @@ def direction_metrics(dir_code, proba):
 
     Args:
         dir_code: Integer labels in ``{0, 1, 2}`` (OK / TOO_LONG / TOO_SHORT).
-        proba: Array ``(n, 3)`` in ``[P_OK, P_TOO_LONG, P_TOO_SHORT]`` order.
+        proba: Array ``(n, 3)`` in ``[pOk, pTooLong, pTooShort]`` order.
 
     Returns:
         Dict with ``n``, ``log_loss``, ``too_long_auc`` / ``too_short_auc``,
@@ -108,13 +110,13 @@ def direction_metrics(dir_code, proba):
 
 
 def gated_mae(eh, true, true_pred, p_ok, gate=0.5):
-    """Returns raw-EH MAE vs gated-LCF-corrected MAE (apply LCF only where P_OK < gate).
+    """Returns raw-EH MAE vs gated-LCF-corrected MAE (apply LCF only where pOk < gate).
 
     Args:
         eh: Raw EH allele calls.
         true: Truth allele sizes.
         true_pred: LCF-recovered truth ``eh / LCF``.
-        p_ok: Direction-head ``P_OK`` per allele.
+        p_ok: Direction-head ``pOk`` per allele.
         gate: Apply the correction only where ``p_ok < gate``.
 
     Returns:
