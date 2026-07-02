@@ -35,6 +35,7 @@ QUICK_FEATURES = [
     "support_frac",
     "depth", "hq_unambiguous_reads", "strand_bias_phred",
     "mean_inserted_bases", "mean_deleted_bases",
+    "reference_repeat_purity", "read_repeat_purity",
 ]
 
 # Full branch adds the two full-only flank-normalized depth columns.
@@ -50,7 +51,7 @@ FEATURE_DEFINITIONS = {
     "num_repeats_in_reference": "Reference allele size in repeat units (ref_size_bp / motif_size).",
     "ref_size_bp": "Reference repeat-region length in bp.",
     "eh": "ExpansionHunter's called allele size (repeat units) -- the label being corrected.",
-    "eh_minus_ref": "eh minus num_repeats_in_reference (expansion/contraction vs the reference).",
+    "eh_minus_ref": "Called allele size minus num_repeats_in_reference (expansion/contraction vs the reference).",
     "allele_rank": "0-based allele index within the genotype (size-sorted).",
     "ci_width": "Width of EH's genotype confidence interval for this allele (repeats).",
     "ci_asymmetry": "Engineered: CI skew around the call, ((ci_end-eh)-(eh-ci_start))/(ci_width+1).",
@@ -66,6 +67,8 @@ FEATURE_DEFINITIONS = {
     "strand_bias_phred": "Strand-bias binomial Phred score for this allele.",
     "mean_inserted_bases": "Mean inserted bases within the repeat for this allele.",
     "mean_deleted_bases": "Mean deleted bases within the repeat for this allele.",
+    "reference_repeat_purity": "Fraction of the reference repeat region matching a perfect motif tiling (0-1).",
+    "read_repeat_purity": "Pooled base-weighted fraction of this allele's in-repeat read bases matching the motif (0-1).",
     "left_flank_norm_depth": "Left-flank-normalized depth (full branch only).",
     "right_flank_norm_depth": "Right-flank-normalized depth (full branch only).",
 }

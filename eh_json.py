@@ -31,6 +31,21 @@ BRANCH_QUICK = "quick"
 _COUNTS_RE = re.compile(r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)")
 _REGION_RE = re.compile(r"^([^:]+):(\d+)-(\d+)$")
 
+# The raw ExpansionHunter output JSON fields this parser reads (for the report): per-variant
+# top-level fields and per-allele ``AlleleQualityMetrics.Alleles[].<field>`` values. Field names are
+# leaf names. Source of truth for the field names is ``extract_variant_rows`` below.
+EH_OUTPUT_FIELDS = [
+    ("ReferenceRepeatPurity", "Per-variant: fraction of the reference repeat region matching a perfect motif tiling."),
+    ("Depth", "Per-allele read depth."),
+    ("HighQualityUnambiguousReads", "Per-allele high-quality unambiguous read count."),
+    ("StrandBiasBinomialPhred", "Strand-bias binomial Phred score."),
+    ("MeanInsertedBasesWithinRepeats", "Mean inserted bases within the repeat."),
+    ("MeanDeletedBasesWithinRepeats", "Mean deleted bases within the repeat."),
+    ("ReadRepeatPurity", "Per-allele: pooled base-weighted fraction of in-repeat read bases matching the motif."),
+    ("LeftFlankNormalizedDepth", "Left-flank-normalized depth (full genotyper only)."),
+    ("RightFlankNormalizedDepth", "Right-flank-normalized depth (full genotyper only)."),
+]
+
 
 def _open(path):
     """Opens ``path`` for text reading, transparently decompressing ``.gz``."""
@@ -113,6 +128,7 @@ def extract_variant_rows(variant, locus_result, sample_id):
     branch = BRANCH_QUICK if bool(variant.get("QuickGenotype", False)) else BRANCH_FULL
     repeat_unit = variant.get("RepeatUnit") or ""
     motif_size = len(repeat_unit) or None
+    reference_repeat_purity = variant.get("ReferenceRepeatPurity")
     _, start, end = parse_reference_region(variant.get("ReferenceRegion"))
     ref_size_bp = (end - start) if (start is not None and end is not None) else None
     num_ref = (ref_size_bp / motif_size) if (ref_size_bp and motif_size) else None
@@ -139,6 +155,7 @@ def extract_variant_rows(variant, locus_result, sample_id):
             "sample_id": sample_id,
             "allele_rank": rank,
             "motif_size": motif_size,
+            "reference_repeat_purity": reference_repeat_purity,
             "ref_size_bp": ref_size_bp,
             "num_repeats_in_reference": num_ref,
             "eh": eh,
@@ -157,6 +174,7 @@ def extract_variant_rows(variant, locus_result, sample_id):
             "strand_bias_phred": aqm.get("StrandBiasBinomialPhred"),
             "mean_inserted_bases": aqm.get("MeanInsertedBasesWithinRepeats"),
             "mean_deleted_bases": aqm.get("MeanDeletedBasesWithinRepeats"),
+            "read_repeat_purity": aqm.get("ReadRepeatPurity"),
             "genotyping_branch": branch,
         }
         if branch == BRANCH_FULL:
