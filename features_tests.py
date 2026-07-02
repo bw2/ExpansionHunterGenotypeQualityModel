@@ -62,12 +62,12 @@ class BuildMatrixTest(unittest.TestCase):
         X, names = features.build_matrix(self._raw_row(), "full")
         self.assertEqual(names, features.FULL_FEATURES)
         self.assertEqual(list(X.columns), features.FULL_FEATURES)
-        self.assertEqual(X.shape[1], 22)
+        self.assertEqual(X.shape[1], 24)
 
     def test_quick_count(self):
         _, names = features.build_matrix(self._raw_row(), "quick")
         self.assertEqual(names, features.QUICK_FEATURES)
-        self.assertEqual(len(names), 20)
+        self.assertEqual(len(names), 22)
 
     def test_bad_branch(self):
         with self.assertRaises(ValueError):

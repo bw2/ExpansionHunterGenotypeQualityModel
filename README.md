@@ -79,9 +79,12 @@ change.
 
 `holdout43.py` loads the exported model from its `.json.gz` (the exact format ExpansionHunter
 consumes) and **applies it unchanged — no re-fitting** — to 43 HPRC short-read samples absent from the
-training pool, scoring against their truth. It writes `report/holdout43.json`, which `report.py` folds
-into the report as an "external held-out validation" section. Run via `RUN_HOLDOUT43=1 ./train_model.sh`
-or directly: `python3 holdout43.py --model <model.json.gz>` (a ~7-8 GB download).
+training pool, scoring against their truth. `holdout43.py` itself writes a standalone
+`report/holdout43.json` benchmark dump; the report's held-out-43 section is generated separately by
+`gen_datasets.py --dataset heldout43` (which reuses `holdout43.run_eval` to emit the
+`report/eval_heldout43.json` / `report/stacked_heldout43.json` artifacts `report.py` reads). Run the
+whole chain via `RUN_HOLDOUT43=1 ./train_model.sh` (builds the parquets, runs `gen_datasets.py`, then
+re-renders the report); a ~7-8 GB download.
 
 ## Tests
 

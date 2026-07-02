@@ -33,6 +33,11 @@ SEED = 20260616
 FORMAT_VERSION = 2
 
 
+def _reject_nonfinite(tok):
+    """``json.loads`` ``parse_constant`` hook: fail if the model JSON carries Infinity/NaN tokens."""
+    raise ValueError("model JSON contains non-finite token %r (invalid standard JSON)" % tok)
+
+
 def _default_out():
     """Returns the default dated output path (today's date)."""
     today = datetime.date.today().strftime("%Y%m%d")
@@ -112,11 +117,13 @@ def main():
              "genotyping_regimes": genotyping_regimes_json}
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    blob = json.dumps(model, separators=(",", ":")).encode()
+    # allow_nan=False => raise rather than emit non-standard Infinity/NaN tokens (the serializer
+    # clamps sklearn's +/-inf split thresholds; this guards anything else slipping through).
+    blob = json.dumps(model, separators=(",", ":"), allow_nan=False).encode()
     with gzip.open(args.out, "wb", compresslevel=9) as f:
         f.write(blob)
     with gzip.open(args.out, "rb") as f:
-        json.loads(f.read())  # confirm it reloads
+        json.loads(f.read(), parse_constant=_reject_nonfinite)  # confirm it reloads + is finite
     print("\nwrote %s (%d quick / %d full features, json %d bytes, gz %d bytes)"
           % (args.out, len(feat_names["quick"]), len(feat_names["full"]), len(blob),
              os.path.getsize(args.out)), flush=True)

@@ -1,0 +1,157 @@
+"""Generate the per-dataset evaluation artifacts that feed the report's dataset pill.
+
+For each dataset (HG002 genome 31x / HG002 exome 3x / the 43 held-out HPRC samples) this writes:
+  - ``report/eval_<key>.json`` + ``report/eval_<key>_violin.npz`` -- the apply-based eval (MAE,
+    helped/hurt, by-pOk / pdiff / LCF violins), via ``holdout43.run_eval``.
+  - ``report/stacked_<key>.json`` -- the stacked "accuracy by true allele size" counts (raw +
+    LCF-corrected, each split non-homopolymer / homopolymer), via ``accuracy_by_size``.
+
+The deployed model is applied unchanged (no fitting). Run one dataset at a time (foreground) so the
+heavy model-apply survives the environment's background-job limits. Coding rules: no type hints,
+Google docstrings, ``print()``.
+"""
+
+import argparse
+import glob
+import json
+import os
+
+import numpy as np
+import pandas as pd
+
+import accuracy_by_size as A
+import holdout43
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TOOL = "EHv5-bw2-optimized"
+_TSV = "*.for_comparison.with_%s_vs_Truth_columns.alleles.tsv.gz" % TOOL
+
+
+def _heldout_parquets():
+    """Returns the per-sample parquets for the 43 held-out HPRC samples.
+
+    Their for-comparison TSVs aren't cached and their catalog/coverage vary per sample, so the
+    held-out accuracy-by-size is computed straight from the parquets via
+    ``accuracy_by_size.categorize_parquet`` (No-Call alleles aren't present in the parquet, hence not
+    shown for held-out -- a tiny fraction for short-read WGS).
+    """
+    return sorted(glob.glob(os.path.join(HERE, "data_eval_43", "real_43", "*.parquet")))
+
+
+# key -> {label, coverage_label, motif descriptions, list of (parquet, tsv) pairs}.
+def datasets():
+    return {
+        "hg002_genome": {
+            "label": "HG002 genome (31x)", "coverage_label": "31x Illumina Genome data",
+            "pairs": [(os.path.join(HERE, "data/real_quick/HG002_31x.parquet"),
+                       os.path.join(HERE, "data/real_quick/_downloads/HG002_31x",
+                                    "HG002.tandem_repeat_genotypes.for_comparison."
+                                    "with_%s_vs_Truth_columns.alleles.tsv.gz" % TOOL))]},
+        "hg002_exome": {
+            "label": "HG002 exome (3x)", "coverage_label": "3x Illumina exome data",
+            "pairs": [(os.path.join(HERE, "data_eval_misc/HG002_exome_3x.parquet"),
+                       os.path.join(HERE, "data_eval_misc/_downloads/HG002_exome_3x",
+                                    "HG002.tandem_repeat_genotypes.for_comparison."
+                                    "with_%s_vs_Truth_columns.alleles.tsv.gz" % TOOL))]},
+        "heldout43": {
+            "label": "43 held-out HPRC samples",
+            "coverage_label": "43 held-out HPRC samples (short-read WGS)",
+            "parquet_only": True, "no_call_note": " (No-Call alleles not shown)",
+            "parquets": _heldout_parquets()},
+    }
+
+
+def gen_stacked(spec, model_path, out_json, corrected_cap):
+    """Builds the stacked accuracy-by-size counts (raw + each LCF-correction variant, non-homo + homo).
+
+    TSV-based datasets (HG002 genome / exome) categorize each (parquet, TSV) pair via ``categorize_tsv``
+    + model-prediction join (keeps the join within a sample, since LocusIds collide across samples).
+    Parquet-only datasets (the 43 held-out pool, whose TSVs aren't cached) categorize each parquet via
+    ``categorize_parquet`` (model applied row-aligned, No-Call absent). Either way the per-sample
+    category counts are ACCUMULATED (additive) rather than concatenated, so a 43-sample pool stays
+    bounded in memory. ``corrected_cap`` caps the model apply per parquet; ``None`` = all alleles.
+
+    The JSON nests ``out[homo|nonhomo][correction_variant][purity_variant]``: each
+    ``A.CORRECTION_VARIANTS`` key (``raw`` reads the ``category`` column, every gated variant its
+    ``category__<key>`` column) crossed with each ``A.PURITY_VARIANTS`` key (``off`` = all alleles, the
+    filtered key keeps only alleles above its truth-purity threshold).
+    """
+    nb = len(A.X_LABELS)
+    variants = [(key, "category" if gate is None else "category__" + key)
+                for key, _, _, gate in A.CORRECTION_VARIANTS]
+    purities = [(pk, pmin) for pk, _, pmin in A.PURITY_VARIANTS]
+    acc = {(h, vk, pk): {"counts": {cat: np.zeros(nb, int) for cat in A.CATEGORIES},
+                         "alleles_per_bin": np.zeros(nb, int), "same": 0, "total": 0, "loci": set()}
+           for h in (False, True) for vk, _ in variants for pk, _ in purities}
+
+    def fold(m, src):
+        for h in (False, True):
+            for vk, col in variants:
+                for pk, pmin in purities:
+                    bc = A.bin_counts(m, col, h, purity_min=pmin)
+                    a = acc[(h, vk, pk)]
+                    for cat in A.CATEGORIES:
+                        a["counts"][cat] += np.asarray(bc["counts"][cat], int)
+                    a["alleles_per_bin"] += np.asarray(bc["alleles_per_bin"], int)
+                    a["same"] += bc["same"]
+                    a["total"] += bc["total"]
+                    a["loci"].update(bc["loci"])  # union distinct loci across samples (catalog loci repeat across the 43 held-out samples)
+        print("  stacked: %s (%d alleles)" % (src, len(m)), flush=True)
+
+    if spec.get("parquet_only"):
+        for p in spec["parquets"]:
+            fold(A.categorize_parquet(p, model_path, corrected_cap=corrected_cap), os.path.basename(p))
+    else:
+        for parquet, tsv in spec["pairs"]:
+            preds = A.predict_lcf_pok([parquet], model_path, cap=corrected_cap)
+            fold(A.add_corrected_categories(A.categorize_tsv(tsv, TOOL), preds), os.path.basename(parquet))
+
+    out = {"label": spec["label"], "coverage_label": spec["coverage_label"],
+           "tool_label": A.TITLE_TOOL_LABELS[TOOL]}
+    if spec.get("no_call_note"):
+        out["no_call_note"] = spec["no_call_note"]
+    for homo, name in ((False, "nonhomo"), (True, "homo")):
+        out[name] = {}
+        for vk, _ in variants:
+            out[name][vk] = {}
+            for pk, _ in purities:
+                a = acc[(homo, vk, pk)]
+                out[name][vk][pk] = {
+                    "counts": {cat: a["counts"][cat].tolist() for cat in A.CATEGORIES},
+                    "alleles_per_bin": a["alleles_per_bin"].tolist(),
+                    "same": int(a["same"]), "total": int(a["total"]),
+                    "total_loci": int(len(a["loci"]))}
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
+    with open(out_json, "w") as f:
+        json.dump(out, f)
+    print("wrote %s" % out_json, flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", required=True, choices=list(datasets().keys()))
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--out-dir", default=os.path.join(HERE, "report"))
+    parser.add_argument("--eval-cap", type=int, default=30000,
+                        help="per-parquet allele cap for the apply-based eval (violins/MAE)")
+    parser.add_argument("--corrected-cap", type=int, default=400000,
+                        help="per-parquet allele cap for the stacked LCF-corrected apply (0 = all)")
+    parser.add_argument("--skip-eval", action="store_true",
+                        help="only (re)generate the stacked-bar JSON")
+    args = parser.parse_args()
+
+    spec = datasets()[args.dataset]
+    parquets = spec["parquets"] if spec.get("parquet_only") else [p for p, _ in spec["pairs"]]
+    print("==== dataset %s: %d parquet(s) ====" % (args.dataset, len(parquets)), flush=True)
+
+    if not args.skip_eval:
+        holdout43.run_eval(parquets, args.model,
+                           os.path.join(args.out_dir, "eval_%s.json" % args.dataset), args.eval_cap)
+
+    print("\n==== stacked accuracy-by-size: %s ====" % args.dataset, flush=True)
+    gen_stacked(spec, args.model, os.path.join(args.out_dir, "stacked_%s.json" % args.dataset),
+                args.corrected_cap or None)
+
+
+if __name__ == "__main__":
+    main()

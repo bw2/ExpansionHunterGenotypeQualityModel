@@ -202,6 +202,27 @@ def predict_proba(model, X):
 
 # --- serialization to the C++ schema --------------------------------------
 
+# sklearn HistGradientBoosting marks "missing-only" split nodes with a +/-inf num_threshold (every
+# non-missing value routes one way, missing the other). Standard JSON has no Infinity, so serialize
+# those as a large finite sentinel: every real feature value is far below it, so the `x <= threshold`
+# routing is byte-for-byte identical, but the JSON is valid for any strict parser (incl. the C++ one).
+_FINITE_CLAMP = 3.0e38  # < float32 max (3.4e38), so the C++ reader keeps it finite even as a 32-bit float
+
+
+def _finite_threshold(v):
+    """Clamps a non-finite split threshold to +/- ``_FINITE_CLAMP``; finite values pass through.
+
+    NaN is intentionally left as-is so ``json.dumps(allow_nan=False)`` rejects it loudly rather than a
+    bad threshold slipping through silently.
+    """
+    v = float(v)
+    if v == np.inf:
+        return _FINITE_CLAMP
+    if v == -np.inf:
+        return -_FINITE_CLAMP
+    return v
+
+
 def _ser_tree(pred):
     """Serializes one sklearn TreePredictor to the schema's flat node array."""
     nodes = []
@@ -210,7 +231,7 @@ def _ser_tree(pred):
             nodes.append({"leaf": True, "value": float(nd["value"])})
         else:
             nodes.append({"feature": int(nd["feature_idx"]),
-                          "threshold": float(nd["num_threshold"]),
+                          "threshold": _finite_threshold(nd["num_threshold"]),
                           "missing_left": bool(nd["missing_go_to_left"]),
                           "left": int(nd["left"]), "right": int(nd["right"])})
     return {"nodes": nodes}

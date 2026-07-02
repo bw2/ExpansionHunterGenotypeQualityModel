@@ -9,8 +9,12 @@ some samples, apply to new samples" test. A single optimized-streaming source pe
 ``full_spanning`` / ``full_nonspanning``.
 
 corrected call = ``eh / LCF`` (q-median head); the gate applies it only where ``pOk < 0.5``
-(direction head), else keeps raw EH. Metrics are accumulated as running sums so the tens of millions
-of ``quick`` rows never sit in RAM at once. Writes ``report/holdout43.json`` for the report section.
+(direction head), else keeps raw EH. The MAE is a running sum, but the exact pooled median retains
+every kept allele's ``|error|`` in RAM (bounded by ``--max-alleles-per-sample``), so peak memory grows
+with the total kept alleles. ``main()`` writes a standalone ``report/holdout43.json`` benchmark dump.
+The report's held-out-43 section is NOT fed from that file -- it is produced by
+``gen_datasets.py --dataset heldout43``, which reuses ``run_eval`` here to emit the
+``report/eval_heldout43.json`` / ``report/stacked_heldout43.json`` artifacts ``report.py`` consumes.
 
 Coding rules: no type hints, Google docstrings, ``print()``, ``gcloud`` (macOS).
 """
@@ -100,19 +104,38 @@ def _new_acc():
     # sum_* feed the MAE; err_* hold the per-allele |error| (float32) for an exact pooled median;
     # helped_*/hurt_*/n_* count, per pOk stratum, how many alleles the LCF would move closer to
     # (helped) / further from (hurt) the truth than raw EH -- evaluated on EVERY allele, so the
-    # pOk>=0.5 stratum shows what the gate avoids by keeping raw EH there. For the violins,
-    # red/pok/lcf_all are a capped per-allele sample of (signed error reduction, pOk, predicted LCF)
-    # over the FULL pOk range, so any later stratification (pOk threshold, LCF bin) is derived from these.
+    # pOk>=0.5 stratum shows what the gate avoids by keeping raw EH there. Homopolymer (1 bp motif)
+    # loci are EXCLUDED from every scalar metric and from the red/pok/lcf violin sample (they are
+    # summarized on their own in the by-motif-size violins); only the mred/mpok/motif sample keeps
+    # them. red/pok/lcf_all = capped per-allele (signed error reduction, pOk, predicted LCF) over the
+    # full pOk range (non-homopolymer); mred/mpok/motif_all = the same reduction + pOk + motif size in
+    # bp over ALL loci, for the by-motif-size violins.
+    # h_* are the homopolymer-only (1 bp motif) counterparts of n/sum_db/sum_da/err, for the separate
+    # homopolymer MAE bar chart (everything else above is non-homopolymer).
+    # pdiff_all / h_pdiff_all = per-allele direction-head lean (pTooLong - pTooShort), strided +
+    # per-sample capped exactly like red/pok/lcf, for the by-lean error-reduction violins.
     return dict(n=0, sum_db=0.0, sum_da=0.0, ex_eh=0, ex_gated=0, pok_correct=0, err_raw=[], err_gated=[],
                 n_lt=0, helped_lt=0, hurt_lt=0, n_ge=0, helped_ge=0, hurt_ge=0,
-                red_all=[], pok_all=[], lcf_all=[])
+                red_all=[], pok_all=[], lcf_all=[], pdiff_all=[], mred_all=[], mpok_all=[], motif_all=[],
+                h_n=0, h_sum_db=0.0, h_sum_da=0.0, h_err_raw=[], h_err_gated=[],
+                h_n_lt=0, h_helped_lt=0, h_hurt_lt=0, h_n_ge=0, h_helped_ge=0, h_hurt_ge=0,
+                h_red_all=[], h_pok_all=[], h_lcf_all=[], h_pdiff_all=[])
+
+
+def _strided(a, idx):
+    return a[idx][:VIOLIN_PER_SAMPLE].astype(np.float32)
 
 
 def _accumulate(acc, sub, comp, branch):
-    """Folds one sample's rows (one genotyping regime) into the running accumulator (gated correction)."""
+    """Folds one sample's rows (one genotyping regime) into the running accumulator (gated correction).
+
+    Homopolymer (1 bp motif) loci are dropped from every scalar metric and the red/pok/lcf violin
+    sample; only the by-motif-size sample (mred/mpok/motif) retains them.
+    """
     X, _ = features.build_matrix(sub, branch)
     eh = sub["eh"].to_numpy(float)
     true = sub["true"].to_numpy(float)
+    motif = sub["motif_size"].to_numpy(float)
     lcf = M.predict_lcf_json(comp, X)
     true_pred = eh / lcf
     proba = M.predict_proba_json(comp, X)
@@ -120,6 +143,46 @@ def _accumulate(acc, sub, comp, branch):
     corrected = np.where(p_ok < 0.5, true_pred, eh)        # gate: correct only low-confidence calls
     d_raw = np.abs(true - eh)
     d_gated = np.abs(true - corrected)
+    d_corr = np.abs(true - true_pred)                      # ungated correction (helped/hurt + reduction)
+    red = d_raw - d_corr                                   # signed error reduction (>0 = corrected closer)
+
+    # By-motif-size violin sample: keep ALL loci (incl. homopolymers). Strided => bounded, deterministic.
+    midx = slice(None) if red.size <= VIOLIN_PER_SAMPLE else slice(None, None, red.size // VIOLIN_PER_SAMPLE)
+    acc["mred_all"].append(_strided(red, midx))
+    acc["mpok_all"].append(_strided(p_ok, midx))
+    acc["motif_all"].append(_strided(motif, midx))
+
+    # Homopolymer-only (1 bp motif) MAE accumulation (for the separate homopolymer bar chart).
+    homo = motif == 1
+    if homo.any():
+        acc["h_n"] += int(homo.sum())
+        acc["h_sum_db"] += float(d_raw[homo].sum())
+        acc["h_sum_da"] += float(d_gated[homo].sum())
+        acc["h_err_raw"].append(d_raw[homo].astype(np.float32))
+        acc["h_err_gated"].append(d_gated[homo].astype(np.float32))
+        # Homopolymer helped/hurt by pOk stratum (ungated d_corr vs raw EH, mirrors the non-homo block).
+        h_lt = p_ok[homo] < 0.5
+        h_db, h_da = d_raw[homo], d_corr[homo]
+        for tag, mask in (("lt", h_lt), ("ge", ~h_lt)):
+            acc["h_n_%s" % tag] += int(mask.sum())
+            acc["h_helped_%s" % tag] += int((h_da[mask] < h_db[mask] - EPS).sum())
+            acc["h_hurt_%s" % tag] += int((h_da[mask] > h_db[mask] + EPS).sum())
+        # Homopolymer violin sample: (signed reduction, pOk, predicted LCF), strided + per-sample capped.
+        hred, hpok, hlcf = red[homo], p_ok[homo], lcf[homo]
+        hidx = slice(None) if hred.size <= VIOLIN_PER_SAMPLE else slice(None, None, hred.size // VIOLIN_PER_SAMPLE)
+        acc["h_red_all"].append(_strided(hred, hidx))
+        acc["h_pok_all"].append(_strided(hpok, hidx))
+        acc["h_lcf_all"].append(_strided(hlcf, hidx))
+        acc["h_pdiff_all"].append(_strided(proba[homo, 1] - proba[homo, 2], hidx))
+
+    # Everything else EXCLUDES homopolymer (1 bp motif) loci.
+    keep = motif != 1
+    if not keep.any():
+        return
+    eh, true, corrected = eh[keep], true[keep], corrected[keep]
+    d_raw, d_gated, d_corr, red = d_raw[keep], d_gated[keep], d_corr[keep], red[keep]
+    proba, p_ok, lcf = proba[keep], p_ok[keep], lcf[keep]
+    dir_code = sub["dir_code"].to_numpy(int)[keep]
     acc["n"] += int(eh.size)
     acc["sum_db"] += float(d_raw.sum())
     acc["sum_da"] += float(d_gated.sum())
@@ -127,31 +190,41 @@ def _accumulate(acc, sub, comp, branch):
     acc["err_gated"].append(d_gated.astype(np.float32))
     acc["ex_eh"] += int((np.round(eh) == np.round(true)).sum())
     acc["ex_gated"] += int((np.round(corrected) == np.round(true)).sum())
-    acc["pok_correct"] += int((np.argmax(proba, axis=1) == sub["dir_code"].to_numpy(int)).sum())
+    acc["pok_correct"] += int((np.argmax(proba, axis=1) == dir_code).sum())
     # Would the LCF-corrected call (eh/LCF) be closer (helped) or further (hurt) than raw EH?
-    # Computed on every allele, then split by pOk stratum: pOk<0.5 is where the gate APPLIES the
-    # correction; pOk>=0.5 is where it KEEPS raw EH (so its hurt count is the regret avoided).
-    d_corr = np.abs(true - true_pred)
+    # Computed on every (non-homopolymer) allele, then split by pOk stratum: pOk<0.5 is where the gate
+    # APPLIES the correction; pOk>=0.5 is where it KEEPS raw EH (so its hurt count is the regret avoided).
     lt = p_ok < 0.5
     for tag, mask in (("lt", lt), ("ge", ~lt)):
         db, da = d_raw[mask], d_corr[mask]
         acc["n_%s" % tag] += int(mask.sum())
         acc["helped_%s" % tag] += int((da < db - EPS).sum())
         acc["hurt_%s" % tag] += int((da > db + EPS).sum())
-    # Violin samples (signed error reduction = |raw err| - |corrected err|, >0 = corrected closer):
-    # keep (reduction, pOk, LCF) over the full pOk range so any later stratification is
-    # derived from these. Strided subsample => bounded, deterministic spread.
-    red = d_raw - d_corr
+    # Violin samples (non-homopolymer): (reduction, pOk, LCF) over the full pOk range.
     idx = slice(None) if red.size <= VIOLIN_PER_SAMPLE else slice(None, None, red.size // VIOLIN_PER_SAMPLE)
-    acc["red_all"].append(red[idx][:VIOLIN_PER_SAMPLE].astype(np.float32))
-    acc["pok_all"].append(p_ok[idx][:VIOLIN_PER_SAMPLE].astype(np.float32))
-    acc["lcf_all"].append(lcf[idx][:VIOLIN_PER_SAMPLE].astype(np.float32))
+    acc["red_all"].append(_strided(red, idx))
+    acc["pok_all"].append(_strided(p_ok, idx))
+    acc["lcf_all"].append(_strided(lcf, idx))
+    acc["pdiff_all"].append(_strided(proba[:, 1] - proba[:, 2], idx))
+
+
+def _homopolymer_summary(acc):
+    """Homopolymer-only (1 bp motif) MAE summary for the separate bar chart."""
+    hn = acc["h_n"]
+    if hn == 0:
+        return {"n": 0}
+    return {"n": hn,
+            "mae_raw": acc["h_sum_db"] / hn, "mae_gated": acc["h_sum_da"] / hn,
+            "median_raw": float(np.median(np.concatenate(acc["h_err_raw"]))),
+            "median_gated": float(np.median(np.concatenate(acc["h_err_gated"]))),
+            "n_pok_lt": acc["h_n_lt"], "helped_lt": acc["h_helped_lt"], "hurt_lt": acc["h_hurt_lt"],
+            "n_pok_ge": acc["h_n_ge"], "helped_ge": acc["h_helped_ge"], "hurt_ge": acc["h_hurt_ge"]}
 
 
 def _finalize(acc, n_samples):
     n = acc["n"]
     if n == 0:
-        return {"n": 0}
+        return {"n": 0, "homopolymer": _homopolymer_summary(acc)}
     mae_raw, mae_gated = acc["sum_db"] / n, acc["sum_da"] / n
     return {
         "n": n, "n_samples": n_samples,
@@ -163,7 +236,64 @@ def _finalize(acc, n_samples):
         "p_ok_accuracy": acc["pok_correct"] / n,
         "n_pok_lt": acc["n_lt"], "helped_lt": acc["helped_lt"], "hurt_lt": acc["hurt_lt"],
         "n_pok_ge": acc["n_ge"], "helped_ge": acc["helped_ge"], "hurt_ge": acc["hurt_ge"],
+        "homopolymer": _homopolymer_summary(acc),
     }
+
+
+def run_eval(paths, model_path, out_json, max_alleles):
+    """Applies the exported model to ``paths`` (per-allele parquets) and writes ``out_json`` + its
+    ``*_violin.npz``; returns the metrics dict.
+
+    Shared by the 43-sample benchmark and the per-dataset (HG002 genome / HG002 exome) evaluations so
+    every dataset produces identical artifacts (scalar metrics JSON + the violin/pdiff/lcf npz). No
+    fitting -- the deployed model is loaded from its ``.json[.gz]`` and applied with the ``pOk<0.5``
+    gate.
+    """
+    print("\n==== load + compile the exported model: %s ====" % os.path.basename(model_path), flush=True)
+    model_json = M.load(model_path)["genotyping_regimes"]
+    compiled = {r: (M.compile_genotyping_regime(model_json[r]), features.GENOTYPING_REGIME_BRANCH[r])
+                for r in features.GENOTYPING_REGIMES}
+
+    acc = {r: _new_acc() for r in features.GENOTYPING_REGIMES}
+    cap = max_alleles or None
+    print("\n==== predict + gate on %d parquet(s) (no fitting, cap %s alleles/sample) ===="
+          % (len(paths), cap or "none"), flush=True)
+    for p in paths:
+        df, _ = dataset.label_and_filter(pd.read_parquet(p))
+        if cap and len(df) > cap:
+            df = df.sample(cap, random_state=20260616).reset_index(drop=True)
+        for regime in features.GENOTYPING_REGIMES:
+            sub = df[df["genotyping_regime"] == regime]
+            if not sub.empty:
+                _accumulate(acc[regime], sub, *compiled[regime])
+        print("  %s done" % os.path.basename(p), flush=True)
+
+    out = {"n_samples": len(paths), "max_alleles_per_sample": cap,
+           "genotyping_regimes": {r: _finalize(acc[r], len(paths)) for r in features.GENOTYPING_REGIMES}}
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
+    with open(out_json, "w") as f:
+        json.dump(out, f, indent=2)
+    # Violin samples per genotyping regime: red/pok/lcf/pdiff are non-homopolymer; mred/mpok/motif keep
+    # ALL loci (the by-motif-size violins); h* are the homopolymer-only counterparts.
+    def _cat(key, r):
+        return np.concatenate(acc[r][key]) if acc[r][key] else np.zeros(0, np.float32)
+    violin = {}
+    for r in features.GENOTYPING_REGIMES:
+        for short, key in (("red", "red_all"), ("pok", "pok_all"), ("lcf", "lcf_all"),
+                           ("pdiff", "pdiff_all"),
+                           ("mred", "mred_all"), ("mpok", "mpok_all"), ("motif", "motif_all"),
+                           ("hred", "h_red_all"), ("hpok", "h_pok_all"), ("hlcf", "h_lcf_all"),
+                           ("hpdiff", "h_pdiff_all")):
+            violin["%s__%s" % (r, short)] = _cat(key, r)
+    np.savez_compressed(os.path.splitext(out_json)[0] + "_violin.npz", **violin)
+    print("\nwrote %s" % out_json, flush=True)
+    for r in features.GENOTYPING_REGIMES:
+        m = out["genotyping_regimes"][r]
+        if m.get("n"):
+            print("  %-18s n=%-9d raw MAE %.3f -> gated %.3f (distred %+.1f%%)  median|err| %.3f->%.3f"
+                  % (r, m["n"], m["mae_raw"], m["mae_gated"], 100 * m["dist_reduction"],
+                     m["median_raw"], m["median_gated"]), flush=True)
+    return out
 
 
 def main():
@@ -188,48 +318,9 @@ def main():
     if args.build_only:
         return
 
-    print("\n==== load + compile the exported model: %s ====" % os.path.basename(args.model), flush=True)
-    model_json = M.load(args.model)["genotyping_regimes"]
-    compiled = {r: (M.compile_genotyping_regime(model_json[r]), features.GENOTYPING_REGIME_BRANCH[r])
-                for r in features.GENOTYPING_REGIMES}
-
-    acc = {r: _new_acc() for r in features.GENOTYPING_REGIMES}
-    cap = args.max_alleles_per_sample or None
     paths = sorted(p for p in (os.path.join(args.data_dir, "real_43", "%s.parquet" % s)
                                for s in wanted) if os.path.exists(p))
-    print("\n==== predict + gate on %d held-out samples (no fitting, cap %s alleles/sample) ===="
-          % (len(paths), cap or "none"), flush=True)
-    for p in paths:
-        df, _ = dataset.label_and_filter(pd.read_parquet(p))
-        if cap and len(df) > cap:
-            df = df.sample(cap, random_state=20260616).reset_index(drop=True)
-        for regime in features.GENOTYPING_REGIMES:
-            sub = df[df["genotyping_regime"] == regime]
-            if not sub.empty:
-                _accumulate(acc[regime], sub, *compiled[regime])
-        print("  %s done" % os.path.basename(p), flush=True)
-
-    out = {"n_samples": len(paths), "max_alleles_per_sample": cap,
-           "genotyping_regimes": {r: _finalize(acc[r], len(paths)) for r in features.GENOTYPING_REGIMES}}
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    with open(args.out, "w") as f:
-        json.dump(out, f, indent=2)
-    # Violin samples per genotyping regime: full-range per-allele (reduction, pOk, LCF);
-    # all pOk-threshold + LCF-bin stratifications are derived from these.
-    def _cat(key, r):
-        return np.concatenate(acc[r][key]) if acc[r][key] else np.zeros(0, np.float32)
-    violin = {}
-    for r in features.GENOTYPING_REGIMES:
-        for short, key in (("red", "red_all"), ("pok", "pok_all"), ("lcf", "lcf_all")):
-            violin["%s__%s" % (r, short)] = _cat(key, r)
-    np.savez_compressed(os.path.splitext(args.out)[0] + "_violin.npz", **violin)
-    print("\nwrote %s" % args.out, flush=True)
-    for r in features.GENOTYPING_REGIMES:
-        m = out["genotyping_regimes"][r]
-        if m.get("n"):
-            print("  %-18s n=%-9d raw MAE %.3f -> gated %.3f (distred %+.1f%%)  median|err| %.3f->%.3f"
-                  % (r, m["n"], m["mae_raw"], m["mae_gated"], 100 * m["dist_reduction"],
-                     m["median_raw"], m["median_gated"]), flush=True)
+    run_eval(paths, args.model, args.out, args.max_alleles_per_sample)
 
 
 if __name__ == "__main__":

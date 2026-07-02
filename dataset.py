@@ -12,13 +12,21 @@ For each ``(sample, coverage)`` combo on each genotyping branch this module:
   4. Writes one parquet per combo, then assembles + labels + filters into
      ``data/parquet/{quick,full}.parquet``.
 
-Branches:
-  - ``full``  -- the low-mem-streaming full genotyper (``EHv5``); every row is a
-    ``full``-contract row, routed to ``full_spanning`` / ``full_nonspanning``.
-  - ``quick`` -- the optimized-streaming run (``EHv5-bw2-optimized``); its
-    ``QuickGenotype`` rows are the ``quick`` genotyping_regime (the full-genotyper fallback
-    rows are dropped -- they sit on the same loci as the ``EHv5`` full rows, so
-    pooling them would leak a locus across the train/test boundary).
+Single EH source -- the optimized-streaming run (``EHv5-bw2-optimized``), the variant
+deployed in production. Both branches are carved from the SAME run by ``genotyping_branch``
+so each expert trains on exactly the subpopulation it is served at deploy time:
+  - ``quick`` -- the ``QuickGenotype`` fast-path rows (``genotyping_branch == "quick"``),
+    routed to the ``quick`` genotyping_regime.
+  - ``full``  -- the full-genotyper FALLBACK rows (``genotyping_branch == "full"``: the loci
+    the fast path punted on), routed to ``full_spanning`` / ``full_nonspanning``.
+
+This replaces the earlier design that sourced ``full`` from a separate low-mem-streaming
+``EHv5`` run over ALL loci -- an easier, different locus population than the fast-path fallback
+the full experts actually see at deploy, which left the full experts train/serve-skewed. The old
+leakage concern (optimized fallback rows colliding with ``EHv5`` full rows on the same loci) no
+longer applies: there is no ``EHv5`` pool to collide with, within one optimized run a locus is
+either fast-path-called OR fallback (never both), and ``quick`` / ``full`` are separate experts;
+cross-coverage repeats of a locus are held out together by the chromosome-clean CV.
 
 The committed model is real-data-only (HG002 10x/20x/31x + CHM1_CHM13 46x); no
 simulated rows. Determinism: stable size sort for rank pairing; no randomness.
@@ -38,12 +46,13 @@ import features
 GCS_ROOT = "gs://str-truth-set-v2/tool_results"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# (branch, GCS variant token, per-combo output subdir). The variant token is also
-# templated into the truth-TSV column headers.
-BRANCHES = [
-    ("full", "EHv5", "real_full"),
-    ("quick", "EHv5-bw2-optimized", "real_quick"),
-]
+# Single source variant: the optimized-streaming run deployed in production. Its QuickGenotype
+# rows feed the `quick` branch and its full-genotyper fallback rows feed the `full` branch (the
+# split happens in assemble_branch by genotyping_branch). The variant token is also templated into
+# the truth-TSV column headers. SOURCE_SUBDIR keeps its historical name ("real_quick") so existing
+# local downloads/parquets are reused; it now feeds BOTH branches.
+SOURCE_VARIANT = "EHv5-bw2-optimized"
+SOURCE_SUBDIR = "real_quick"
 
 # (sample, coverage-dir label) -- illumina WGS only.
 COMBOS = [
@@ -144,10 +153,10 @@ def _join_truth(json_df, tsv_df):
     return merged
 
 
-def build_combo(branch, variant, subdir, sample, cov_label, data_dir, force):
-    """Downloads + joins one combo and writes its per-combo parquet."""
+def build_combo(variant, subdir, sample, cov_label, data_dir, force):
+    """Downloads + joins one combo and writes its per-combo parquet (all rows, both branches)."""
     out_path = os.path.join(data_dir, subdir, "%s_%s.parquet" % (sample, cov_label))
-    print("=== %s %s %s -> %s ===" % (branch, sample, cov_label, out_path))
+    print("=== %s %s -> %s ===" % (sample, cov_label, out_path))
     if os.path.exists(out_path) and not force:
         n = len(pd.read_parquet(out_path, columns=["eh"]))
         print("    parquet exists; skipping (use --force to rebuild)  [%d rows]" % n)
@@ -231,8 +240,10 @@ def assemble_branch(data_dir, branch, subdir):
         print("\n%s branch: no per-combo parquets in %s/ -- skipping" % (branch, subdir))
         return
     df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
-    if branch == "quick":
-        df = df[df["genotyping_branch"] == "quick"].reset_index(drop=True)
+    # Both branches are carved from the same optimized-streaming run by genotyping_branch:
+    # quick = fast-path QuickGenotype rows; full = full-genotyper fallback rows (the deploy-matched
+    # subpopulation the full experts are served).
+    df = df[df["genotyping_branch"] == ("quick" if branch == "quick" else "full")].reset_index(drop=True)
 
     n0 = len(df)
     df, drops = label_and_filter(df)
@@ -257,10 +268,10 @@ def main():
     parser.add_argument("--force", action="store_true", help="rebuild even if parquets exist")
     args = parser.parse_args()
 
-    for branch, variant, subdir in BRANCHES:
-        for sample, cov_label in COMBOS:
-            build_combo(branch, variant, subdir, sample, cov_label, args.data_dir, args.force)
-        assemble_branch(args.data_dir, branch, subdir)
+    for sample, cov_label in COMBOS:
+        build_combo(SOURCE_VARIANT, SOURCE_SUBDIR, sample, cov_label, args.data_dir, args.force)
+    for branch in ("quick", "full"):
+        assemble_branch(args.data_dir, branch, SOURCE_SUBDIR)
 
 
 if __name__ == "__main__":
