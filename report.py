@@ -275,7 +275,7 @@ def plot_mae(results, out_png):
 
     def draw_bars(ax):
         ax.bar(x - 0.2, raw, 0.4, label="raw EH", color=GRAY)
-        ax.bar(x + 0.2, gat, 0.4, label="LCF-corrected (pOk<0.5 gate)", color=ORANGE)
+        ax.bar(x + 0.2, gat, 0.4, label="LCF-corrected (pOk<0.5 threshold)", color=ORANGE)
         ax.grid(axis="y", alpha=0.3)
 
     title = "Mean absolute error: raw EH allele size vs allele size after LCF correction"
@@ -672,6 +672,7 @@ def plot_helped_hurt(holdout, out_png, homopolymer=False, title_tag="non-homopol
             ax.text(xi, v, "{:,}".format(v), ha="center", va="bottom", fontsize=8)
         ax.set_xticks(x); ax.set_xticklabels(labels)
         ax.set_ylabel("number of alleles")
+        ax.set_ylim(top=ax.get_ylim()[1] * 1.25)  # headroom so legend clears tall bars
         ax.set_title(title); ax.grid(axis="y", alpha=0.3); ax.legend()
     fig.suptitle("Would LCF correction help or hurt? (held-out 43 samples, by pOk stratum) — %s" % title_tag,
                  fontsize=13, weight="bold")
@@ -681,7 +682,7 @@ def plot_helped_hurt(holdout, out_png, homopolymer=False, title_tag="non-homopol
 
 # Per-allele error reduction (the violin y-axis): how much closer the LCF-corrected
 # call lands to truth than raw EH, in repeat units. >0 = correction helped.
-_REDUCTION_LABEL = "error reduction (repeats; >0 = better)"
+_REDUCTION_LABEL = "error reduction (repeats)\n>0 = better, <0 = worse than EH original allele size"
 
 
 def _violin_ylim(ax, data):
@@ -879,7 +880,7 @@ def plot_violins_motif(violin, out_png):
         ax.set_title(features.GENOTYPING_REGIME_DISPLAY[r], pad=_VIOLIN_COUNT_PAD)
         ax.set_ylabel(_REDUCTION_LABEL)
         ax.grid(axis="y", alpha=0.3)
-    fig.suptitle("Per-allele error reduction at the gate (pOk<0.5), by motif size (held-out 43)",
+    fig.suptitle("Per-allele error reduction at the pOk < 0.5 threshold, by motif size (held-out 43)",
                  fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_png, dpi=130, bbox_inches="tight"); plt.close(fig)
@@ -1021,7 +1022,7 @@ def _img_toggle(excluded_png, homopolymer_png, gid):
 
 
 def _q_table(results):
-    rows = ["<tr><th>genotyping_regime</th><th>n (held-out)</th><th>raw EH MAE</th><th>LCF MAE</th>"
+    rows = ["<tr><th>allele size bucket</th><th>n (held-out)</th><th>raw EH MAE</th><th>LCF MAE</th>"
             "<th>dist. reduction</th><th>median |err|: EH&rarr;LCF</th><th>exact: EH&rarr;LCF</th></tr>"]
     for r in results:
         q = r["q"]
@@ -1059,31 +1060,32 @@ def _eh_output_glossary():
 
 # The per-allele quantities each regime model predicts: (output, head, meaning, range, use).
 _MODEL_OUTPUTS = (
-    ("pOk", "direction predictor (3-class softmax)", "probability the EH call is correct (within tolerance)",
-     "0&ndash;1", "the gate: the LCF is applied only where <code>pOk &lt; 0.5</code>"),
-    ("pTooLong", "direction predictor (3-class softmax)", "probability the EH call is larger than truth",
-     "0&ndash;1", "direction lean (<code>pTooLong &minus; pTooShort</code>)"),
-    ("pTooShort", "direction predictor (3-class softmax)", "probability the EH call is smaller than truth",
-     "0&ndash;1", "direction lean (<code>pTooLong &minus; pTooShort</code>)"),
+    ("pOk", "direction predictor (3-class softmax)", "probability that the EH call is correct (within tolerance)",
+     "0&ndash;1"),
+    ("pTooLong", "direction predictor (3-class softmax)",
+     "probability that the true allele size is shorter than what EH called", "0&ndash;1"),
+    ("pTooShort", "direction predictor (3-class softmax)",
+     "probability that the true allele size is longer than what EH called", "0&ndash;1"),
     ("LCF", "length predictor (regression)",
-     "predicted length-correction factor = (EH called allele size)/(true allele size); the corrected "
-     "call is <code>round(eh / LCF)</code>",
-     "1 = no correction; &gt;1 shrink the allele size, &lt;1 increase the allele size; (always &gt; 0)",
-     "corrects the allele size where the gate applies it"),
+     "<span style='white-space:nowrap'>predicted length-correction factor = "
+     "(EH called allele size)/(true allele size)</span><br>"
+     "Predicts that the true allele size = <code>round(eh / LCF)</code>",
+     "1 = no correction; &gt;1 predicts the EH allele size is too long,<br>&lt;1 predicts the EH allele "
+     "size is too short; (always &gt; 0)"),
 )
 
 
 def _model_outputs_table():
     """Table of the per-allele quantities the model predicts (length head + 3-class direction head)."""
-    rows = ["<tr><th>output</th><th>predictor</th><th>meaning</th><th>range</th><th>used for</th></tr>"]
-    for name, head, meaning, rng, use in _MODEL_OUTPUTS:
-        rows.append("<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-                    % (name, head, meaning, rng, use))
+    rows = ["<tr><th>output</th><th>meaning</th><th>range</th><th>predictor</th></tr>"]
+    for name, head, meaning, rng in _MODEL_OUTPUTS:
+        rows.append("<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                    % (name, meaning, rng, head))
     return "<table>%s</table>" % "".join(rows)
 
 
 def _dir_table(results):
-    rows = ["<tr><th>genotyping_regime</th><th>log-loss</th><th>TOO_LONG AUC</th><th>TOO_SHORT AUC</th>"
+    rows = ["<tr><th>allele size bucket</th><th>log-loss</th><th>TOO_LONG AUC</th><th>TOO_SHORT AUC</th>"
             "<th>ECE</th><th>pOk argmax acc.</th></tr>"]
     for r in results:
         d = r["direction"]
@@ -1112,7 +1114,7 @@ def _holdout_homopolymer_results(holdout):
 
 
 def _holdout_table(holdout):
-    rows = ["<tr><th>genotyping regime</th><th>n</th><th>raw EH MAE</th><th>gated MAE</th>"
+    rows = ["<tr><th>allele size bucket</th><th>n</th><th>raw EH MAE</th><th>gated MAE</th>"
             "<th>dist. reduction</th><th>median |err|: EH&rarr;gated</th><th>exact: EH&rarr;gated</th>"
             "<th>pOk argmax acc.</th></tr>"]
     for r in features.GENOTYPING_REGIMES:
@@ -1254,8 +1256,8 @@ def build_dataset_sections(out_dir, regenerate=True):
             "pill replaces each gated call with <code>round(eh/LCF)</code>, growing the green "
             "<b>Same</b> band where it helps: <b>Raw EH</b> (no correction), <b>p&lt;0.5</b> "
             "(correct alleles with <code>pOk&lt;0.5</code>), <b>p&lt;0.25</b> (a stricter "
-            "<code>pOk&lt;0.25</code> gate), and <b>p&lt;0.5, non-spanning</b> (the <code>pOk&lt;0.5</code> "
-            "gate restricted to full_nonspanning-regime alleles). The <b>Repeat Purity Filter</b> pill "
+            "<code>pOk&lt;0.25</code> threshold), and <b>p&lt;0.5, non-spanning</b> (the <code>pOk&lt;0.5</code> "
+            "threshold restricted to full_nonspanning-bucket alleles). The <b>Repeat Purity Filter</b> pill "
             "(<b>Off</b> vs <b>&gt; 0.95 pure</b>) restricts the plot to alleles whose truth repeat "
             "purity exceeds 0.95 (purity is on a 0&ndash;1 scale), i.e. near-perfect tandem repeats "
             "without interruptions. (The held-out pool is computed from per-allele parquets, so its "
@@ -1292,18 +1294,18 @@ def build_dataset_sections(out_dir, regenerate=True):
         lambda k, png, pfx, tag: plot_mae(
             _holdout_homopolymer_results(evals[k]) if pfx == "h" else _holdout_results(evals[k]), png),
         "<p class='note'>Raw-EH MAE vs the MAE after applying the LCF only where <code>pOk&lt;0.5</code>, "
-        "per genotyping regime (repeat units).</p>", [k for k, _ in present if k in evals])
+        "per allele size bucket (repeat units).</p>", [k for k, _ in present if k in evals])
     parts += homo_family(
         "dhh", "Loci the LCF would help vs hurt, by pOk stratum", "hh",
         lambda k, png, pfx, tag: plot_helped_hurt(evals[k], png, homopolymer=(pfx == "h"), title_tag=tag),
         "<p class='note'>Would the LCF move each call <b>closer</b> (green) or <b>further</b> (red) from "
-        "truth? Left = <code>pOk&lt;0.5</code> (gate applies the LCF); right = <code>pOk&ge;0.5</code> "
-        "(gate keeps raw EH).</p>", [k for k, _ in present if k in evals])
+        "truth? Left = <code>pOk&lt;0.5</code> (threshold applies the LCF); right = <code>pOk&ge;0.5</code> "
+        "(threshold keeps raw EH).</p>", [k for k, _ in present if k in evals])
     parts += homo_family(
         "dpokv", "Per-allele error reduction (signed), by pOk stratum", "pokv",
         lambda k, png, pfx, tag: plot_violins(violins[k], png, pfx=pfx, title_tag=tag),
         "<p class='note'>Signed error reduction <code>|true&minus;eh| &minus; |true&minus;eh/LCF|</code> "
-        "(above 0 = closer to truth) as the pOk gate tightens.</p>",
+        "(above 0 = closer to truth) as the pOk threshold tightens.</p>",
         [k for k, _ in present if k in violins])
     parts += homo_family(
         "dlcfv", "Error reduction by predicted-LCF bin x pOk stratum", "lcfv",
@@ -1334,7 +1336,7 @@ def build_dataset_sections(out_dir, regenerate=True):
             except Exception as e:
                 print("  [%s] motif violins skipped: %s" % (key, e), flush=True)
     if motif_imgs:
-        parts += ["<h3>Error reduction at the gate (pOk&lt;0.5), by motif size</h3>",
+        parts += ["<h3>Error reduction at the pOk &lt; 0.5 threshold, by motif size</h3>",
                   _pills("dmotif", [ds_dim_for(motif_imgs)], motif_imgs),
                   "<p class='note'>Signed error reduction for <code>pOk&lt;0.5</code> alleles, by motif "
                   "size (1bp .. 25+bp).</p>"]
@@ -1394,21 +1396,15 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         intro_homo,
         "<p class='note'>Model file: <code>%s</code></p>" % html.escape(os.path.basename(model_path)),
         "<h2>Model Overview</h2>",
-        "<p class='note'>The model scores each ExpansionHunter (EH) allele call against its likely true "
-        "size. Each allele gets its own set of predictions:</p>",
+        "<p class='note'>The model scores each ExpansionHunter (EH) allele call vs the probable true "
+        "allele size. Each allele gets its own set of 4 scores:</p>",
         _model_outputs_table(),
-        "<p class='note'>ExpansionHunter genotypes each allele on one of three <b>genotyping regimes</b>, "
-        "which are routed to separate models:</p>",
-        "<ul class='note'>"
-        "<li><b>quick</b> &mdash; This regime exists only under <code>--analysis-mode optimized-streaming</code>. "
-        "These alleles are called using the quick branch; typically short, well-supported repeats sized "
-        "directly using spanning reads.</li>"
-        "<li><b>full_spanning</b> &mdash; full genotyping (ExpansionHunter's core repeat genotyping "
-        "algorithm), where the allele size is supported by &ge;1 spanning read.</li>"
-        "<li><b>full_nonspanning</b> &mdash; full genotyping (ExpansionHunter's core repeat genotyping "
-        "algorithm), with no spanning reads. This is where ExpansionHunter errs most and where the "
-        "correction helps most.</li>"
-        "</ul>",
+        "<p class='note'>During model training and prediction, ExpansionHunter genotyped allele sizes are "
+        "split into two separate buckets: the <b>full_spanning</b> bucket for allele sizes supported by "
+        "&ge;1 spanning read, and the <b>full_nonspanning</b> bucket for alleles with no spanning reads. "
+        "Additionally, in <code>--analysis-mode optimized-streaming</code>, a 3rd <b>quick</b> bucket is "
+        "added for alleles that could be confidently and quickly genotyped using only spanning reads "
+        "without running the full, computationally-expensive ExpansionHunter genotyping algorithm.</p>",
         "<p class='note'><b>Training data:</b> %s &mdash; Illumina whole-genome sequencing.</p>" % html.escape(pool),
         "<p class='note'><b>Truth set:</b> <a href='https://github.com/broadinstitute/str-truth-set-v2'>"
         "<code>str-truth-set-v2</code></a>. Per-allele true repeat counts "
@@ -1416,9 +1412,9 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "same samples (HG002, CHM1&ndash;CHM13), giving the true repeat number at each tandem-repeat "
         "locus. Negative-control loci and impure (&lt;0.9 purity) alleles are filtered out before "
         "training.</p>",
-        "<p class='note'>Held-out accuracy is measured by 5-fold chromosome-clean cross validation: "
+        "<p class='note'>Held-out accuracy is measured by 5-fold cross validation: "
         "each fold trains on ~19 chromosomes and tests on the held-out ones.</p>",
-        "<h2>ExpansionHunter output fields</h2>",
+        "<h2>ExpansionHunter output fields used for model training</h2>",
         "<p class='note'>The raw per-allele <code>AlleleQualityMetrics.Alleles[]</code> fields read from "
         "each ExpansionHunter output JSON.</p>",
         _eh_output_glossary(),
@@ -1431,10 +1427,12 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "<h2>Mean absolute error: raw EH allele size vs allele size after LCF correction</h2>",
         _img_toggle(mae_png, mae_homopolymer_png, "mae"),
         "<p class='note'>The length-correction factor "
-        "<code>LCF = (ExpansionHunter called allele size)/(True allele size)</code> (LCF prediction) is "
-        "applied only where <code>pOk &lt; 0.5</code> (pOk/pTooLong/pTooShort); confident calls keep raw EH. "
-        "MAE is over held-out alleles, in repeat units. The gate concentrates the correction on the "
-        "<code>full_nonspanning</code> genotyping_regime, where flanking/IRR sizing makes raw EH most error-prone.</p>",
+        "<code>LCF = (ExpansionHunter called allele size)/(True allele size)</code> is "
+        "applied only where <code>pOk &lt; 0.5</code>; calls with <code>pOk &ge; 0.5</code> keep the raw "
+        "EH allele size. "
+        "MAE is computed over held-out alleles, and is measured in repeat units. The pOk &lt; 0.5 threshold "
+        "concentrates the correction on the "
+        "<code>full_nonspanning</code> allele size bucket, where flanking/IRR sizing makes raw EH most error-prone.</p>",
         "<h2>Held-out LCF prediction accuracy (LCF-recovered truth vs raw EH)</h2>",
         _q_table(results),
         "<h2>Held-out pOk/pTooLong/pTooShort metrics</h2>",
@@ -1449,7 +1447,7 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
          "<code>ECE</code> is each class's own one-vs-rest calibration error; the table's ECE is the "
          "mean of the TOO_LONG and TOO_SHORT values only, so it equals neither the pOk legend value "
          "nor either component alone. This "
-         "matters because the deployment gate thresholds on <code>pOk</code> directly, so "
+         "matters because the pOk &lt; 0.5 threshold applies to <code>pOk</code> directly, so "
          "<code>pOk</code> must mean what it says.</p>" if calib_png else ""),
         "<h3>Confusion matrix (argmax prediction, row-normalized)</h3>",
         _img_toggle(confusion_png, confusion_homopolymer_png, "cm"),
@@ -1461,16 +1459,17 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "probabilities shown calibrated above.</p>",
         ("<h3>ROC curves: detecting TOO_LONG / TOO_SHORT calls</h3>" if roc_png else ""),
         (_img_toggle(roc_png, roc_homopolymer_png, "roc") if roc_png else ""),
-        ("<p class='note'>One-vs-rest ROC for the two error directions the gate must catch: true "
-         "positive rate vs false positive rate as the probability threshold sweeps, regimes "
+        ("<p class='note'>One-vs-rest ROC for the two error directions the pOk &lt; 0.5 threshold must "
+         "catch: true "
+         "positive rate vs false positive rate as the probability threshold sweeps, allele size buckets "
          "overlaid. The legend <code>AUC</code> matches <code>TOO_LONG AUC</code> / "
          "<code>TOO_SHORT AUC</code> in the table; the dashed diagonal is chance. ROC is "
          "threshold-independent but, because OK calls dominate, reads optimistically &mdash; see the "
          "PR-ROC curves below for the rare-class precision trade-off.</p>" if roc_png else ""),
         ("<h3>PR-ROC curves: detecting TOO_LONG / TOO_SHORT calls</h3>" if pr_png else ""),
         (_img_toggle(pr_png, pr_homopolymer_png, "pr") if pr_png else ""),
-        ("<p class='note'>One-vs-rest precision&ndash;recall for the two error directions the gate "
-         "must catch. Because OK calls dominate, ROC-AUC looks optimistic; PR-ROC shows the real "
+        ("<p class='note'>One-vs-rest precision&ndash;recall for the two error directions the pOk &lt; 0.5 "
+         "threshold must catch. Because OK calls dominate, ROC-AUC looks optimistic; PR-ROC shows the real "
          "trade-off when the positive class is rare. <code>AP</code> is the average precision (area "
          "under the curve); <code>base</code> (the dotted line) is the class prevalence &mdash; the "
          "precision a random classifier would get, so the gap above it is the model's lift. "
@@ -1480,7 +1479,7 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         (_img_toggle(prob_violins_png, prob_violins_homopolymer_png, "pv") if prob_violins_png else ""),
         ("<p class='note'>Distribution of each predicted direction probability "
          "(<code>pOk</code> / <code>pTooLong</code> / <code>pTooShort</code>, rows) as a function of "
-         "the EH call error, per genotyping regime (columns). The x-axis is the signed bin "
+         "the EH call error, per allele size bucket (columns). The x-axis is the signed bin "
          "<code>delta = round(eh) &minus; round(true)</code> in repeat units "
          "&mdash; left is EH <b>undercalling</b> (call too short), right is EH <b>overcalling</b> "
          "(call too long), and the dashed line marks the no-error <code>0</code> bin (violins colored "
@@ -1489,11 +1488,11 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
          "<code>pTooLong</code> where it overcalls, while <code>pOk</code> peaks near <code>0</code>. "
          "Per-bin allele counts are capped at %s for the kernel-density estimate only.</p>"
          % format(_DELTA_VIOLIN_CAP, ",") if prob_violins_png else ""),
-        "<h2>Relative feature importance (per genotyping regime, LCF prediction)</h2>",
+        "<h2>Relative feature importance (per allele size bucket, LCF prediction)</h2>",
         _img_toggle(importance_png, importance_homopolymer_png, "imp"),
         "<p class='note'>Each feature's <code>(#n)</code> suffix is its importance rank in the "
-        "<code>full_nonspanning</code> genotyping regime; the same number is reused across all three "
-        "charts so a feature can be tracked between genotyping regimes. Toggle between "
+        "<code>full_nonspanning</code> allele size bucket; the same number is reused across all three "
+        "charts so a feature can be tracked between allele size buckets. Toggle between "
         "<b>non-homopolymer</b> loci and <b>homopolymer</b> (1&nbsp;bp motif) loci (the homopolymer panel's "
         "<code>#</code> ranks are set by its own homopolymer full_nonspanning order).</p>",
         "<h2>Add-one-feature ablation (LCF prediction)</h2>",
@@ -1501,7 +1500,7 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "<p class='note'>The LCF prediction (the regressor predicting the length-correction factor "
         "<code>LCF = exp(t)</code>, so the corrected size is <code>eh/LCF</code>) is re-fit using only "
         "its top-1 most-important feature, then top-2, ... up to all features (x-axis; added in each "
-        "genotyping regime's own importance order). The y-axis is the <b>held-out MAE</b> "
+        "allele size bucket's own importance order). The y-axis is the <b>held-out MAE</b> "
         "<code>mean|true &minus; eh/LCF|</code> (repeat units, fold-0 test chromosomes, within-pool CV). "
         "<b>x = 0 is raw EH</b> (no correction); <b>x &ge; 1</b> apply the LCF fit on that many features "
         "(the y-axis is broken so the large raw-EH baseline and the corrected detail are both readable). "
