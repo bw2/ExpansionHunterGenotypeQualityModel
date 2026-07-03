@@ -37,7 +37,7 @@ import model as M
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCS_ROOT = "gs://str-truth-set-v2/tool_results"
 VARIANT = "EHv5-bw2-optimized"
-CATALOG = "combined_catalog_43_samples_1.6M_loci_maxdepth150"
+CATALOG = "combined_catalog_43_samples_1.6M_loci"
 
 # The 43 held-out HPRC short-read samples (absent from the HG002+CHM training pool).
 SAMPLES = [

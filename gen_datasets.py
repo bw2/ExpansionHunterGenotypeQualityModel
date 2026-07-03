@@ -18,8 +18,10 @@ import os
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 import accuracy_by_size as A
+import features
 import holdout43
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -127,6 +129,25 @@ def gen_stacked(spec, model_path, out_json, corrected_cap):
     print("wrote %s" % out_json, flush=True)
 
 
+def _check_feature_columns(parquets):
+    """Raises a clear error if a parquet predates the current model feature contract.
+
+    Catches a cached external-validation parquet built before a ``features.py`` feature-list
+    change (e.g. it lacks a newly added column) with an actionable message, instead of the
+    unrelated-looking ``AssertionError`` that ``features.build_matrix`` would raise deep inside
+    ``holdout43.run_eval``.
+    """
+    required = set(features.FULL_FEATURES) - {"ci_asymmetry", "ci_over_eh"}  # engineered by add_engineered
+    for p in parquets:
+        missing = required - set(pq.ParquetFile(p).schema.names)
+        if missing:
+            raise RuntimeError(
+                "%s is missing feature column(s) %s -- it was built with an older feature "
+                "contract. Rebuild it (re-run its download/extract step, e.g. "
+                "holdout43.build_sample(..., force=True) for a held-out-43 sample) before "
+                "re-running gen_datasets.py." % (p, sorted(missing)))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, choices=list(datasets().keys()))
@@ -143,6 +164,7 @@ def main():
     spec = datasets()[args.dataset]
     parquets = spec["parquets"] if spec.get("parquet_only") else [p for p, _ in spec["pairs"]]
     print("==== dataset %s: %d parquet(s) ====" % (args.dataset, len(parquets)), flush=True)
+    _check_feature_columns(parquets)
 
     if not args.skip_eval:
         holdout43.run_eval(parquets, args.model,

@@ -197,10 +197,12 @@ def _chrom_from_locus(locus_id):
 def label_and_filter(df):
     """Adds ``chrom`` + the q/direction labels and drops unusable rows.
 
-    Drops chrM/unknown contigs, negative-control loci, missing/non-positive ``eh``/``true``,
-    missing motif, and impure (<0.9) / missing-purity rows, then derives the labels +
-    genotyping-regime routing via ``features.add_labels``. Shared by the training-pool assembly
-    and the held-out-sample benchmark so both apply identical filtering.
+    Drops chrM/unknown contigs, negative-control loci, missing/non-positive ``eh``/``true``, and
+    missing motif, then derives the labels + genotyping-regime routing via ``features.add_labels``.
+    Shared by the training-pool assembly and the held-out-sample benchmark so both apply identical
+    filtering. Does NOT filter on truth repeat purity -- impure loci are kept in both training and
+    eval (purity is available to the report's opt-in stratification pill via ``accuracy_by_size.py``
+    instead of being used as a blanket exclusion).
 
     Returns:
         A ``(kept_df, drop_counts)`` tuple. ``kept_df`` has ``chrom`` + the label columns added and
@@ -211,7 +213,6 @@ def label_and_filter(df):
     eh = pd.to_numeric(df["eh"], errors="coerce")
     true = pd.to_numeric(df["true"], errors="coerce")
     motif = pd.to_numeric(df["motif_size"], errors="coerce")
-    purity = pd.to_numeric(df["purity"], errors="coerce")
     negative = df["is_negative_locus"].fillna(False).astype(bool)
 
     keep = pd.Series(True, index=df.index)
@@ -220,9 +221,7 @@ def label_and_filter(df):
                       ("negative_control_locus", negative),
                       ("missing_eh_or_true", eh.isna() | true.isna()),
                       ("nonpositive_eh_or_true", (eh <= 0) | (true <= 0)),
-                      ("missing_motif_size", motif.isna() | (motif <= 0)),
-                      ("impure_below_0.9", purity < 0.9),
-                      ("missing_purity", purity.isna())):
+                      ("missing_motif_size", motif.isna() | (motif <= 0))):
         bad = bad & keep
         drops[name] = int(bad.sum())
         keep &= ~bad

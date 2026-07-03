@@ -1000,8 +1000,11 @@ def _img_toggle(excluded_png, homopolymer_png, gid):
 
     Pure CSS (radio + sibling selectors; no JS), so it works in a saved standalone file. ``gid`` must be
     unique per page (it names the radio group + element ids). Falls back to the excluded image alone when
-    ``homopolymer_png`` is missing (e.g. the homopolymer benchmark has not been run yet).
+    ``homopolymer_png`` is missing (e.g. the homopolymer benchmark has not been run yet), and to an empty
+    string when even ``excluded_png`` is missing (e.g. ``--render-text-only`` with no cached PNG yet).
     """
+    if not excluded_png:
+        return ""
     if not homopolymer_png:
         return _img(excluded_png)
     return (
@@ -1614,12 +1617,13 @@ def main():
         stale = {}
         if not args.render_text_only:
             cur_counts = _homopolymer_row_counts(args.data_dir)
-            stale = {r["genotyping_regime"]: (r["n_rows"], cur_counts.get(r["genotyping_regime"], 0))
-                     for r in homo_results if cur_counts.get(r["genotyping_regime"], 0) != r["n_rows"]}
-            if cur_counts and stale:
-                print("  WARNING: results_homopolymer.json row counts %s (cached, current) disagree with "
-                      "the current parquets; skipping homopolymer panels -- re-run "
-                      "report.py --homopolymer-cv" % stale, flush=True)
+            if cur_counts:
+                stale = {r["genotyping_regime"]: (r["n_rows"], cur_counts.get(r["genotyping_regime"], 0))
+                         for r in homo_results if cur_counts.get(r["genotyping_regime"], 0) != r["n_rows"]}
+                if stale:
+                    print("  WARNING: results_homopolymer.json row counts %s (cached, current) disagree "
+                          "with the current parquets; skipping homopolymer panels -- re-run "
+                          "report.py --homopolymer-cv" % stale, flush=True)
         if not stale:
             mae_homopolymer_png = _png("mae_raw_vs_gated_homopolymer.png",
                                        lambda p: plot_mae(homo_results, p))

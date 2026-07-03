@@ -371,8 +371,7 @@ def bin_counts(cat, category_col, homopolymer, purity_min=None):
 
 
 # Tool display labels (from the v1 script's TITLE_TOOL_LABELS).
-TITLE_TOOL_LABELS = {"EHv5-bw2-optimized": "bw2/EHv5 (optimized-streaming)",
-                     "EHv5": "bw2/EHv5 (low-mem-streaming)"}
+TITLE_TOOL_LABELS = {"EHv5-bw2-optimized": "bw2/EHv5 (optimized-streaming)"}
 
 
 def plot_accuracy_by_size(data, out_png, tool_label, coverage_label, motif_desc, lcf_note=""):
