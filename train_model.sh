@@ -31,15 +31,16 @@ echo "==== [3/3] evaluate (5-fold CV) + HTML report ========================="
 "$PYTHON" report.py --data-dir "$DATA_DIR" --cv-train-cap "$CV_TRAIN_CAP" --homopolymer-cv
 "$PYTHON" report.py --data-dir "$DATA_DIR" --model "$MODEL_OUT" --cv-train-cap "$CV_TRAIN_CAP"
 
-# Optional external validation: apply the exported model to the 43 held-out HPRC samples and
-# fold the results into the report. Off by default (a ~7-8 GB download). Enable with RUN_HOLDOUT43=1.
+# Optional external validation: apply the exported model to the 30 held-out HPRC samples (of the
+# original 43-sample panel; 13 were promoted into training) and fold the results into the report.
+# Off by default (a ~7-8 GB download). Enable with RUN_HOLDOUT43=1.
 if [ "${RUN_HOLDOUT43:-0}" = "1" ]; then
-  echo "==== [4] external held-out benchmark (43 HPRC samples) ================"
-  # Download + build the 43 held-out per-sample parquets (into data_eval_43/real_43/).
-  "$PYTHON" holdout43.py --model "$MODEL_OUT" --build-only
+  echo "==== [4] external held-out benchmark (30 HPRC samples) ================"
+  # Download + build the 30 held-out per-sample parquets (into data_eval_43/real_43/).
+  "$PYTHON" heldout.py --model "$MODEL_OUT" --build-only
   # Generate the artifacts report.py actually reads for the held-out-43 section
-  # (report/eval_heldout43.json + report/stacked_heldout43.json). holdout43.py's own
-  # report/holdout43.json is a standalone dump the report does NOT consume.
+  # (report/eval_heldout43.json + report/stacked_heldout43.json). heldout.py's own
+  # report/heldout.json is a standalone dump the report does NOT consume.
   "$PYTHON" gen_datasets.py --dataset heldout43 --model "$MODEL_OUT"
   "$PYTHON" report.py --data-dir "$DATA_DIR" --model "$MODEL_OUT" --render-only
 fi

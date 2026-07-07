@@ -2,7 +2,7 @@
 
 For each dataset (HG002 genome 31x / HG002 exome 3x / the 43 held-out HPRC samples) this writes:
   - ``report/eval_<key>.json`` + ``report/eval_<key>_violin.npz`` -- the apply-based eval (MAE,
-    helped/hurt, by-pOk / pdiff / LCF violins), via ``holdout43.run_eval``.
+    helped/hurt, by-pOk / pdiff / LCF violins), via ``heldout.run_eval``.
   - ``report/stacked_<key>.json`` -- the stacked "accuracy by true allele size" counts (raw +
     LCF-corrected, each split non-homopolymer / homopolymer), via ``accuracy_by_size``.
 
@@ -21,8 +21,9 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 import accuracy_by_size as A
+import dataset
 import features
-import holdout43
+import heldout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = "EHv5-bw2-optimized"
@@ -30,14 +31,19 @@ _TSV = "*.for_comparison.with_%s_vs_Truth_columns.alleles.tsv.gz" % TOOL
 
 
 def _heldout_parquets():
-    """Returns the per-sample parquets for the 43 held-out HPRC samples.
+    """Returns the per-sample parquets for the held-out HPRC samples still in ``heldout.SAMPLES``.
 
-    Their for-comparison TSVs aren't cached and their catalog/coverage vary per sample, so the
-    held-out accuracy-by-size is computed straight from the parquets via
+    Filters the ``data_eval_43/real_43/`` glob down to ``heldout.SAMPLES`` so samples promoted into
+    training (``dataset.PROMOTED_HELDOUT_SAMPLES``) -- whose parquets are left on disk for reuse as
+    training-pool symlinks -- are never scored as held-out (that would leak train rows into external
+    validation). Their for-comparison TSVs aren't cached and their catalog/coverage vary per sample, so
+    the held-out accuracy-by-size is computed straight from the parquets via
     ``accuracy_by_size.categorize_parquet`` (No-Call alleles aren't present in the parquet, hence not
     shown for held-out -- a tiny fraction for short-read WGS).
     """
-    return sorted(glob.glob(os.path.join(HERE, "data_eval_43", "real_43", "*.parquet")))
+    all_parquets = glob.glob(os.path.join(HERE, "data_eval_43", "real_43", "*.parquet"))
+    return sorted(p for p in all_parquets
+                 if os.path.splitext(os.path.basename(p))[0] in heldout.SAMPLES)
 
 
 # key -> {label, coverage_label, motif descriptions, list of (parquet, tsv) pairs}.
@@ -56,8 +62,8 @@ def datasets():
                                     "HG002.tandem_repeat_genotypes.for_comparison."
                                     "with_%s_vs_Truth_columns.alleles.tsv.gz" % TOOL))]},
         "heldout43": {
-            "label": "43 held-out HPRC samples",
-            "coverage_label": "43 held-out HPRC samples (short-read WGS)",
+            "label": "%d held-out HPRC samples" % len(heldout.SAMPLES),
+            "coverage_label": "%d held-out HPRC samples (short-read WGS)" % len(heldout.SAMPLES),
             "parquet_only": True, "no_call_note": " (No-Call alleles not shown)",
             "parquets": _heldout_parquets()},
     }
@@ -73,31 +79,35 @@ def gen_stacked(spec, model_path, out_json, corrected_cap):
     category counts are ACCUMULATED (additive) rather than concatenated, so a 43-sample pool stays
     bounded in memory. ``corrected_cap`` caps the model apply per parquet; ``None`` = all alleles.
 
-    The JSON nests ``out[homo|nonhomo][correction_variant][purity_variant]``: each
+    The JSON nests ``out[homo|nonhomo][correction_variant][purity_variant][pok_variant]``: each
     ``A.CORRECTION_VARIANTS`` key (``raw`` reads the ``category`` column, every gated variant its
     ``category__<key>`` column) crossed with each ``A.PURITY_VARIANTS`` key (``off`` = all alleles, the
-    filtered key keeps only alleles above its truth-purity threshold).
+    filtered key keeps only alleles above its truth-purity threshold) crossed with each
+    ``A.POK_VARIANTS`` key (``all`` = every allele, the other two split on the model's own predicted
+    ``pok`` regardless of which correction variant is selected).
     """
     nb = len(A.X_LABELS)
     variants = [(key, "category" if gate is None else "category__" + key)
                 for key, _, _, gate in A.CORRECTION_VARIANTS]
     purities = [(pk, pmin) for pk, _, pmin in A.PURITY_VARIANTS]
-    acc = {(h, vk, pk): {"counts": {cat: np.zeros(nb, int) for cat in A.CATEGORIES},
-                         "alleles_per_bin": np.zeros(nb, int), "same": 0, "total": 0, "loci": set()}
-           for h in (False, True) for vk, _ in variants for pk, _ in purities}
+    poks = [(kk, mode) for kk, _, mode in A.POK_VARIANTS]
+    acc = {(h, vk, pk, kk): {"counts": {cat: np.zeros(nb, int) for cat in A.CATEGORIES},
+                             "alleles_per_bin": np.zeros(nb, int), "same": 0, "total": 0, "loci": set()}
+           for h in (False, True) for vk, _ in variants for pk, _ in purities for kk, _ in poks}
 
     def fold(m, src):
         for h in (False, True):
             for vk, col in variants:
                 for pk, pmin in purities:
-                    bc = A.bin_counts(m, col, h, purity_min=pmin)
-                    a = acc[(h, vk, pk)]
-                    for cat in A.CATEGORIES:
-                        a["counts"][cat] += np.asarray(bc["counts"][cat], int)
-                    a["alleles_per_bin"] += np.asarray(bc["alleles_per_bin"], int)
-                    a["same"] += bc["same"]
-                    a["total"] += bc["total"]
-                    a["loci"].update(bc["loci"])  # union distinct loci across samples (catalog loci repeat across the 43 held-out samples)
+                    for kk, mode in poks:
+                        bc = A.bin_counts(m, col, h, purity_min=pmin, pok_stratum=mode)
+                        a = acc[(h, vk, pk, kk)]
+                        for cat in A.CATEGORIES:
+                            a["counts"][cat] += np.asarray(bc["counts"][cat], int)
+                        a["alleles_per_bin"] += np.asarray(bc["alleles_per_bin"], int)
+                        a["same"] += bc["same"]
+                        a["total"] += bc["total"]
+                        a["loci"].update(bc["loci"])  # union distinct loci across samples (catalog loci repeat across the 43 held-out samples)
         print("  stacked: %s (%d alleles)" % (src, len(m)), flush=True)
 
     if spec.get("parquet_only"):
@@ -106,7 +116,18 @@ def gen_stacked(spec, model_path, out_json, corrected_cap):
     else:
         for parquet, tsv in spec["pairs"]:
             preds = A.predict_lcf_pok([parquet], model_path, cap=corrected_cap)
-            fold(A.add_corrected_categories(A.categorize_tsv(tsv, TOOL), preds), os.path.basename(parquet))
+            cat = A.categorize_tsv(tsv, TOOL)
+            if corrected_cap is None:
+                # A cap alone makes the JSON side look artificially short of the TSV's locus catalog,
+                # so this check is only meaningful (and only run) uncapped; see
+                # dataset._assert_catalog_agreement.
+                json_side = pd.DataFrame({"locus_id": preds["locus"].unique()})
+                tsv_side = (cat[["locus", "true_repeats"]]
+                           .rename(columns={"locus": "LocusId", "true_repeats": "true"})
+                           .drop_duplicates("LocusId"))
+                dataset._assert_catalog_agreement(json_side, tsv_side, os.path.basename(parquet),
+                                                  fatal=False)
+            fold(A.add_corrected_categories(cat, preds), os.path.basename(parquet))
 
     out = {"label": spec["label"], "coverage_label": spec["coverage_label"],
            "tool_label": A.TITLE_TOOL_LABELS[TOOL]}
@@ -117,12 +138,14 @@ def gen_stacked(spec, model_path, out_json, corrected_cap):
         for vk, _ in variants:
             out[name][vk] = {}
             for pk, _ in purities:
-                a = acc[(homo, vk, pk)]
-                out[name][vk][pk] = {
-                    "counts": {cat: a["counts"][cat].tolist() for cat in A.CATEGORIES},
-                    "alleles_per_bin": a["alleles_per_bin"].tolist(),
-                    "same": int(a["same"]), "total": int(a["total"]),
-                    "total_loci": int(len(a["loci"]))}
+                out[name][vk][pk] = {}
+                for kk, _ in poks:
+                    a = acc[(homo, vk, pk, kk)]
+                    out[name][vk][pk][kk] = {
+                        "counts": {cat: a["counts"][cat].tolist() for cat in A.CATEGORIES},
+                        "alleles_per_bin": a["alleles_per_bin"].tolist(),
+                        "same": int(a["same"]), "total": int(a["total"]),
+                        "total_loci": int(len(a["loci"]))}
     os.makedirs(os.path.dirname(out_json), exist_ok=True)
     with open(out_json, "w") as f:
         json.dump(out, f)
@@ -135,7 +158,7 @@ def _check_feature_columns(parquets):
     Catches a cached external-validation parquet built before a ``features.py`` feature-list
     change (e.g. it lacks a newly added column) with an actionable message, instead of the
     unrelated-looking ``AssertionError`` that ``features.build_matrix`` would raise deep inside
-    ``holdout43.run_eval``.
+    ``heldout.run_eval``.
     """
     required = set(features.FULL_FEATURES) - {"ci_asymmetry", "ci_over_eh"}  # engineered by add_engineered
     for p in parquets:
@@ -144,7 +167,7 @@ def _check_feature_columns(parquets):
             raise RuntimeError(
                 "%s is missing feature column(s) %s -- it was built with an older feature "
                 "contract. Rebuild it (re-run its download/extract step, e.g. "
-                "holdout43.build_sample(..., force=True) for a held-out-43 sample) before "
+                "heldout.build_sample(..., force=True) for a held-out-43 sample) before "
                 "re-running gen_datasets.py." % (p, sorted(missing)))
 
 
@@ -167,8 +190,8 @@ def main():
     _check_feature_columns(parquets)
 
     if not args.skip_eval:
-        holdout43.run_eval(parquets, args.model,
-                           os.path.join(args.out_dir, "eval_%s.json" % args.dataset), args.eval_cap)
+        heldout.run_eval(parquets, args.model,
+                         os.path.join(args.out_dir, "eval_%s.json" % args.dataset), args.eval_cap)
 
     print("\n==== stacked accuracy-by-size: %s ====" % args.dataset, flush=True)
     gen_stacked(spec, args.model, os.path.join(args.out_dir, "stacked_%s.json" % args.dataset),

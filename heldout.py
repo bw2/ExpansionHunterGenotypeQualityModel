@@ -1,8 +1,10 @@
-"""Cross-population held-out benchmark: apply the EXPORTED model to 43 HPRC samples.
+"""Cross-population held-out benchmark: apply the EXPORTED model to the remaining 30 HPRC samples.
 
 The deployed model is loaded straight from its ``.json[.gz]`` -- the exact format ExpansionHunter
-consumes -- and applied (NO fitting, no re-training) to 43 HPRC short-read samples that are entirely
-absent from the HG002+CHM training pool, scored against their truth. This is the realistic "train on
+consumes -- and applied (NO fitting, no re-training) to the remaining 30 HPRC short-read samples (of
+the original 43-sample panel) that are entirely absent from the HG002+CHM training pool -- the other
+13 were promoted into training, see ``dataset.PROMOTED_HELDOUT_SAMPLES`` -- scored against their
+truth. This is the realistic "train on
 some samples, apply to new samples" test. A single optimized-streaming source per sample (the same
 1.6M-locus catalog, ``EHv5-bw2-optimized``) supplies all three genotyping regimes via routing: its
 ``QuickGenotype`` rows are the ``quick`` regime and its full-genotyper-fallback rows split into
@@ -11,7 +13,7 @@ some samples, apply to new samples" test. A single optimized-streaming source pe
 corrected call = ``eh / LCF`` (q-median head); the gate applies it only where ``pOk < 0.5``
 (direction head), else keeps raw EH. The MAE is a running sum, but the exact pooled median retains
 every kept allele's ``|error|`` in RAM (bounded by ``--max-alleles-per-sample``), so peak memory grows
-with the total kept alleles. ``main()`` writes a standalone ``report/holdout43.json`` benchmark dump.
+with the total kept alleles. ``main()`` writes a standalone ``report/heldout.json`` benchmark dump.
 The report's held-out-43 section is NOT fed from that file -- it is produced by
 ``gen_datasets.py --dataset heldout43``, which reuses ``run_eval`` here to emit the
 ``report/eval_heldout43.json`` / ``report/stacked_heldout43.json`` artifacts ``report.py`` consumes.
@@ -39,14 +41,17 @@ GCS_ROOT = "gs://str-truth-set-v2/tool_results"
 VARIANT = "EHv5-bw2-optimized"
 CATALOG = "combined_catalog_43_samples_1.6M_loci"
 
-# The 43 held-out HPRC short-read samples (absent from the HG002+CHM training pool).
+# The remaining 30 held-out HPRC short-read samples (absent from the training pool). 13 of the
+# original 43 (see ``dataset.PROMOTED_HELDOUT_SAMPLES``) were promoted into training for
+# ancestry/sex diversity at large allele sizes, so they are excluded here to avoid double-counting
+# them in the external validation set.
 SAMPLES = [
-    "HG00438", "HG00514", "HG00621", "HG00673", "HG00733", "HG00735", "HG00741", "HG01071",
-    "HG01106", "HG01109", "HG01175", "HG01243", "HG01258", "HG01358", "HG01361", "HG01891",
-    "HG01928", "HG01952", "HG01978", "HG02055", "HG02080", "HG02145", "HG02148", "HG02257",
-    "HG02572", "HG02622", "HG02630", "HG02717", "HG02723", "HG02818", "HG02886", "HG03098",
-    "HG03125", "HG03453", "HG03486", "HG03492", "HG03516", "HG03540", "HG03579", "NA12878",
-    "NA18906", "NA19240", "NA20129",
+    "HG00438", "HG00514", "HG00673", "HG00733", "HG00735", "HG00741", "HG01071",
+    "HG01109", "HG01175", "HG01243", "HG01358", "HG01361", "HG01891",
+    "HG01952", "HG01978", "HG02145", "HG02148", "HG02257",
+    "HG02572", "HG02630", "HG02717", "HG02723", "HG02818", "HG02886", "HG03098",
+    "HG03486", "HG03516", "HG03540", "HG03579",
+    "NA19240",
 ]
 
 
@@ -68,25 +73,35 @@ def _catalog_base(sample, cov):
 def build_sample(sample, data_dir, force):
     """Downloads + joins one held-out sample and writes its per-sample parquet."""
     out_path = os.path.join(data_dir, "real_43", "%s.parquet" % sample)
-    if os.path.exists(out_path) and not force:
-        return out_path
     cov = _discover_cov(sample)
     base = _catalog_base(sample, cov)
     listing = subprocess.run(["gsutil", "ls", base + "json/"],
                              capture_output=True, text=True, check=True).stdout.split()
     json_remote = sorted(p for p in listing if p.endswith(".json") or p.endswith(".json.gz"))
-    tsv_remote = ("%s%s.tandem_repeat_genotypes.for_comparison.with_%s_vs_Truth_columns."
-                  "alleles.tsv.gz" % (base, sample, VARIANT))
-    print("=== %s (%s): %d json file(s) ===" % (sample, cov, len(json_remote)), flush=True)
 
     dl_dir = os.path.join(data_dir, "real_43", "_downloads", sample)
+    genotypes_tsv_remote = dataset._truth_genotypes_tsv_remote(sample)
+    # Checked even when the parquet cache below is about to be reused -- see dataset.build_combo.
+    dataset._check_freshness(sample, [
+        ("json shard %d" % i, r, os.path.join(dl_dir, os.path.basename(r)))
+        for i, r in enumerate(json_remote)
+    ] + [
+        ("truth-genotypes TSV", genotypes_tsv_remote,
+         os.path.join(dl_dir, os.path.basename(genotypes_tsv_remote))),
+    ])
+
+    if os.path.exists(out_path) and not force:
+        return out_path
+    print("=== %s (%s): %d json file(s) ===" % (sample, cov, len(json_remote)), flush=True)
+
     json_local = dataset._download(json_remote, dl_dir)
-    tsv_local = dataset._download([tsv_remote], dl_dir)[0]
+    genotypes_tsv_local = dataset._download([genotypes_tsv_remote], dl_dir)[0]
 
     rows = []
     for path in json_local:
         rows.extend(eh_json.extract_rows(path, sample_id=sample))
-    merged = dataset._join_truth(pd.DataFrame(rows), dataset._load_truth_tsv(tsv_local, VARIANT))
+    merged = dataset._join_truth(
+        pd.DataFrame(rows), dataset._load_truth_from_genotypes_tsv(genotypes_tsv_local), sample)
     merged = merged.drop(columns=["sample_id"])
     for c in merged.select_dtypes("float64").columns:
         merged[c] = merged[c].astype("float32")
@@ -303,10 +318,11 @@ def main():
         HERE, "model", "genotype_quality_model_from_HG002_and_CHM1_CHM13.%s.json.gz"
         % datetime.date.today().strftime("%Y%m%d")),
         help="exported model .json[.gz] to apply (the format ExpansionHunter loads)")
-    parser.add_argument("--out", default=os.path.join(HERE, "report", "holdout43.json"))
+    parser.add_argument("--out", default=os.path.join(HERE, "report", "heldout.json"))
     parser.add_argument("--build-only", action="store_true", help="only download + build parquets")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--samples", nargs="+", default=None, help="subset (default: all 43)")
+    parser.add_argument("--samples", nargs="+", default=None,
+                        help="subset (default: all %d)" % len(SAMPLES))
     parser.add_argument("--max-alleles-per-sample", type=int, default=2_000_000,
                         help="seeded per-sample allele cap for the JSON-model apply (0 = all alleles)")
     args = parser.parse_args()

@@ -49,9 +49,11 @@ calibration set (never sklearn's internal random-split early stopping, which wou
 
 ## Training data
 
-**HG002** (10× / 20× / 31×) + **CHM1_CHM13** (46×), illumina WGS. The model uses **no
-locus-id or raw-coverage feature** — the realistic "train on some samples, apply to new samples"
-setting. `data/`, `model/`, `report/`, `results/` are gitignored and rebuilt from sources.
+**HG002** (10× / 20× / 31×) + **CHM1_CHM13** (46×), illumina WGS, plus 13 HPRC samples
+(`dataset.PROMOTED_HELDOUT_SAMPLES`) promoted from the held-out panel for ancestry/sex diversity at
+large allele sizes. The model uses **no locus-id or raw-coverage feature** — the realistic "train on
+some samples, apply to new samples" setting. `data/`, `model/`, `report/`, `results/` are gitignored
+and rebuilt from sources.
 
 ## Feature-order contract
 
@@ -70,18 +72,19 @@ change.
 | `dataset.py` | GCS download + parquet assembly |
 | `model.py` | the two heads + JSON serialization + round-trip verification + vectorized JSON inference |
 | `metrics.py` | held-out accuracy / direction / gated-MAE metrics |
-| `report.py` | 5-fold CV + HTML report (MAE chart, feature importance, ablation, optional 43-sample section) |
-| `holdout43.py` | external validation: apply the exported `.json.gz` to 43 held-out HPRC samples |
-| `*_tests.py` | unit tests (`python3 -m pytest -q`) |
+| `report.py` | 5-fold CV + HTML report (MAE chart, feature importance, ablation, optional 30-sample held-out section) |
+| `heldout.py` | external validation: apply the exported `.json.gz` to the 30 held-out HPRC samples |
+| `*_tests.py` | unit tests (`python3 -m unittest discover -p "*_tests.py"`) |
 | `original/` | the prior multi-module implementation, kept for reference |
 
 ## External validation (optional)
 
-`holdout43.py` loads the exported model from its `.json.gz` (the exact format ExpansionHunter
-consumes) and **applies it unchanged — no re-fitting** — to 43 HPRC short-read samples absent from the
-training pool, scoring against their truth. `holdout43.py` itself writes a standalone
-`report/holdout43.json` benchmark dump; the report's held-out-43 section is generated separately by
-`gen_datasets.py --dataset heldout43` (which reuses `holdout43.run_eval` to emit the
+`heldout.py` loads the exported model from its `.json.gz` (the exact format ExpansionHunter
+consumes) and **applies it unchanged — no re-fitting** — to the 30 HPRC short-read samples absent from
+the training pool (13 others from the original 43-sample panel were promoted into training — see
+Training data above), scoring against their truth. `heldout.py` itself writes a standalone
+`report/heldout.json` benchmark dump; the report's held-out-43 section is generated separately by
+`gen_datasets.py --dataset heldout43` (which reuses `heldout.run_eval` to emit the
 `report/eval_heldout43.json` / `report/stacked_heldout43.json` artifacts `report.py` reads). Run the
 whole chain via `RUN_HOLDOUT43=1 ./train_model.sh` (builds the parquets, runs `gen_datasets.py`, then
 re-renders the report); a ~7-8 GB download.
@@ -89,5 +92,5 @@ re-renders the report); a ~7-8 GB download.
 ## Tests
 
 ```bash
-python3 -m pytest -q
+python3 -m unittest discover -p "*_tests.py"
 ```

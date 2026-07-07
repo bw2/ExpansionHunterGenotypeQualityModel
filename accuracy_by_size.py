@@ -128,16 +128,18 @@ def categorize_tsv(tsv_path, tool):
     c = _cols(tool)
     df = pd.read_csv(tsv_path, sep="\t", low_memory=False, dtype={c["locus"]: str},
                      usecols=list(c.values()))
+    # ANALYSIS_OK[imputation]: malformed/missing TSV fields below become NaN; classify() treats NaN
+    # "d" as "No Call" by design (see its docstring), and xbin()/stratification tolerate NaN motif/purity.
     out = pd.DataFrame({
         "locus": df[c["locus"]].astype(str).str.replace(r"^chr", "", regex=True),
         "motif": pd.to_numeric(df[c["motif"]], errors="coerce"),
-        "d": pd.to_numeric(df[c["d"]], errors="coerce"),
+        "d": pd.to_numeric(df[c["d"]], errors="coerce"),  # ANALYSIS_OK[imputation]: see rationale above.
         "n": pd.to_numeric(df[c["n"]], errors="coerce"),
         "drr_truth": pd.to_numeric(df[c["drr_truth"]], errors="coerce"),
         "drr_tool": pd.to_numeric(df[c["drr_tool"]], errors="coerce"),
         "is_ref": _as_bool(df[c["is_ref"]]),
         "is_hom_ref": _as_bool(df[c["is_hom_ref"]]),
-        "true_repeats": pd.to_numeric(df[c["true_repeats"]], errors="coerce"),
+        "true_repeats": pd.to_numeric(df[c["true_repeats"]], errors="coerce"),  # ANALYSIS_OK[imputation]: see rationale above.
         "purity": pd.to_numeric(df[c["purity"]], errors="coerce"),
     })
     out["category"] = classify(out["d"], out["n"], out["drr_truth"], out["drr_tool"],
@@ -173,6 +175,16 @@ CORRECTION_VARIANTS = (
 PURITY_VARIANTS = (
     ("off", "Off", None),
     ("p95", "> 0.95 pure", 0.95),
+)
+
+# pOk-stratum filter for the accuracy-by-size pill: splits alleles by the model's own predicted
+# confidence, independent of which LCF-correction variant is selected (so e.g. "Raw EH, p < 0.5" shows
+# how the uncorrected calls look specifically where the model would consider applying a correction).
+# (key, pill label, mode) where mode is None (no filter) / "lt" (pOk < 0.5) / "ge" (pOk >= 0.5).
+POK_VARIANTS = (
+    ("all", "All", None),
+    ("lt050", "p < 0.5", "lt"),
+    ("ge050", "p ≥ 0.5", "ge"),
 )
 
 
@@ -217,6 +229,8 @@ def predict_lcf_pok(parquet_paths, model_path, cap=None):
         df = pd.read_parquet(p)
         if cap and len(df) > cap:
             df = df.sample(cap, random_state=20260616).reset_index(drop=True)
+        # ANALYSIS_OK[imputation]: NaN spanning_at_called -> 0 is genotyping_regime_of's documented
+        # default (features.py), routing such alleles to full_nonspanning.
         df = df.assign(_regime=features.genotyping_regime_of(
             df["genotyping_branch"].to_numpy(),
             pd.to_numeric(df["spanning_at_called"], errors="coerce").to_numpy()))
@@ -241,7 +255,10 @@ def add_corrected_categories(cat, preds):
     (from ``predict_lcf_pok``) by ``(locus, allele_rank)``. The corrected call + its category are the
     same for any gated allele across variants -- only the gate (which alleles get it) differs.
     """
-    m = assign_allele_rank(cat).merge(preds, on=["locus", "allele_rank"], how="left")
+    m = assign_allele_rank(cat).merge(preds, on=["locus", "allele_rank"], how="left",
+                                       validate="one_to_one")
+    # ANALYSIS_OK[imputation]: unmatched/capped-out alleles get NaN n/lcf/pok from this left join; see
+    # the "Alleles with no prediction" comment below for how NaN pok is then excluded from the panels.
     n = pd.to_numeric(m["n"], errors="coerce").to_numpy(dtype=float)
     lcf = pd.to_numeric(m["lcf"], errors="coerce").to_numpy(dtype=float)
     pok = pd.to_numeric(m["pok"], errors="coerce").to_numpy(dtype=float)
@@ -283,10 +300,13 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     import model as M
     import features
     df = pd.read_parquet(parquet_path)
+    # ANALYSIS_OK[imputation]: rows with unparseable truth are dropped by the notna() filter below.
     df = df[pd.to_numeric(df["true"], errors="coerce").notna()].reset_index(drop=True)
     eh = pd.to_numeric(df["eh"], errors="coerce").to_numpy(dtype=float)
     true = pd.to_numeric(df["true"], errors="coerce").to_numpy(dtype=float)
     nref = pd.to_numeric(df["num_repeats_in_reference"], errors="coerce").to_numpy(dtype=float)
+    # ANALYSIS_OK[imputation]: remaining eh/nref/motif/purity NaNs propagate into classify()/xbin(),
+    # which are NaN-aware by design (see their docstrings).
     motif = pd.to_numeric(df["motif_size"], errors="coerce").to_numpy(dtype=float)
     purity = pd.to_numeric(df["purity"], errors="coerce").to_numpy(dtype=float)
     locus = df["locus_id"].astype(str).str.replace(r"^chr", "", regex=True).to_numpy()
@@ -307,6 +327,8 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     sel = np.arange(len(df))
     if corrected_cap and len(df) > corrected_cap:
         sel = np.sort(np.random.default_rng(20260616).choice(sel, corrected_cap, replace=False))
+    # ANALYSIS_OK[imputation]: NaN spanning_at_called -> 0 is genotyping_regime_of's documented
+    # default (features.py), routing such alleles to full_nonspanning.
     sub = df.iloc[sel].assign(_row=sel, _regime=features.genotyping_regime_of(
         df.iloc[sel]["genotyping_branch"].to_numpy(),
         pd.to_numeric(df.iloc[sel]["spanning_at_called"], errors="coerce").to_numpy()))
@@ -322,7 +344,8 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     non_spanning[sub["_row"].to_numpy()] = (
         sub["_regime"].to_numpy() == features.GENOTYPING_REGIME_FULL_NONSPANNING)
     corrected = np.round(np.where(lcf > 0, eh / np.where(lcf > 0, lcf, np.nan), eh))
-    out = {"category": cat, "xbin": xbin(drr_truth), "motif": motif, "locus": locus, "purity": purity}
+    out = {"category": cat, "xbin": xbin(drr_truth), "motif": motif, "locus": locus, "purity": purity,
+           "pok": pok}
     # When corrected_cap < len(df) the model is applied only to the sampled rows; pok stays NaN for the
     # rest. Marking those None (so bin_counts drops them from the corrected panels) keeps the
     # LCF-corrected accuracy on the alleles actually scored, instead of diluting it with raw rows that
@@ -340,21 +363,27 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     return pd.DataFrame(out)
 
 
-def bin_counts(cat, category_col, homopolymer, purity_min=None):
+def bin_counts(cat, category_col, homopolymer, purity_min=None, pok_stratum=None):
     """Tallies a per-category x-bin count matrix for the homopolymer / non-homopolymer subset.
 
     ``purity_min`` (when not None) additionally keeps only alleles whose truth repeat purity strictly
-    exceeds it (NaN purity is dropped). Rows whose ``category_col`` is None are dropped too: a
-    corrected variant marks the alleles the model was NOT applied to (capped out / unmatched) as None,
-    so they are excluded from the corrected panel's numerator AND denominator rather than silently
-    counted as raw (the raw ``category`` column is never None, so the raw panel keeps every allele).
+    exceeds it (NaN purity is dropped). ``pok_stratum`` (when not None) additionally keeps only alleles
+    whose predicted ``pok`` is ``< 0.5`` (``"lt"``) or ``>= 0.5`` (``"ge"``); NaN pok (model not applied
+    to that allele) is dropped. Rows whose ``category_col`` is None are dropped too: a corrected variant
+    marks the alleles the model was NOT applied to (capped out / unmatched) as None, so they are
+    excluded from the corrected panel's numerator AND denominator rather than silently counted as raw
+    (the raw ``category`` column is never None, so the raw panel keeps every allele).
     Returns a dict with ``counts`` (category -> list of ``len(X_LABELS)`` ints), ``alleles_per_bin``
     (total alleles per x-bin), ``same`` / ``total`` scalars and ``loci`` (the set of distinct locus
     ids kept) for the title.
     """
     sel = cat[cat["motif"] == 1] if homopolymer else cat[cat["motif"] > 1]
+    # ANALYSIS_OK[imputation]: NaN purity/pok dropped below, per this function's docstring above.
     if purity_min is not None:
         sel = sel[pd.to_numeric(sel["purity"], errors="coerce") > purity_min]
+    if pok_stratum is not None:
+        pok = pd.to_numeric(sel["pok"], errors="coerce")
+        sel = sel[(pok < 0.5) if pok_stratum == "lt" else (pok >= 0.5)]
     sel = sel[sel[category_col].notna()]  # drop alleles the model wasn't applied to (corrected variants)
     nb = len(X_LABELS)
     xb = sel["xbin"].to_numpy()
@@ -446,4 +475,5 @@ if __name__ == "__main__":
           % (same, 100.0 * same / len(sub)))
     print("loci: %d  (published 171,200)" % sub["locus"].nunique())
     print("\ncategory counts:")
+    # ANALYSIS_OK[imputation]: zero-fills absent categories in this diagnostic printout only.
     print(sub["category"].value_counts().reindex(CATEGORIES).fillna(0).astype(int).to_string())

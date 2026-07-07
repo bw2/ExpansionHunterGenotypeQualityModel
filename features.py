@@ -103,6 +103,7 @@ def add_engineered(df):
     missing (legitimate negatives/zeros are kept).
     """
     df = df.copy()
+    # ANALYSIS_OK[imputation]: NaN ci_*/eh are set to 0 below (ci_missing), per this docstring above.
     eh = pd.to_numeric(df["eh"], errors="coerce")
     ci_start = pd.to_numeric(df["ci_start"], errors="coerce")
     ci_end = pd.to_numeric(df["ci_end"], errors="coerce")
@@ -173,6 +174,7 @@ def genotyping_regime_of(genotyping_branch, spanning_at_called):
     called size: ``>= 1`` -> ``full_spanning`` else ``full_nonspanning`` (NaN -> 0).
     """
     branch = np.asarray(genotyping_branch, dtype=object)
+    # ANALYSIS_OK[imputation]: NaN -> 0 is documented above (routes to full_nonspanning).
     span = np.nan_to_num(np.asarray(spanning_at_called, dtype=float), nan=0.0)
     out = np.where(span >= 1, GENOTYPING_REGIME_FULL_SPANNING, GENOTYPING_REGIME_FULL_NONSPANNING).astype(object)
     out[branch == BRANCH_QUICK] = GENOTYPING_REGIME_QUICK
@@ -186,6 +188,8 @@ def add_labels(df):
     and ``spanning_at_called``. Adds ``t``, ``allele_bp``, ``tol_repeats``,
     ``dir_code``, ``direction`` and ``genotyping_regime``. Returns the same ``df``.
     """
+    # ANALYSIS_OK[imputation]: this function's only caller (dataset.label_and_filter) already drops
+    # NaN/nonpositive eh/true/motif before calling it; this re-parse is defensive for other callers.
     eh = pd.to_numeric(df["eh"], errors="coerce").to_numpy(dtype=float)
     true = pd.to_numeric(df["true"], errors="coerce").to_numpy(dtype=float)
     motif = pd.to_numeric(df["motif_size"], errors="coerce").to_numpy(dtype=float)
@@ -196,6 +200,7 @@ def add_labels(df):
     df["dir_code"] = direction_codes(eh, true, tol)
     df["direction"] = pd.Series(df["dir_code"], index=df.index).map(
         dict(enumerate(DIR_CLASS_NAMES)))
+    # ANALYSIS_OK[imputation]: NaN -> 0 is genotyping_regime_of's documented default.
     df["genotyping_regime"] = genotyping_regime_of(
         df["genotyping_branch"].to_numpy(),
         pd.to_numeric(df["spanning_at_called"], errors="coerce").to_numpy())

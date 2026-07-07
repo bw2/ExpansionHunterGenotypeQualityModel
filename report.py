@@ -34,8 +34,10 @@ from sklearn.metrics import (average_precision_score, make_scorer, mean_pinball_
                              precision_recall_curve, roc_auc_score, roc_curve)
 
 import accuracy_by_size as ABS
+import dataset
 import eh_json
 import features
+import heldout
 import metrics
 import model as M
 
@@ -45,7 +47,7 @@ ALL_CHROMS = [str(i) for i in range(1, 23)] + ["X", "Y"]
 GRAY, ORANGE = "#888888", "#F58518"
 IMPORTANCE_CAP = 30_000  # held-out rows used for permutation importance
 TOP_N = 15               # features shown per importance panel
-ABLATION_KMAX = 22       # max # of top features in the add-one ablation curve (full = 22, quick = 20)
+ABLATION_KMAX = 22       # max # of top features in the add-one ablation curve (full: 22 of 24; quick: all 22, never truncated)
 ABLATION_TRAIN_CAP = 120_000
 ABLATION_TEST_CAP = 150_000
 REGIME_COLORS = {"quick": "#4c72b0", "full_spanning": "#dd8452", "full_nonspanning": "#55a868"}
@@ -647,13 +649,14 @@ def plot_confusion(results, out_png, title_tag="non-homopolymer"):
     fig.savefig(out_png, dpi=150, bbox_inches="tight"); plt.close(fig)
 
 
-def plot_helped_hurt(holdout, out_png, homopolymer=False, title_tag="non-homopolymer"):
+def plot_helped_hurt(holdout, out_png, homopolymer=False, title_tag="non-homopolymer",
+                     dataset_label="held-out HPRC"):
     """Loci the LCF would move closer (green) vs further (red) from truth, split by pOk stratum.
 
     Left panel = pOk<0.5 (where the gate APPLIES the LCF): helped should dominate. Right panel =
     pOk>=0.5 (where the gate KEEPS raw EH): hurt dominating is exactly why those calls are left alone.
     ``homopolymer`` reads the per-regime ``homopolymer`` sub-dict counts instead of the top-level
-    (non-homopolymer) counts; ``title_tag`` labels the suptitle.
+    (non-homopolymer) counts; ``title_tag`` labels the suptitle; ``dataset_label`` names the dataset.
     """
     gr = holdout["genotyping_regimes"]
     def _c(r):
@@ -674,7 +677,7 @@ def plot_helped_hurt(holdout, out_png, homopolymer=False, title_tag="non-homopol
         ax.set_ylabel("number of alleles")
         ax.set_ylim(top=ax.get_ylim()[1] * 1.25)  # headroom so legend clears tall bars
         ax.set_title(title); ax.grid(axis="y", alpha=0.3); ax.legend()
-    fig.suptitle("Would LCF correction help or hurt? (held-out 43 samples, by pOk stratum) — %s" % title_tag,
+    fig.suptitle("Would LCF correction help or hurt? (%s, by pOk stratum) — %s" % (dataset_label, title_tag),
                  fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_png, dpi=150, bbox_inches="tight"); plt.close(fig)
@@ -687,7 +690,10 @@ _REDUCTION_LABEL = "error reduction (repeats)\n>0 = better, <0 = worse than EH o
 
 def _violin_ylim(ax, data):
     """Sets a 1-99th-percentile y-limit (with padding) so a few extreme alleles don't flatten violins."""
-    allv = np.concatenate([d for d in data if len(d)])
+    nonempty = [d for d in data if len(d)]
+    if not nonempty:
+        return
+    allv = np.concatenate(nonempty)
     if allv.size > 1:
         lo, hi = np.percentile(allv, [1, 99])
         pad = max(0.5, 0.1 * (hi - lo))
@@ -727,7 +733,7 @@ def _style_violin_extrema(vp):
 
 
 def plot_violins(violin, out_png, thresholds=(0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1),
-                 pfx="", title_tag="non-homopolymer"):
+                 pfx="", title_tag="non-homopolymer", dataset_label="held-out HPRC"):
     """Violins of the per-allele signed error reduction, one panel per genotyping regime.
 
     reduction = |true - eh| - |true - eh/LCF| (>0 = correction moved the call closer to truth). Per
@@ -735,7 +741,8 @@ def plot_violins(violin, out_png, thresholds=(0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3,
     where the gate keeps raw EH). Per-regime y-scale; y clipped to the 1-99th percentile.
 
     ``pfx`` selects the per-allele arrays: ``""`` -> non-homopolymer ``{r}__red/pok``, ``"h"`` ->
-    homopolymer-only ``{r}__hred/hpok``. ``title_tag`` labels the suptitle.
+    homopolymer-only ``{r}__hred/hpok``. ``title_tag`` labels the suptitle; ``dataset_label`` names
+    the dataset.
     """
     regs = [r for r in features.GENOTYPING_REGIMES if ("%s__%sred" % (r, pfx)) in violin]
     fig, axes = plt.subplots(1, len(regs), figsize=(5.0 * len(regs), 5.8))
@@ -746,20 +753,20 @@ def plot_violins(violin, out_png, thresholds=(0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3,
         data = [red[pok < t] for t in thresholds] + [red[pok >= 0.5]]
         counts = [int(d.size) for d in data]
         data = [d if d.size else np.zeros(1) for d in data]
+        _violin_ylim(ax, data)
         vp = ax.violinplot(data, showmedians=True, showextrema=True, widths=0.85)
         _style_violin_extrema(vp)
         for body, c in zip(vp["bodies"], ["#4c72b0"] * len(thresholds) + ["#dd8452"]):
             body.set_facecolor(c); body.set_alpha(0.65)
         ax.axhline(0, color="k", lw=0.9, ls="--")
-        _violin_ylim(ax, data)
         ax.set_xticks(np.arange(1, len(data) + 1))
         ax.set_xticklabels(["pOk<%g" % t for t in thresholds] + ["pOk≥0.5"], fontsize=8, rotation=45)
         _violin_counts(ax, counts, header=(ax is axes[0]))
         ax.set_title(features.GENOTYPING_REGIME_DISPLAY[r], pad=_VIOLIN_COUNT_PAD)
         ax.set_ylabel(_REDUCTION_LABEL)
         ax.grid(axis="y", alpha=0.3)
-    fig.suptitle("Per-allele error reduction from LCF correction (held-out 43), by pOk stratum — %s" % title_tag,
-                 fontsize=13, weight="bold")
+    fig.suptitle("Per-allele error reduction from LCF correction (%s), by pOk stratum — %s"
+                 % (dataset_label, title_tag), fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_png, dpi=130, bbox_inches="tight"); plt.close(fig)
 
@@ -781,7 +788,7 @@ _REGIME_ALLELE_DESC = {
 }
 
 
-def plot_violins_lcf(violin, out_png, pfx="", title_tag="non-homopolymer"):
+def plot_violins_lcf(violin, out_png, pfx="", title_tag="non-homopolymer", dataset_label="held-out HPRC"):
     """Second violin plot: error reduction by pOk(<0.5 / >=0.5) x predicted-LCF bin.
 
     Grid of regime (rows) x pOk stratum (cols, pOk<0.5 = gate APPLIES the LCF, pOk>=0.5 = gate keeps
@@ -790,7 +797,8 @@ def plot_violins_lcf(violin, out_png, pfx="", title_tag="non-homopolymer"):
     correction). Allele count angled above each violin.
 
     ``pfx`` selects the per-allele arrays: ``""`` -> the non-homopolymer ``{r}__red/pok/lcf`` sample,
-    ``"h"`` -> the homopolymer-only ``{r}__hred/hpok/hlcf`` sample. ``title_tag`` labels the suptitle.
+    ``"h"`` -> the homopolymer-only ``{r}__hred/hpok/hlcf`` sample. ``title_tag`` labels the suptitle;
+    ``dataset_label`` names the dataset.
     """
     regs = [r for r in features.GENOTYPING_REGIMES if ("%s__%sred" % (r, pfx)) in violin]
     cols = [("p < 0.5", lambda p: p < 0.5), ("p ≥ 0.5", lambda p: p >= 0.5)]
@@ -827,7 +835,7 @@ def plot_violins_lcf(violin, out_png, pfx="", title_tag="non-homopolymer"):
             for j in range(2):
                 axes[i][j].set_ylim(lo - pad, top)
     fig.suptitle("Error reduction by predicted-LCF bin (correction size + direction), by pOk stratum "
-                 "— %s (held-out 43)" % title_tag, fontsize=13, weight="bold")
+                 "— %s (%s)" % (title_tag, dataset_label), fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out_png, dpi=130, bbox_inches="tight"); plt.close(fig)
 
@@ -848,12 +856,13 @@ def _motif_bin(motif):
     return idx
 
 
-def plot_violins_motif(violin, out_png):
+def plot_violins_motif(violin, out_png, dataset_label="held-out HPRC"):
     """Violins of per-allele signed error reduction at the deployment gate (pOk<0.5), by motif size.
 
     One panel per genotyping regime; within each, one violin per motif-size bin (1..6 bp, 7-24 bp,
     25+ bp). Only ``pOk < 0.5`` alleles -- the stratum where the gate actually applies the LCF. Allele
     count angled above each violin; per-regime y-scale clipped to the 1-99th percentile.
+    ``dataset_label`` names the dataset.
     """
     regs = [r for r in features.GENOTYPING_REGIMES if ("%s__motif" % r) in violin]
     fig, axes = plt.subplots(1, len(regs), figsize=(5.0 * len(regs), 5.8), squeeze=False)
@@ -880,7 +889,7 @@ def plot_violins_motif(violin, out_png):
         ax.set_title(features.GENOTYPING_REGIME_DISPLAY[r], pad=_VIOLIN_COUNT_PAD)
         ax.set_ylabel(_REDUCTION_LABEL)
         ax.grid(axis="y", alpha=0.3)
-    fig.suptitle("Per-allele error reduction at the pOk < 0.5 threshold, by motif size (held-out 43)",
+    fig.suptitle("Per-allele error reduction at the pOk < 0.5 threshold, by motif size (%s)" % dataset_label,
                  fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_png, dpi=130, bbox_inches="tight"); plt.close(fig)
@@ -893,7 +902,7 @@ _PDIFF_BIN_LABELS = tuple("%.1f:%.1f" % (_PDIFF_BIN_EDGES[i], _PDIFF_BIN_EDGES[i
                           for i in range(len(_PDIFF_BIN_EDGES) - 1))
 
 
-def plot_violins_pdiff(violin, out_png, pfx="", title_tag="non-homopolymer"):
+def plot_violins_pdiff(violin, out_png, pfx="", title_tag="non-homopolymer", dataset_label="held-out HPRC"):
     """Violins of per-allele signed error reduction, one panel per genotyping regime, binned by the
     direction-head lean ``pTooLong - pTooShort``.
 
@@ -903,7 +912,8 @@ def plot_violins_pdiff(violin, out_png, pfx="", title_tag="non-homopolymer"):
     Per-regime y-scale; y clipped to the 1-99th percentile.
 
     ``pfx`` selects the per-allele arrays: ``""`` -> non-homopolymer ``{r}__red`` + ``{r}__pdiff``,
-    ``"h"`` -> homopolymer-only ``{r}__hred`` + ``{r}__hpdiff``. ``title_tag`` labels the suptitle.
+    ``"h"`` -> homopolymer-only ``{r}__hred`` + ``{r}__hpdiff``. ``title_tag`` labels the suptitle;
+    ``dataset_label`` names the dataset.
     """
     regs = [r for r in features.GENOTYPING_REGIMES if ("%s__%spdiff" % (r, pfx)) in violin]
     nb = len(_PDIFF_BIN_LABELS)
@@ -931,8 +941,8 @@ def plot_violins_pdiff(violin, out_png, pfx="", title_tag="non-homopolymer"):
         ax.set_title(features.GENOTYPING_REGIME_DISPLAY[r], pad=_VIOLIN_COUNT_PAD)
         ax.set_ylabel(_REDUCTION_LABEL)
         ax.grid(axis="y", alpha=0.3)
-    fig.suptitle("Per-allele error reduction from LCF correction (held-out 43), by direction lean "
-                 "(pTooLong − pTooShort) — %s" % title_tag, fontsize=13, weight="bold")
+    fig.suptitle("Per-allele error reduction from LCF correction (%s), by direction lean "
+                 "(pTooLong − pTooShort) — %s" % (dataset_label, title_tag), fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_png, dpi=130, bbox_inches="tight"); plt.close(fig)
 
@@ -944,7 +954,8 @@ _LCF_STRATA_EDGES = (0.2, 0.25, 0.5, 1.0, 2.0, 4.0, 5.0)
 _LCF_STRATA_LABELS = ("0–0.2", "0.2–0.25", "0.25–0.5", "0.5–1", "1–2", "2–4", "4–5", ">5")
 
 
-def plot_violins_lcf_bins(violin, out_png, pfx="", title_tag="non-homopolymer"):
+def plot_violins_lcf_bins(violin, out_png, pfx="", title_tag="non-homopolymer",
+                          dataset_label="held-out HPRC"):
     """Violins of per-allele signed error reduction, one panel per genotyping regime, binned by the
     predicted ``LCF`` (correction size + direction).
 
@@ -955,7 +966,8 @@ def plot_violins_lcf_bins(violin, out_png, pfx="", title_tag="non-homopolymer"):
     the 1-99th percentile.
 
     ``pfx`` selects the per-allele arrays: ``""`` -> non-homopolymer ``{r}__red`` + ``{r}__lcf``,
-    ``"h"`` -> homopolymer-only ``{r}__hred`` + ``{r}__hlcf``. ``title_tag`` labels the suptitle.
+    ``"h"`` -> homopolymer-only ``{r}__hred`` + ``{r}__hlcf``. ``title_tag`` labels the suptitle;
+    ``dataset_label`` names the dataset.
     """
     regs = [r for r in features.GENOTYPING_REGIMES if ("%s__%slcf" % (r, pfx)) in violin]
     nb = len(_LCF_STRATA_LABELS)
@@ -983,8 +995,8 @@ def plot_violins_lcf_bins(violin, out_png, pfx="", title_tag="non-homopolymer"):
         ax.set_title(features.GENOTYPING_REGIME_DISPLAY[r], pad=_VIOLIN_COUNT_PAD)
         ax.set_ylabel(_REDUCTION_LABEL)
         ax.grid(axis="y", alpha=0.3)
-    fig.suptitle("Per-allele error reduction from LCF correction (held-out 43), by predicted LCF "
-                 "(corrected = eh/LCF) — %s" % title_tag, fontsize=13, weight="bold")
+    fig.suptitle("Per-allele error reduction from LCF correction (%s), by predicted LCF "
+                 "(corrected = eh/LCF) — %s" % (dataset_label, title_tag), fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_png, dpi=130, bbox_inches="tight"); plt.close(fig)
 
@@ -1131,7 +1143,7 @@ def _holdout_table(holdout):
 
 # Datasets the per-plot Dataset pill switches between (key -> display label).
 DATASETS = [("hg002_genome", "HG002 genome (31x)"),
-            ("heldout43", "43 held-out HPRC"),
+            ("heldout43", "%d held-out HPRC" % len(heldout.SAMPLES)),
             ("hg002_exome", "HG002 exome (3x)")]
 
 
@@ -1175,6 +1187,18 @@ def _pills(gid, dims, contents):
     return "".join(out)
 
 
+def _ds_dim_for(contents, present):
+    """Dataset pill dimension restricted to the datasets actually populated in ``contents`` (a dataset
+    missing this section's artifact would otherwise render a blank panel).
+
+    Args:
+        contents: ``{(val_key per dim, in dim order): html_string}`` -- the section's own pill contents.
+        present: ``[(key, label), ...]`` datasets with at least one artifact loaded this report run.
+    """
+    keys = {combo[0] for combo in contents}
+    return ("ds", "Dataset", [(k, l) for k, l in present if k in keys])
+
+
 def build_dataset_sections(out_dir, regenerate=True):
     """Renders the per-dataset evaluation + accuracy-by-size plots and returns the report HTML.
 
@@ -1199,11 +1223,6 @@ def build_dataset_sections(out_dir, regenerate=True):
     present = [(k, l) for k, l in DATASETS if k in evals or k in stacked]
     if not present:
         return ""
-    def ds_dim_for(contents):
-        """Dataset pill dimension restricted to the datasets actually populated in this section's
-        contents (a dataset missing this section's artifact would otherwise render a blank panel)."""
-        keys = {combo[0] for combo in contents}
-        return ("ds", "Dataset", [(k, l) for k, l in present if k in keys])
     homo_dim = ("homo", "Homopolymers", [("nh", "Non-homopolymer"), ("ho", "Homopolymer")])
 
     def P(name):
@@ -1212,8 +1231,10 @@ def build_dataset_sections(out_dir, regenerate=True):
     parts = ["<h2>External validation by dataset</h2>",
              "<p class='note'>The exported model is applied unchanged (no fitting) to each dataset, "
              "scored against truth. Use the <b>Dataset</b> pill on every plot below to switch between "
-             "<b>HG002 genome (31x)</b>, the <b>43 held-out HPRC samples</b> (absent from training), and "
-             "<b>HG002 exome (3x)</b>.</p>"]
+             "<b>HG002 genome (31x)</b>, the <b>%d held-out HPRC samples</b> (absent from training -- a "
+             "further %d HPRC samples were promoted into the training pool below for ancestry/sex "
+             "diversity), and <b>HG002 exome (3x)</b>.</p>"
+             % (len(heldout.SAMPLES), len(dataset.PROMOTED_HELDOUT_SAMPLES))]
 
     # --- accuracy by true allele size (str-truth-set-v2 stacked-bar replica) ---
     abs_imgs = {}
@@ -1225,30 +1246,33 @@ def build_dataset_sections(out_dir, regenerate=True):
                                  ("ho", "homo", "homopolymer, 1 bp motif")):
             for vkey, _, vnote, _ in ABS.CORRECTION_VARIANTS:
                 for pkey, _, pmin in ABS.PURITY_VARIANTS:
-                    data = sd[hcol].get(vkey, {}).get(pkey)
-                    if data is None:
-                        continue
-                    hdesc = hdesc0 + ("" if pmin is None else ", repeat purity > %g" % pmin)
-                    png = P("ds_abs_%s_%s_%s_%s.png" % (key, hk, vkey, pkey))
-                    try:
-                        if regenerate:
-                            ABS.plot_accuracy_by_size(data, png, sd["tool_label"], sd["coverage_label"],
-                                                      hdesc, vnote)
-                        abs_imgs[(key, hk, vkey, pkey)] = _img(png)
-                    except Exception as e:
-                        print("  [%s] accuracy-by-size %s/%s/%s skipped: %s"
-                              % (key, hk, vkey, pkey, e), flush=True)
+                    for kkey, klabel, _ in ABS.POK_VARIANTS:
+                        data = sd[hcol].get(vkey, {}).get(pkey, {}).get(kkey)
+                        if data is None:
+                            continue
+                        hdesc = (hdesc0 + ("" if pmin is None else ", repeat purity > %g" % pmin)
+                                 + ("" if kkey == "all" else ", %s" % klabel))
+                        png = P("ds_abs_%s_%s_%s_%s_%s.png" % (key, hk, vkey, pkey, kkey))
+                        try:
+                            if regenerate:
+                                ABS.plot_accuracy_by_size(data, png, sd["tool_label"], sd["coverage_label"],
+                                                          hdesc, vnote)
+                            abs_imgs[(key, hk, vkey, pkey, kkey)] = _img(png)
+                        except Exception as e:
+                            print("  [%s] accuracy-by-size %s/%s/%s/%s skipped: %s"
+                                  % (key, hk, vkey, pkey, kkey, e), flush=True)
     if abs_imgs:
         parts += [
             "<h3>Accuracy by true allele size (per-allele call vs truth)</h3>",
-            _pills("absp", [ds_dim_for(abs_imgs), homo_dim,
+            _pills("absp", [_ds_dim_for(abs_imgs, present), homo_dim,
                             ("lcf", "LCF correction",
                              [(k, lbl) for k, lbl, _, _ in ABS.CORRECTION_VARIANTS]),
                             ("pur", "Repeat Purity Filter",
-                             [(k, lbl) for k, lbl, _ in ABS.PURITY_VARIANTS])],
+                             [(k, lbl) for k, lbl, _ in ABS.PURITY_VARIANTS]),
+                            ("pok", "pOk Filter",
+                             [(k, lbl) for k, lbl, _ in ABS.POK_VARIANTS])],
                    abs_imgs),
-            "<p class='note'>Replica of the str-truth-set-v2 "
-            "<code>tool_accuracy_by_true_allele_size</code> figure. Each allele is colored by how the "
+            "<p class='note'>Each allele is colored by how the "
             "ExpansionHunter call compares to its true size (<b>Same</b> = within &plusmn;1 repeat = "
             "exactly right; blue = under-call, orange = over-call, cyan = wrong direction, plus "
             "No&nbsp;Call / Hom&nbsp;Ref / Het&nbsp;Ref); the x-axis is true allele size minus the "
@@ -1267,11 +1291,11 @@ def build_dataset_sections(out_dir, regenerate=True):
     # --- per-dataset held-out accuracy table ---
     etab = {(k,): _holdout_table(evals[k]) for k, _ in present if k in evals}
     parts += ["<h3>Held-out accuracy (raw EH vs pOk&lt;0.5-gated LCF)</h3>",
-              _pills("etab", [ds_dim_for(etab)], etab)]
+              _pills("etab", [_ds_dim_for(etab, present)], etab)]
 
     def homo_family(gid, h3, prefix, render, desc, datasets_with):
         imgs = {}
-        for key, _ in present:
+        for key, label in present:
             if key not in datasets_with:
                 continue
             pngs = {}
@@ -1279,7 +1303,7 @@ def build_dataset_sections(out_dir, regenerate=True):
                 png = P("ds_%s_%s_%s.png" % (prefix, key, hk))
                 try:
                     if regenerate:
-                        render(key, png, pfx, tag)
+                        render(key, png, pfx, tag, label)
                     if os.path.exists(png):
                         pngs[hk] = png
                 except Exception as e:
@@ -1287,57 +1311,62 @@ def build_dataset_sections(out_dir, regenerate=True):
             if "nh" in pngs:
                 imgs[(key, "nh")] = _img(pngs["nh"])
                 imgs[(key, "ho")] = _img(pngs.get("ho", pngs["nh"]))
-        return ["<h3>%s</h3>" % h3, _pills(gid, [ds_dim_for(imgs), homo_dim], imgs), desc] if imgs else []
+        return ["<h3>%s</h3>" % h3, _pills(gid, [_ds_dim_for(imgs, present), homo_dim], imgs), desc] if imgs else []
 
     parts += homo_family(
         "dmae", "Mean absolute error: raw EH vs gated-LCF", "mae",
-        lambda k, png, pfx, tag: plot_mae(
+        lambda k, png, pfx, tag, label: plot_mae(
             _holdout_homopolymer_results(evals[k]) if pfx == "h" else _holdout_results(evals[k]), png),
         "<p class='note'>Raw-EH MAE vs the MAE after applying the LCF only where <code>pOk&lt;0.5</code>, "
         "per allele size bucket (repeat units).</p>", [k for k, _ in present if k in evals])
     parts += homo_family(
         "dhh", "Loci the LCF would help vs hurt, by pOk stratum", "hh",
-        lambda k, png, pfx, tag: plot_helped_hurt(evals[k], png, homopolymer=(pfx == "h"), title_tag=tag),
+        lambda k, png, pfx, tag, label: plot_helped_hurt(evals[k], png, homopolymer=(pfx == "h"),
+                                                         title_tag=tag, dataset_label=label),
         "<p class='note'>Would the LCF move each call <b>closer</b> (green) or <b>further</b> (red) from "
         "truth? Left = <code>pOk&lt;0.5</code> (threshold applies the LCF); right = <code>pOk&ge;0.5</code> "
         "(threshold keeps raw EH).</p>", [k for k, _ in present if k in evals])
     parts += homo_family(
         "dpokv", "Per-allele error reduction (signed), by pOk stratum", "pokv",
-        lambda k, png, pfx, tag: plot_violins(violins[k], png, pfx=pfx, title_tag=tag),
+        lambda k, png, pfx, tag, label: plot_violins(violins[k], png, pfx=pfx, title_tag=tag,
+                                                      dataset_label=label),
         "<p class='note'>Signed error reduction <code>|true&minus;eh| &minus; |true&minus;eh/LCF|</code> "
         "(above 0 = closer to truth) as the pOk threshold tightens.</p>",
         [k for k, _ in present if k in violins])
     parts += homo_family(
         "dlcfv", "Error reduction by predicted-LCF bin x pOk stratum", "lcfv",
-        lambda k, png, pfx, tag: plot_violins_lcf(violins[k], png, pfx=pfx, title_tag=tag),
+        lambda k, png, pfx, tag, label: plot_violins_lcf(violins[k], png, pfx=pfx, title_tag=tag,
+                                                          dataset_label=label),
         "<p class='note'>Signed error reduction split by pOk stratum (columns) and predicted-LCF bin.</p>",
         [k for k, _ in present if k in violins])
     parts += homo_family(
         "dpdv", "Per-allele error reduction by direction lean (pTooLong &minus; pTooShort)", "pdv",
-        lambda k, png, pfx, tag: plot_violins_pdiff(violins[k], png, pfx=pfx, title_tag=tag),
+        lambda k, png, pfx, tag, label: plot_violins_pdiff(violins[k], png, pfx=pfx, title_tag=tag,
+                                                            dataset_label=label),
         "<p class='note'>Signed error reduction binned by the direction predictor's lean "
         "<code>pTooLong &minus; pTooShort</code> (&minus;1 = TOO_SHORT .. +1 = TOO_LONG).</p>",
         [k for k, _ in present if k in violins])
     parts += homo_family(
         "dlcfb", "Per-allele error reduction by predicted LCF (correction size)", "lcfb",
-        lambda k, png, pfx, tag: plot_violins_lcf_bins(violins[k], png, pfx=pfx, title_tag=tag),
+        lambda k, png, pfx, tag, label: plot_violins_lcf_bins(violins[k], png, pfx=pfx, title_tag=tag,
+                                                               dataset_label=label),
         "<p class='note'>Signed error reduction binned by the predicted LCF "
         "(0&ndash;0.2 .. &gt;5; corrected = <code>eh/LCF</code>).</p>",
         [k for k, _ in present if k in violins])
 
     motif_imgs = {}
-    for key, _ in present:
+    for key, label in present:
         if key in violins:
             png = P("ds_motif_%s.png" % key)
             try:
                 if regenerate:
-                    plot_violins_motif(violins[key], png)
+                    plot_violins_motif(violins[key], png, dataset_label=label)
                 motif_imgs[(key,)] = _img(png)
             except Exception as e:
                 print("  [%s] motif violins skipped: %s" % (key, e), flush=True)
     if motif_imgs:
         parts += ["<h3>Error reduction at the pOk &lt; 0.5 threshold, by motif size</h3>",
-                  _pills("dmotif", [ds_dim_for(motif_imgs)], motif_imgs),
+                  _pills("dmotif", [_ds_dim_for(motif_imgs, present)], motif_imgs),
                   "<p class='note'>Signed error reduction for <code>pOk&lt;0.5</code> alleles, by motif "
                   "size (1bp .. 25+bp).</p>"]
     return "".join(parts)
@@ -1374,8 +1403,11 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
            ".pr+label.pillseg{border-radius:13px;border-left:1px solid #bbb;margin:0 4px 4px 0}"
            ".pr:checked+label.pillseg{background:#1457b8;color:#fff;border-color:#1457b8}"
            ".pillimgs .pc{display:none}")
-    pool = " + ".join("%s %s" % (s, c) for s, c in (("HG002", "(10x, 20x, and 31x coverage)"),
-                                                    ("CHM1_CHM13", "(46x coverage)")))
+    pool = " + ".join("%s %s" % (s, c) for s, c in (
+        ("HG002", "(10x, 20x, and 31x coverage)"),
+        ("CHM1_CHM13", "(46x coverage)"),
+        ("%d HPRC samples" % len(dataset.PROMOTED_HELDOUT_SAMPLES),
+         "(promoted from the held-out panel for ancestry/sex diversity)")))
     # Only promise the per-plot Excluded/Only-Homopolymers toggle when homopolymer panels were
     # actually generated (i.e. report.py --homopolymer-cv was run); otherwise _img_toggle falls back
     # to a single plot with no toggle, so the text must not claim one.
@@ -1410,8 +1442,9 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "<code>str-truth-set-v2</code></a>. Per-allele true repeat counts "
         "(and repeat purity) are derived from haplotype-resolved long-read genome assemblies of the "
         "same samples (HG002, CHM1&ndash;CHM13), giving the true repeat number at each tandem-repeat "
-        "locus. Negative-control loci and impure (&lt;0.9 purity) alleles are filtered out before "
-        "training.</p>",
+        "locus. Negative-control loci are filtered out before training; truth repeat purity is not "
+        "used as a training filter, but is available below as an opt-in <b>Repeat Purity Filter</b> "
+        "stratification pill.</p>",
         "<p class='note'>Held-out accuracy is measured by 5-fold cross validation: "
         "each fold trains on ~19 chromosomes and tests on the held-out ones.</p>",
         "<h2>ExpansionHunter output fields used for model training</h2>",
