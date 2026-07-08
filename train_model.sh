@@ -42,6 +42,12 @@ echo "==== [3/3] evaluate (5-fold CV) + HTML report ========================="
 # The main render also regenerates the held-out HPRC artifacts from the parquets above (if built).
 "$PYTHON" report.py --data-dir "$DATA_DIR" --model "$MODEL_OUT" --cv-train-cap "$CV_TRAIN_CAP"
 
+echo "==== [4/4] compare new model vs previous (held-out) ==================="
+# Post-hoc convenience: apply the new model AND the previous/deployed model to the held-out HPRC set
+# and print per-regime metric deltas. Self-skips (prints a note) if the held-out parquets weren't
+# built (no RUN_HELDOUT_SAMPLES=1) or no previous model exists. Non-fatal -- never fails the pipeline.
+"$PYTHON" compare_models.py --new-model "$MODEL_OUT" || echo "(model comparison step failed -- non-fatal)"
+
 echo "======================================================================="
 echo "DONE"
 echo "  model:  $MODEL_OUT"

@@ -185,13 +185,16 @@ def _bw2_head_sha():
 
 
 def _json_eh_version(path):
-    """Returns the ``Version`` stamped in a JSON shard's ``SampleParameters`` -- the short commit sha
-    of the ExpansionHunter-bw2 build that produced it. Absent entirely on builds that predate that
-    stamping (before 2026-07-01); ``"unknown"`` if the build couldn't capture its own commit sha
-    (e.g. a Docker build without ``.git`` in the build context)."""
+    """Returns the short commit sha of the ExpansionHunter-bw2 build that produced a JSON shard.
+
+    Current builds stamp it in ``RunInfo.Version``; older builds put it in ``SampleParameters.Version``
+    (checked as a fallback). Absent entirely on builds that predate the stamping (before 2026-07-01);
+    ``"unknown"`` if the build couldn't capture its own commit sha (e.g. a Docker build without
+    ``.git`` in the build context)."""
     op = gzip.open if path.endswith(".gz") else open
     with op(path, "rt") as f:
-        return json.load(f).get("SampleParameters", {}).get("Version")
+        d = json.load(f)
+    return d.get("RunInfo", {}).get("Version") or d.get("SampleParameters", {}).get("Version")
 
 
 def _check_freshness(desc, sources):
