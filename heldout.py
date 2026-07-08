@@ -81,16 +81,15 @@ def build_sample(sample, data_dir, force):
 
     dl_dir = os.path.join(data_dir, "real_43", "_downloads", sample)
     genotypes_tsv_remote = dataset._truth_genotypes_tsv_remote(sample)
+    json_locals = [os.path.join(dl_dir, os.path.basename(r)) for r in json_remote]
+    genotypes_tsv_local = os.path.join(dl_dir, os.path.basename(genotypes_tsv_remote))
     # Checked even when the parquet cache below is about to be reused -- see dataset.build_combo.
-    dataset._check_freshness(sample, [
-        ("json shard %d" % i, r, os.path.join(dl_dir, os.path.basename(r)))
-        for i, r in enumerate(json_remote)
-    ] + [
-        ("truth-genotypes TSV", genotypes_tsv_remote,
-         os.path.join(dl_dir, os.path.basename(genotypes_tsv_remote))),
-    ])
+    # Deletes any bucket-newer / content-changed local copy so _download re-fetches it below.
+    dataset._check_freshness(sample,
+                             [("json shard %d" % i, r, l) for i, (r, l) in enumerate(zip(json_remote, json_locals))]
+                             + [("truth-genotypes TSV", genotypes_tsv_remote, genotypes_tsv_local)])
 
-    if os.path.exists(out_path) and not force:
+    if dataset._parquet_reusable(out_path, json_locals + [genotypes_tsv_local], force):
         return out_path
     print("=== %s (%s): %d json file(s) ===" % (sample, cov, len(json_remote)), flush=True)
 

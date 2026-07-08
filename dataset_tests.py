@@ -199,6 +199,29 @@ class GcsMd5Test(unittest.TestCase):
             self.assertIsNone(dataset._gcs_md5("gs://x/y.json.gz"))
 
 
+class GcsMtimeTest(unittest.TestCase):
+    def test_prefers_update_over_creation(self):
+        import email.utils
+        stdout = ("gs://x/y:\n    Creation time:    Wed, 02 Jul 2026 10:00:00 GMT\n"
+                  "    Update time:      Wed, 02 Jul 2026 22:46:00 GMT\n    Hash (md5): abc==\n")
+        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
+            got = dataset._gcs_mtime("gs://x/y")
+        self.assertAlmostEqual(
+            got, email.utils.parsedate_to_datetime("Wed, 02 Jul 2026 22:46:00 GMT").timestamp())
+
+    def test_falls_back_to_creation_time(self):
+        import email.utils
+        stdout = "gs://x/y:\n    Creation time:    Wed, 02 Jul 2026 10:00:00 GMT\n"
+        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
+            self.assertAlmostEqual(
+                dataset._gcs_mtime("gs://x/y"),
+                email.utils.parsedate_to_datetime("Wed, 02 Jul 2026 10:00:00 GMT").timestamp())
+
+    def test_no_time_line_returns_none(self):
+        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout="nope\n")):
+            self.assertIsNone(dataset._gcs_mtime("gs://x/y"))
+
+
 class Bw2HeadShaTest(unittest.TestCase):
     def test_missing_checkout_returns_none(self):
         with mock.patch.object(dataset.os.path, "isdir", return_value=False):
@@ -276,100 +299,70 @@ class CheckFreshnessTest(unittest.TestCase):
         self.local = os.path.join(self.tmp.name, "a.json")
         with open(self.local, "w") as f:
             json.dump({"SampleParameters": {}}, f)
+        self.lm = os.path.getmtime(self.local)
 
     def test_no_local_file_skips_entirely(self):
         with mock.patch.object(dataset, "_gcs_md5", side_effect=AssertionError("should not be called")):
-            dataset._check_freshness("d", [("json shard", "gs://r", "/nonexistent/path")])  # must not raise
+            n = dataset._check_freshness("d", [("json shard", "gs://r", "/nonexistent/path")])
+        self.assertEqual(n, 0)
 
-    def test_matching_hash_and_no_bw2_repo_is_a_no_op(self):
+    def test_up_to_date_is_a_no_op(self):
+        # md5 matches AND the bucket is not newer than the local file -> keep it, nothing removed.
         with mock.patch.object(dataset, "_gcs_md5", return_value="samehash"), \
              mock.patch.object(dataset, "_local_md5", return_value="samehash"), \
+             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm - 100), \
              mock.patch.object(dataset, "_bw2_head_sha", return_value=None):
-            dataset._check_freshness("d", [("json shard", "gs://r", self.local)])  # must not raise
-
-    def test_stale_hash_noninteractive_exits(self):
-        with mock.patch.object(dataset, "_gcs_md5", return_value="new"), \
-             mock.patch.object(dataset, "_local_md5", return_value="old"), \
-             mock.patch.object(dataset, "_bw2_head_sha", return_value=None), \
-             mock.patch.object(dataset.sys.stdin, "isatty", return_value=False):
-            with self.assertRaises(SystemExit):
-                dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
-
-    def test_stale_hash_interactive_exit_choice(self):
-        with mock.patch.object(dataset, "_gcs_md5", return_value="new"), \
-             mock.patch.object(dataset, "_local_md5", return_value="old"), \
-             mock.patch.object(dataset, "_bw2_head_sha", return_value=None), \
-             mock.patch.object(dataset.sys.stdin, "isatty", return_value=True), \
-             mock.patch("builtins.input", return_value="e"):
-            with self.assertRaises(SystemExit):
-                dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
-
-    def test_stale_hash_interactive_ignore_choice_keeps_file(self):
-        with mock.patch.object(dataset, "_gcs_md5", return_value="new"), \
-             mock.patch.object(dataset, "_local_md5", return_value="old"), \
-             mock.patch.object(dataset, "_bw2_head_sha", return_value=None), \
-             mock.patch.object(dataset.sys.stdin, "isatty", return_value=True), \
-             mock.patch("builtins.input", return_value="i"):
-            dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
+            n = dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
+        self.assertEqual(n, 0)
         self.assertTrue(os.path.exists(self.local))
 
-    def test_stale_hash_interactive_update_choice_removes_file(self):
+    def test_md5_mismatch_deletes_for_redownload(self):
         with mock.patch.object(dataset, "_gcs_md5", return_value="new"), \
              mock.patch.object(dataset, "_local_md5", return_value="old"), \
-             mock.patch.object(dataset, "_bw2_head_sha", return_value=None), \
-             mock.patch.object(dataset.sys.stdin, "isatty", return_value=True), \
-             mock.patch("builtins.input", return_value="u"):
-            dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
-        self.assertFalse(os.path.exists(self.local))
+             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm - 100), \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value=None):
+            n = dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
+        self.assertEqual(n, 1)
+        self.assertFalse(os.path.exists(self.local))  # deleted so _download re-fetches
 
-    def test_invalid_response_reprompts_then_ignores(self):
-        with mock.patch.object(dataset, "_gcs_md5", return_value="new"), \
-             mock.patch.object(dataset, "_local_md5", return_value="old"), \
-             mock.patch.object(dataset, "_bw2_head_sha", return_value=None), \
-             mock.patch.object(dataset.sys.stdin, "isatty", return_value=True), \
-             mock.patch("builtins.input", side_effect=["huh", "i"]) as m:
-            dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
-        self.assertEqual(m.call_count, 2)
-
-    def test_eh_build_staleness_only_checked_for_json_labels(self):
+    def test_bucket_newer_mtime_deletes_for_redownload(self):
         with mock.patch.object(dataset, "_gcs_md5", return_value="samehash"), \
              mock.patch.object(dataset, "_local_md5", return_value="samehash"), \
+             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm + 100), \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value=None):
+            n = dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
+        self.assertEqual(n, 1)
+        self.assertFalse(os.path.exists(self.local))
+
+    def test_eh_build_staleness_refuses_for_kept_json(self):
+        # up-to-date content but produced by an older EH build -> hard refusal (can't fix by redownload).
+        with mock.patch.object(dataset, "_gcs_md5", return_value="samehash"), \
+             mock.patch.object(dataset, "_local_md5", return_value="samehash"), \
+             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm - 100), \
              mock.patch.object(dataset, "_json_eh_version", return_value="old_sha"), \
-             mock.patch.object(dataset, "_bw2_head_sha", return_value="new_sha"), \
-             mock.patch.object(dataset.sys.stdin, "isatty", return_value=False):
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="new_sha"):
             with self.assertRaises(SystemExit):
                 dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
 
     def test_eh_build_staleness_ignored_for_non_json_labels(self):
         with mock.patch.object(dataset, "_gcs_md5", return_value="samehash"), \
              mock.patch.object(dataset, "_local_md5", return_value="samehash"), \
+             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm - 100), \
              mock.patch.object(dataset, "_json_eh_version", return_value="old_sha"), \
              mock.patch.object(dataset, "_bw2_head_sha", return_value="new_sha"):
-            dataset._check_freshness("d", [("truth-genotypes TSV", "gs://r", self.local)])  # must not raise
+            n = dataset._check_freshness("d", [("truth-genotypes TSV", "gs://r", self.local)])
+        self.assertEqual(n, 0)  # build check only applies to json-labeled sources
 
-    def test_update_choice_reprompts_when_eh_build_issue_is_unfixable(self):
-        # md5 matches (nothing for "u" to delete) but the EH build is stale -- "u" must not silently
-        # return; it should re-prompt until the user explicitly picks e/i.
+    def test_cache_stale_json_is_redownloaded_without_build_refusal(self):
+        # A json that is BOTH bucket-newer AND from an older build is re-downloaded (not refused): the
+        # fresh copy replaces it, so its stale build sha is not judged here.
         with mock.patch.object(dataset, "_gcs_md5", return_value="samehash"), \
              mock.patch.object(dataset, "_local_md5", return_value="samehash"), \
+             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm + 100), \
              mock.patch.object(dataset, "_json_eh_version", return_value="old_sha"), \
-             mock.patch.object(dataset, "_bw2_head_sha", return_value="new_sha"), \
-             mock.patch.object(dataset.sys.stdin, "isatty", return_value=True), \
-             mock.patch("builtins.input", side_effect=["u", "i"]) as m:
-            dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
-        self.assertEqual(m.call_count, 2)
-        self.assertTrue(os.path.exists(self.local))  # nothing to delete, file untouched
-
-    def test_update_choice_still_returns_when_only_hash_stale(self):
-        # unfixable=False path: "u" fixes the only issue (md5 mismatch) and returns without re-prompting.
-        with mock.patch.object(dataset, "_gcs_md5", return_value="new"), \
-             mock.patch.object(dataset, "_local_md5", return_value="old"), \
-             mock.patch.object(dataset, "_json_eh_version", return_value=None), \
-             mock.patch.object(dataset, "_bw2_head_sha", return_value=None), \
-             mock.patch.object(dataset.sys.stdin, "isatty", return_value=True), \
-             mock.patch("builtins.input", return_value="u") as m:
-            dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
-        self.assertEqual(m.call_count, 1)
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="new_sha"):
+            n = dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
+        self.assertEqual(n, 1)
         self.assertFalse(os.path.exists(self.local))
 
 
@@ -378,8 +371,20 @@ class BuildComboTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out_path = os.path.join(d, "sub", "HG002_10x.parquet")
             os.makedirs(os.path.dirname(out_path))
+            # Upstream local sources must exist and be OLDER than the parquet for it to be reused.
+            dl_dir = os.path.join(d, "sub", "_downloads", "HG002_10x")
+            gt_dir = os.path.join(d, "sub", "_downloads", "HG002")
+            os.makedirs(dl_dir)
+            os.makedirs(gt_dir)
+            json_local = os.path.join(dl_dir, "a.json.gz")
+            tsv_local = os.path.join(gt_dir, "HG002.tandem_repeat_genotypes.tsv.gz")
+            open(json_local, "w").close()
+            open(tsv_local, "w").close()
             pd.DataFrame({"eh": [1.0, 2.0, 3.0]}).to_parquet(out_path)
+            newer = max(os.path.getmtime(json_local), os.path.getmtime(tsv_local)) + 100
+            os.utime(out_path, (newer, newer))
             with mock.patch.object(dataset, "_list_json_inputs", return_value=["gs://x/a.json.gz"]), \
+                 mock.patch.object(dataset, "_check_freshness", return_value=0), \
                  mock.patch.object(dataset, "_download", side_effect=AssertionError("should not download")):
                 n = dataset.build_combo("V", "sub", "HG002", "10x", d, force=False)
             self.assertEqual(n, 3)

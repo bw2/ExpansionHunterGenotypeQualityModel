@@ -167,10 +167,20 @@ class BuildSampleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out_path = os.path.join(d, "real_43", "HG00438.parquet")
             os.makedirs(os.path.dirname(out_path))
+            # Upstream local sources must exist and be OLDER than the parquet for it to be reused.
+            dl_dir = os.path.join(d, "real_43", "_downloads", "HG00438")
+            os.makedirs(dl_dir)
+            json_local = os.path.join(dl_dir, "a.json.gz")
+            tsv_local = os.path.join(dl_dir, "HG00438.tandem_repeat_genotypes.tsv.gz")
+            open(json_local, "w").close()
+            open(tsv_local, "w").close()
             pd.DataFrame({"eh": [1.0, 2.0]}).to_parquet(out_path)
+            newer = max(os.path.getmtime(json_local), os.path.getmtime(tsv_local)) + 100
+            os.utime(out_path, (newer, newer))
             with mock.patch.object(heldout, "_discover_cov", return_value="30x"), \
                  mock.patch.object(heldout.subprocess, "run",
                                    return_value=SimpleNamespace(stdout="gs://x/json/a.json.gz")), \
+                 mock.patch.object(dataset, "_check_freshness", return_value=0), \
                  mock.patch.object(dataset, "_download", side_effect=AssertionError("should not download")):
                 out = heldout.build_sample("HG00438", d, force=False)
             self.assertEqual(out, out_path)

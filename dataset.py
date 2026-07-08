@@ -5,7 +5,8 @@ For each ``(sample, coverage)`` combo on each genotyping branch this module:
   1. Idempotently downloads the per-shard EH JSON (``*.json.gz``) from
      ``gs://str-truth-set-v2/tool_results/...`` plus the tool-independent truth-genotypes TSV
      (``TRUTH_CATALOG_ROOT``, used for the actual truth join, shared across a sample's coverages).
-     Existing local files are not re-fetched.
+     A local file is kept only if it is present AND still current; ``_check_freshness`` re-downloads
+     any local copy whose bucket object is newer (by last-modified) or whose content (md5) has changed.
   2. Extracts per-allele feature rows from the JSON via ``eh_json.extract_rows``
      (``eh`` and every feature come from the JSON, never a TSV).
   3. Filters the truth-genotypes TSV to EH's catalog loci (primary contigs + variant, non-hom-ref;
@@ -38,6 +39,7 @@ Coding rules: no type hints, Google docstrings, ``print()``, ``gcloud`` (macOS).
 
 import argparse
 import base64
+import email.utils
 import glob
 import gzip
 import hashlib
@@ -143,6 +145,26 @@ def _gcs_md5(remote_path):
     return None
 
 
+def _gcs_mtime(remote_path):
+    """Returns the cloud object's last-modified time (Unix timestamp) via ``gsutil stat``, or None.
+
+    Prefers the object's ``Update time`` and falls back to ``Creation time`` (an object never updated
+    since upload reports only the latter). Used to decide whether a local copy is older than the bucket
+    version and must be re-downloaded.
+    """
+    result = subprocess.run(["gsutil", "stat", remote_path], capture_output=True, text=True)
+    times = {}
+    for line in result.stdout.splitlines():
+        s = line.strip()
+        for key in ("Update time:", "Creation time:"):
+            if s.startswith(key):
+                try:
+                    times[key] = email.utils.parsedate_to_datetime(s.split(":", 1)[1].strip()).timestamp()
+                except (TypeError, ValueError, IndexError):
+                    pass
+    return times.get("Update time:", times.get("Creation time:"))
+
+
 def _local_md5(path):
     """Returns the base64 md5 hash of a local file, in the same form ``_gcs_md5`` returns."""
     h = hashlib.md5()
@@ -173,70 +195,69 @@ def _json_eh_version(path):
 
 
 def _check_freshness(desc, sources):
-    """Detects stale local downloads and, if any are found, refuses to proceed silently.
+    """Auto-refreshes stale local downloads and refuses only on an unfixable EH-build mismatch.
 
-    ``sources`` is a list of ``(label, remote_path, local_path)``. For each entry whose
-    ``local_path`` already exists (nothing to check for a first-time download -- ``_download``
-    will simply fetch the current bucket version), two independent signals are checked:
+    ``sources`` is a list of ``(label, remote_path, local_path)``. For each entry whose ``local_path``
+    already exists (a first-time download needs no check -- ``_download`` fetches the current bucket
+    version), two signals are evaluated:
 
-    1. Local-cache staleness: does the local file's md5 still match what's currently in the bucket?
-       Catches the truth catalog having been regenerated upstream since we last downloaded it.
-    2. EH-build staleness (labels starting with ``"json"`` only): does the JSON's stamped build
-       commit sha match the local ExpansionHunter-bw2 checkout's current HEAD? Catches training on
-       EH calls produced by a build older than what's checked out now. Skipped if that repo isn't
-       present locally.
+    1. Cache staleness: the local copy is out of date if its md5 no longer matches the bucket object's,
+       OR the bucket object's last-modified time is newer than the local file's mtime. Such files are
+       DELETED here so the subsequent ``_download`` re-fetches (overwrites with) the current bucket
+       version -- an automatic update, no prompt. (Re-downloading a file also means its about-to-be-
+       overwritten build sha is not judged below.)
+    2. EH-build staleness (labels starting with ``"json"``, and only for files being KEPT -- not the
+       ones already scheduled for re-download): does the JSON's stamped build commit sha match the
+       local ExpansionHunter-bw2 HEAD? A mismatch means the calls were produced by a different EH
+       build; re-downloading the same object can't fix that (it requires re-running EH externally), so
+       this is a hard refusal (exit nonzero). Skipped if that checkout isn't present locally.
 
-    Any issue found prints a summary and prompts ``(e)xit / (u)pdate / (i)gnore`` on a TTY;
-    non-interactively (e.g. a backgrounded rebuild) it prints the same summary and exits nonzero --
-    a deliberate refusal, not a warning, since silently training on stale inputs is exactly the bug
-    class this exists to catch. ``(u)pdate`` only has an automatic fix for local-cache staleness (it
-    deletes the stale file so the next ``_download`` call re-fetches it); an EH-build-staleness issue
-    has no automatic fix here since that requires re-running ExpansionHunter-bw2 externally, so
-    ``(u)pdate`` removes what it can and then re-prompts (rather than silently returning) whenever an
-    EH-build issue is still unresolved, forcing an explicit ``(e)xit``/``(i)gnore`` choice for it.
+    Returns the number of stale local files removed for re-download (0 if none), so callers can force a
+    dependent rebuild when the inputs were refreshed.
     """
-    issues, stale_locals, unfixable = [], [], False
+    redownload, build_stale = [], []
     for label, remote, local in sources:
         if not os.path.exists(local):
             continue
         remote_md5 = _gcs_md5(remote)
-        if remote_md5 and remote_md5 != _local_md5(local):
-            issues.append("%s: local copy no longer matches the current bucket content (%s)"
-                          % (label, remote))
-            stale_locals.append(local)
+        cloud_mtime = _gcs_mtime(remote)
+        if (remote_md5 and remote_md5 != _local_md5(local)) or \
+                (cloud_mtime is not None and cloud_mtime > os.path.getmtime(local)):
+            redownload.append((label, local))
+            continue  # being overwritten -- don't judge its stale build sha
         if label.startswith("json"):
             version, head = _json_eh_version(local), _bw2_head_sha()
             if head and version != head:
-                issues.append("%s: produced by EH build %r, current ExpansionHunter-bw2 HEAD is %r"
-                              % (label, version, head))
-                unfixable = True
-    if not issues:
-        return
-    print("\n=== STALE DATA SOURCE(S): %s ===" % desc)
-    for issue in issues:
-        print("  - %s" % issue)
-    if not sys.stdin.isatty():
-        print("  non-interactive run -- refusing to proceed on stale inputs. Re-run interactively to "
-             "decide, or delete the affected file(s) under _downloads/ and re-run with --force.")
+                build_stale.append((label, version, head))
+    if redownload:
+        print("  refreshing %d stale local file(s) (bucket newer or content changed): %s"
+              % (len(redownload), ", ".join(l for _, l in redownload)), flush=True)
+        for _, local in redownload:
+            os.remove(local)
+    if build_stale:
+        print("\n=== STALE EH BUILD: %s ===" % desc)
+        for label, version, head in build_stale:
+            print("  - %s: produced by EH build %r, current ExpansionHunter-bw2 HEAD is %r"
+                  % (label, version, head))
+        print("  refusing to proceed -- regenerate these JSONs with the current ExpansionHunter-bw2 "
+              "build, or remove the local ExpansionHunter-bw2 checkout to skip this check.")
         sys.exit(1)
-    while True:
-        resp = input("  (e)xit / (u)pdate / (i)gnore? ").strip().lower()
-        if resp in ("e", "exit"):
-            sys.exit(1)
-        if resp in ("i", "ignore"):
-            return
-        if resp in ("u", "update"):
-            for local in stale_locals:
-                os.remove(local)
-            stale_locals = []
-            print("  removed stale local file(s) -- they will be re-downloaded now.")
-            if unfixable:
-                print("  Note: a JSON produced by an older EH build can't be 'updated' this way -- that "
-                     "requires re-running ExpansionHunter-bw2 externally. Choose (e)xit or (i)gnore to "
-                     "proceed despite this.")
-                continue
-            return
-        print("  please answer e/u/i")
+    return len(redownload)
+
+
+def _parquet_reusable(out_path, upstream_locals, force):
+    """Returns True iff the cached per-combo/per-sample parquet can be reused as-is.
+
+    Reuse requires: not ``force``, the parquet exists, every upstream local source (EH JSON shards +
+    truth TSV) still exists, and the parquet is at least as new as all of them. If ``_check_freshness``
+    just deleted a stale upstream (so it is missing / about to be re-downloaded with a newer mtime), or
+    an upstream is otherwise newer, the parquet is rebuilt rather than silently reused.
+    """
+    if force or not os.path.exists(out_path):
+        return False
+    if not all(os.path.exists(u) for u in upstream_locals):
+        return False
+    return os.path.getmtime(out_path) >= max((os.path.getmtime(u) for u in upstream_locals), default=0)
 
 
 def _load_truth_from_genotypes_tsv(tsv_path):
@@ -410,19 +431,18 @@ def build_combo(variant, subdir, sample, cov_label, data_dir, force):
     genotypes_dl_dir = os.path.join(data_dir, subdir, "_downloads", sample)
     json_remote = _list_json_inputs(sample, variant, cov_label)
     genotypes_tsv_remote = _truth_genotypes_tsv_remote(sample)
+    json_locals = [os.path.join(dl_dir, os.path.basename(r)) for r in json_remote]
+    genotypes_tsv_local = os.path.join(genotypes_dl_dir, os.path.basename(genotypes_tsv_remote))
     # Checked even when the parquet cache below is about to be reused -- an --force-free run must
-    # still detect that the inputs it would otherwise silently keep trusting have moved on.
-    _check_freshness("%s %s" % (sample, cov_label), [
-        ("json shard %d" % i, r, os.path.join(dl_dir, os.path.basename(r)))
-        for i, r in enumerate(json_remote)
-    ] + [
-        ("truth-genotypes TSV", genotypes_tsv_remote,
-         os.path.join(genotypes_dl_dir, os.path.basename(genotypes_tsv_remote))),
-    ])
+    # still detect that the inputs it would otherwise silently keep trusting have moved on. Deletes any
+    # locally-stale (bucket-newer / content-changed) copy so _download re-fetches it below.
+    _check_freshness("%s %s" % (sample, cov_label),
+                     [("json shard %d" % i, r, l) for i, (r, l) in enumerate(zip(json_remote, json_locals))]
+                     + [("truth-genotypes TSV", genotypes_tsv_remote, genotypes_tsv_local)])
 
-    if os.path.exists(out_path) and not force:
+    if _parquet_reusable(out_path, json_locals + [genotypes_tsv_local], force):
         n = len(pd.read_parquet(out_path, columns=["eh"]))
-        print("    parquet exists; skipping (use --force to rebuild)  [%d rows]" % n)
+        print("    parquet up-to-date; skipping (use --force to rebuild)  [%d rows]" % n)
         return n
 
     print("    %d JSON file(s) + 1 truth TSV" % len(json_remote))
