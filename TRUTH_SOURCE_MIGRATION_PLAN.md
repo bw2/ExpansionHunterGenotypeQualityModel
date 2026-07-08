@@ -72,7 +72,7 @@ building** (`heldout.build_sample`) — i.e., what the model actually trains and
 ### 2. `heldout.py`: full swap
 
 `build_sample()`'s downloaded `for_comparison` TSV is used *only* for `_join_truth` — nothing
-else in the held-out path touches it (the `heldout43` report dataset is parquet-only, no TSV
+else in the held-out path touches it (the `heldout_hprc` report dataset is parquet-only, no TSV
 involved). Clean full replacement:
 - Replace `tsv_remote = ".../for_comparison..."` + `dataset._download(...)` +
   `dataset._load_truth_tsv(tsv_local, VARIANT)` with

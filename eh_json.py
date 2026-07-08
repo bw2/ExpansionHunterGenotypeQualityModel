@@ -14,9 +14,11 @@ A variant's contract is decided per-variant by ``QuickGenotype``:
   ``QD`` and the flank-normalized depths.
 
 The allele call ``eh`` always comes from the JSON ``Genotype`` field, never from
-any precomputed TSV column. Only the columns the deployable model and its report
-actually consume are emitted (the audit/debug columns from earlier iterations are
-intentionally dropped). Pure functions, no global state, no randomness.
+any precomputed TSV column. A no-call locus still emits rows (``eh`` None) so the
+accuracy-by-size report can count the uncalled truth alleles as "No Call"; those
+rows are dropped before training. Only the columns the deployable model and its
+report actually consume are emitted (the audit/debug columns from earlier
+iterations are intentionally dropped). Pure functions, no global state, no randomness.
 """
 
 import gzip
@@ -119,12 +121,56 @@ def _aqm_for_allele(aqm_alleles, aqm_by_number, rank, eh):
     return aqm or {}
 
 
-def extract_variant_rows(variant, locus_result, sample_id):
-    """Yields one row dict per allele of a single EH variant (or nothing for a no-call)."""
-    genotype = parse_genotype(variant.get("Genotype"))
-    if genotype is None:
-        return  # no-call: eh undefined, drop
+# A no-call locus is emitted as this many rows (ranks 0..N-1). The truth catalog always carries two
+# alleles per locus (Short/Long), so two no-call rows join one-to-one with the two truth alleles.
+NO_CALL_RANKS = 2
 
+
+def _no_call_rows(locus_result, sample_id, branch, motif_size, reference_repeat_purity,
+                  ref_size_bp, num_ref):
+    """Yields ``NO_CALL_RANKS`` no-call rows for one uncalled variant (eh + read fields None)."""
+    for rank in range(NO_CALL_RANKS):
+        yield {
+            "locus_id": locus_result.get("LocusId"),
+            "sample_id": sample_id,
+            "allele_rank": rank,
+            "motif_size": motif_size,
+            "reference_repeat_purity": reference_repeat_purity,
+            "ref_size_bp": ref_size_bp,
+            "num_repeats_in_reference": num_ref,
+            "eh": None,
+            "eh_minus_ref": None,
+            "ci_start": None,
+            "ci_end": None,
+            "ci_width": None,
+            "spanning_total": None,
+            "hq_unamb_total": None,
+            "spanning_at_called": None,
+            "spanning_above_called": None,
+            "flanking_above_called": None,
+            "support_frac": None,
+            "depth": None,
+            "hq_unambiguous_reads": None,
+            "strand_bias_phred": None,
+            "mean_inserted_bases": None,
+            "mean_deleted_bases": None,
+            "read_repeat_purity": None,
+            "genotyping_branch": branch,
+            "left_flank_norm_depth": None,
+            "right_flank_norm_depth": None,
+        }
+
+
+def extract_variant_rows(variant, locus_result, sample_id):
+    """Yields one row dict per allele of a single EH variant.
+
+    A no-call (``Genotype`` == ``"./."`` / empty) still yields ``NO_CALL_RANKS`` rows with ``eh`` (and
+    every read/allele-specific field) set to None -- only the catalog fields (motif, reference size,
+    repeat purity) are populated. The truth join then attaches ``true`` per ``(locus_id, allele_rank)``
+    so the accuracy-by-size report can count these as "No Call" (a truth allele EH left uncalled). They
+    carry ``eh=None`` on purpose, so ``dataset.label_and_filter`` drops them (``missing_eh_or_true``)
+    before training -- they exist only for the report side, never the model fit.
+    """
     branch = BRANCH_QUICK if bool(variant.get("QuickGenotype", False)) else BRANCH_FULL
     repeat_unit = variant.get("RepeatUnit") or ""
     motif_size = len(repeat_unit) or None
@@ -132,6 +178,12 @@ def extract_variant_rows(variant, locus_result, sample_id):
     _, start, end = parse_reference_region(variant.get("ReferenceRegion"))
     ref_size_bp = (end - start) if (start is not None and end is not None) else None
     num_ref = (ref_size_bp / motif_size) if (ref_size_bp and motif_size) else None
+
+    genotype = parse_genotype(variant.get("Genotype"))
+    if genotype is None:
+        yield from _no_call_rows(locus_result, sample_id, branch, motif_size,
+                                 reference_repeat_purity, ref_size_bp, num_ref)
+        return
 
     n_alleles = len(genotype)
     cis = parse_ci(variant.get("GenotypeConfidenceInterval"), n_alleles)

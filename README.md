@@ -83,11 +83,12 @@ change.
 consumes) and **applies it unchanged — no re-fitting** — to the 30 HPRC short-read samples absent from
 the training pool (13 others from the original 43-sample panel were promoted into training — see
 Training data above), scoring against their truth. `heldout.py` itself writes a standalone
-`report/heldout.json` benchmark dump; the report's held-out-43 section is generated separately by
-`gen_datasets.py --dataset heldout43` (which reuses `heldout.run_eval` to emit the
-`report/eval_heldout43.json` / `report/stacked_heldout43.json` artifacts `report.py` reads). Run the
-whole chain via `RUN_HOLDOUT43=1 ./train_model.sh` (builds the parquets, runs `gen_datasets.py`, then
-re-renders the report); a ~7-8 GB download.
+`report/heldout.json` benchmark dump; the report's held-out HPRC section is fed by the
+`report/eval_heldout_hprc.json` / `report/stacked_heldout_hprc.json` artifacts, which `report.py`
+**regenerates by default** from the locally-built held-out parquets (via `gen_datasets.generate`, no
+download) — pass `--skip-heldout-samples` to opt out. Building those parquets (a ~7-8 GB download) is
+off by default; enable it with `RUN_HELDOUT_SAMPLES=1 ./train_model.sh`, which builds them before the
+report step so the render picks them up.
 
 ## Tests
 

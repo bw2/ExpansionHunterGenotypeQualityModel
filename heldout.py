@@ -14,9 +14,9 @@ corrected call = ``eh / LCF`` (q-median head); the gate applies it only where ``
 (direction head), else keeps raw EH. The MAE is a running sum, but the exact pooled median retains
 every kept allele's ``|error|`` in RAM (bounded by ``--max-alleles-per-sample``), so peak memory grows
 with the total kept alleles. ``main()`` writes a standalone ``report/heldout.json`` benchmark dump.
-The report's held-out-43 section is NOT fed from that file -- it is produced by
-``gen_datasets.py --dataset heldout43``, which reuses ``run_eval`` here to emit the
-``report/eval_heldout43.json`` / ``report/stacked_heldout43.json`` artifacts ``report.py`` consumes.
+The report's held-out HPRC section is NOT fed from that file -- it is produced by
+``gen_datasets.py --dataset heldout_hprc``, which reuses ``run_eval`` here to emit the
+``report/eval_heldout_hprc.json`` / ``report/stacked_heldout_hprc.json`` artifacts ``report.py`` consumes.
 
 Coding rules: no type hints, Google docstrings, ``print()``, ``gcloud`` (macOS).
 """

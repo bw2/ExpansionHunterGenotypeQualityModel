@@ -68,10 +68,17 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(rows[0]["genotyping_branch"], "quick")
         self.assertIsNone(rows[0]["left_flank_norm_depth"])
 
-    def test_no_call_dropped(self):
+    def test_no_call_emits_rows_with_null_eh(self):
         rows = list(eh_json.extract_rows(
             {"LocusResults": {"x": _locus(genotype="./.")}}, sample_id="S"))
-        self.assertEqual(rows, [])
+        self.assertEqual(len(rows), eh_json.NO_CALL_RANKS)
+        self.assertEqual([r["allele_rank"] for r in rows], list(range(eh_json.NO_CALL_RANKS)))
+        for r in rows:
+            self.assertIsNone(r["eh"])              # eh undefined -> dropped from training later
+            self.assertIsNone(r["spanning_at_called"])
+            self.assertEqual(r["motif_size"], 3)    # catalog fields still populated for the report
+            self.assertEqual(r["num_repeats_in_reference"], 10)  # (1030-1000)/3
+            self.assertEqual(r["genotyping_branch"], "full")
 
     def test_gzip_path(self):
         with tempfile.TemporaryDirectory() as d:

@@ -97,65 +97,6 @@ def classify(d, n, drr_truth, drr_tool, is_ref_allele, is_hom_ref):
     return lab
 
 
-# Column names in the `*.for_comparison.with_<tool>_vs_Truth_columns.alleles.tsv.gz` table.
-def _cols(tool):
-    return {
-        "d": "DiffRepeats: Allele: %s - Truth" % tool,
-        "n": "NumRepeats: Allele: %s" % tool,
-        "drr_truth": "DiffFromRefRepeats: Allele: Truth",
-        "drr_tool": "DiffFromRefRepeats: Allele: %s" % tool,
-        "is_ref": "IsRef: Allele: %s" % tool,
-        "is_hom_ref": "IsHomRef: %s" % tool,
-        "motif": "MotifSize",
-        "locus": "LocusId",
-        "true_repeats": "NumRepeats: Allele: Truth",
-        "purity": "RepeatPurity: Allele: Truth",
-    }
-
-
-def _as_bool(series):
-    return series.astype(str).str.strip().str.lower().isin(("true", "1", "yes"))
-
-
-def categorize_tsv(tsv_path, tool):
-    """Loads a for-comparison alleles TSV and returns a frame with ``category``, ``xbin``, ``motif``.
-
-    Returns one row per allele with the raw (uncorrected) category, the (true-ref) size-bin index,
-    the motif size, ``locus``, and the raw inputs needed to recompute the category after LCF
-    correction (``d``, ``n``, ``drr_truth``, ``drr_tool``, ``is_ref``, ``is_hom_ref``,
-    ``true_repeats``).
-    """
-    c = _cols(tool)
-    df = pd.read_csv(tsv_path, sep="\t", low_memory=False, dtype={c["locus"]: str},
-                     usecols=list(c.values()))
-    # ANALYSIS_OK[imputation]: malformed/missing TSV fields below become NaN; classify() treats NaN
-    # "d" as "No Call" by design (see its docstring), and xbin()/stratification tolerate NaN motif/purity.
-    out = pd.DataFrame({
-        "locus": df[c["locus"]].astype(str).str.replace(r"^chr", "", regex=True),
-        "motif": pd.to_numeric(df[c["motif"]], errors="coerce"),
-        "d": pd.to_numeric(df[c["d"]], errors="coerce"),  # ANALYSIS_OK[imputation]: see rationale above.
-        "n": pd.to_numeric(df[c["n"]], errors="coerce"),
-        "drr_truth": pd.to_numeric(df[c["drr_truth"]], errors="coerce"),
-        "drr_tool": pd.to_numeric(df[c["drr_tool"]], errors="coerce"),
-        "is_ref": _as_bool(df[c["is_ref"]]),
-        "is_hom_ref": _as_bool(df[c["is_hom_ref"]]),
-        "true_repeats": pd.to_numeric(df[c["true_repeats"]], errors="coerce"),  # ANALYSIS_OK[imputation]: see rationale above.
-        "purity": pd.to_numeric(df[c["purity"]], errors="coerce"),
-    })
-    out["category"] = classify(out["d"], out["n"], out["drr_truth"], out["drr_tool"],
-                               out["is_ref"], out["is_hom_ref"])
-    out["xbin"] = xbin(out["drr_truth"])
-    return out
-
-
-def assign_allele_rank(cat):
-    """Adds a per-locus ``allele_rank`` (size-sorted by called repeats then truth) matching the
-    parquet's rank convention, so model predictions can be joined back onto the TSV rows."""
-    cat = cat.sort_values(["locus", "n"], kind="mergesort")
-    cat = cat.assign(allele_rank=cat.groupby("locus", sort=False).cumcount())
-    return cat.sort_index()
-
-
 # LCF-correction variants shown on the report's "LCF correction" pill. Each applies
 # corrected = round(eh / LCF) only to the alleles passing its gate; "raw" applies no correction.
 # (key, pill label, title note, gate). A gate's "pok" is the pOk upper bound; "nonspanning" restricts
@@ -212,90 +153,24 @@ def _corrected_category(raw_call, corrected_call, gated, ref, true_round, drr_tr
     return classify(np.round(eff - true_round), eff, drr_truth, np.round(eff - ref), is_ref, is_hom_ref)
 
 
-def predict_lcf_pok(parquet_paths, model_path, cap=None):
-    """Applies the deployed model to the raw per-allele parquet(s); returns one row per called allele
-    with ``locus`` (chr-stripped), ``allele_rank``, ``lcf``, ``pok`` and ``non_spanning`` (the
-    full_nonspanning genotyping regime) -- the inputs the gated LCF correction needs. No fitting; the
-    model is loaded from its serialized ``.json[.gz]``. ``cap`` seed-subsamples each parquet to bound
-    the apply (``None`` = all alleles).
-    """
-    import model as M
-    import features
-    mj = M.load(model_path)["genotyping_regimes"]
-    comp = {r: (M.compile_genotyping_regime(mj[r]), features.GENOTYPING_REGIME_BRANCH[r])
-            for r in features.GENOTYPING_REGIMES}
-    out = []
-    for p in parquet_paths:
-        df = pd.read_parquet(p)
-        if cap and len(df) > cap:
-            df = df.sample(cap, random_state=20260616).reset_index(drop=True)
-        # ANALYSIS_OK[imputation]: NaN spanning_at_called -> 0 is genotyping_regime_of's documented
-        # default (features.py), routing such alleles to full_nonspanning.
-        df = df.assign(_regime=features.genotyping_regime_of(
-            df["genotyping_branch"].to_numpy(),
-            pd.to_numeric(df["spanning_at_called"], errors="coerce").to_numpy()))
-        for r, (cg, branch) in comp.items():
-            sub = df[df["_regime"] == r]
-            if sub.empty:
-                continue
-            X, _ = features.build_matrix(sub, branch)
-            out.append(pd.DataFrame({
-                "locus": sub["locus_id"].astype(str).str.replace(r"^chr", "", regex=True).to_numpy(),
-                "allele_rank": sub["allele_rank"].to_numpy(),
-                "lcf": M.predict_lcf_json(cg, X), "pok": M.predict_proba_json(cg, X)[:, 0],
-                "non_spanning": r == features.GENOTYPING_REGIME_FULL_NONSPANNING}))
-    cols = ["locus", "allele_rank", "lcf", "pok", "non_spanning"]
-    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=cols)
-
-
-def add_corrected_categories(cat, preds):
-    """Returns ``cat`` joined with ``preds`` plus one ``category__<key>`` column per gated entry in
-    ``CORRECTION_VARIANTS``: the category after applying corrected = ``round(eh / LCF)`` only to the
-    alleles passing that variant's gate; every other allele keeps its raw category. Joins ``preds``
-    (from ``predict_lcf_pok``) by ``(locus, allele_rank)``. The corrected call + its category are the
-    same for any gated allele across variants -- only the gate (which alleles get it) differs.
-    """
-    m = assign_allele_rank(cat).merge(preds, on=["locus", "allele_rank"], how="left",
-                                       validate="one_to_one")
-    # ANALYSIS_OK[imputation]: unmatched/capped-out alleles get NaN n/lcf/pok from this left join; see
-    # the "Alleles with no prediction" comment below for how NaN pok is then excluded from the panels.
-    n = pd.to_numeric(m["n"], errors="coerce").to_numpy(dtype=float)
-    lcf = pd.to_numeric(m["lcf"], errors="coerce").to_numpy(dtype=float)
-    pok = pd.to_numeric(m["pok"], errors="coerce").to_numpy(dtype=float)
-    non_spanning = (m["non_spanning"] == True).to_numpy(dtype=bool)  # NaN (unmatched join) -> False
-    true_r = m["true_repeats"].to_numpy(dtype=float)
-    drr_truth = m["drr_truth"].to_numpy(dtype=float)
-    corrected = np.round(np.where(lcf > 0, n / np.where(lcf > 0, lcf, np.nan), n))
-    ref = np.round(true_r - drr_truth)
-    locus = m["locus"].to_numpy()
-    raw = m["category"].to_numpy(dtype=object)
-    # Alleles with no prediction (pok NaN) -- capped out of ``predict_lcf_pok`` or unmatched by the
-    # join -- are marked None so bin_counts drops them from the corrected panels; otherwise they would
-    # sit there as raw EH and dilute the LCF-corrected accuracy. The raw "category" column is untouched.
-    applied = ~np.isnan(pok)
-    for key, _, _, gate in CORRECTION_VARIANTS:
-        if gate is None:
-            continue
-        g = _gate_mask(lcf, pok, non_spanning, gate)
-        cat_g = _corrected_category(n, corrected, g, ref, np.round(true_r), drr_truth, locus)
-        res = raw.copy()
-        res[~applied] = None
-        res[g] = cat_g[g]
-        m["category__" + key] = res
-    return m
-
-
 def categorize_parquet(parquet_path, model_path, corrected_cap=None):
-    """Categorizes the called alleles of a per-allele parquet (raw + each LCF-correction variant)
-    WITHOUT the TSV.
+    """Categorizes the alleles of a per-allele parquet (raw + each LCF-correction variant).
 
-    Used for the held-out pool, whose for-comparison TSVs aren't cached and whose catalog/coverage
-    vary per sample. Computes every category except "No Call" (the parquet has only called alleles;
-    no-call is a tiny fraction for WGS) from the parquet's own ``eh`` / ``true`` /
-    ``num_repeats_in_reference`` columns, applies the deployed model inline (row-aligned, so no join)
-    -- capped at ``corrected_cap`` per parquet for the corrected variants -- and returns a frame with
-    ``category``, one ``category__<key>`` per ``CORRECTION_VARIANTS`` gate, ``xbin``, ``motif``,
-    ``locus``.
+    Rebuilds the str-truth-set "for_comparison" categorization directly from the parquet -- the EH
+    calls come from the JSON (already flattened into ``eh`` by ``eh_json``) and the truth from the
+    truth-genotypes TSV (already joined into ``true`` / ``num_repeats_in_reference`` / ``purity`` by
+    ``dataset.build_combo``) -- so no precomputed comparison TSV is needed. This is the single
+    categorization path for every report dataset.
+
+    Rows whose ``eh`` is null are the no-call alleles ``eh_json`` emits for loci EH left uncalled:
+    ``classify`` scores them "No Call" (they appear in the raw panel), and because the deployed model
+    is applied only to the finite-``eh`` (called) rows below, their ``pok`` stays NaN so they are
+    excluded from the LCF-corrected panels (a no-call can't be corrected) -- matching the old TSV path.
+
+    Applies the deployed model inline (row-aligned, so no join) -- capped at ``corrected_cap`` called
+    alleles per parquet for the corrected variants -- and returns a frame with ``category``, one
+    ``category__<key>`` per ``CORRECTION_VARIANTS`` gate, ``xbin``, ``motif``, ``locus``, ``purity``,
+    ``pok``.
     """
     import model as M
     import features
@@ -306,7 +181,7 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     true = pd.to_numeric(df["true"], errors="coerce").to_numpy(dtype=float)
     nref = pd.to_numeric(df["num_repeats_in_reference"], errors="coerce").to_numpy(dtype=float)
     # ANALYSIS_OK[imputation]: remaining eh/nref/motif/purity NaNs propagate into classify()/xbin(),
-    # which are NaN-aware by design (see their docstrings).
+    # which are NaN-aware by design (see their docstrings). A null eh (no-call row) -> classify "No Call".
     motif = pd.to_numeric(df["motif_size"], errors="coerce").to_numpy(dtype=float)
     purity = pd.to_numeric(df["purity"], errors="coerce").to_numpy(dtype=float)
     locus = df["locus_id"].astype(str).str.replace(r"^chr", "", regex=True).to_numpy()
@@ -324,8 +199,10 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     mj = M.load(model_path)["genotyping_regimes"]
     comp = {r: (M.compile_genotyping_regime(mj[r]), features.GENOTYPING_REGIME_BRANCH[r])
             for r in features.GENOTYPING_REGIMES}
-    sel = np.arange(len(df))
-    if corrected_cap and len(df) > corrected_cap:
+    # Only called alleles (finite eh) can be LCF-corrected; no-call rows keep lcf/pok NaN so they drop
+    # out of the corrected panels (see docstring). Cap the called-allele apply for speed.
+    sel = np.where(np.isfinite(eh))[0]
+    if corrected_cap and sel.size > corrected_cap:
         sel = np.sort(np.random.default_rng(20260616).choice(sel, corrected_cap, replace=False))
     # ANALYSIS_OK[imputation]: NaN spanning_at_called -> 0 is genotyping_regime_of's documented
     # default (features.py), routing such alleles to full_nonspanning.
@@ -406,7 +283,12 @@ TITLE_TOOL_LABELS = {"EHv5-bw2-optimized": "bw2/EHv5 (optimized-streaming)"}
 def plot_accuracy_by_size(data, out_png, tool_label, coverage_label, motif_desc, lcf_note=""):
     """Draws the two-panel stacked-bar accuracy plot from a ``bin_counts`` dict (one motif set, one
     correction state). Left = stacked counts, right = stacked fractions + per-bin allele counts.
+
+    ``data`` may carry the distinct-locus count either as a precomputed ``total_loci`` int (what
+    ``gen_datasets`` accumulates across samples) or only as the raw ``loci`` set ``bin_counts``
+    returns; the title falls back to ``len(data["loci"])`` so a raw ``bin_counts`` dict plots directly.
     """
+    total_loci = data.get("total_loci", len(data.get("loci", ())))
     nb = len(X_LABELS)
     x = np.arange(nb)
     counts = {c: np.asarray(data["counts"][c], dtype=float) for c in CATEGORIES}
@@ -454,26 +336,7 @@ def plot_accuracy_by_size(data, out_png, tool_label, coverage_label, motif_desc,
                  "in %s%s\n"
                  "Showing results for %s loci (%s)"
                  % (tool_label, "{:,}".format(data["same"]), "{:,}".format(data["total"]), pct,
-                    coverage_label, lcf_note, "{:,}".format(data["total_loci"]), motif_desc),
+                    coverage_label, lcf_note, "{:,}".format(total_loci), motif_desc),
                  fontsize=13, y=0.995, va="top")
     fig.savefig(out_png, dpi=130, bbox_inches="tight")
     plt.close(fig)
-
-
-if __name__ == "__main__":
-    # Self-test: reproduce the published HG002 31x 2-6bp numbers (309,621 / 342,406 = 90.4% "Same").
-    import sys
-    tsv = sys.argv[1] if len(sys.argv) > 1 else (
-        "data/real_quick/_downloads/HG002_31x/"
-        "HG002.tandem_repeat_genotypes.for_comparison.with_EHv5-bw2-optimized_vs_Truth_columns."
-        "alleles.tsv.gz")
-    cat = categorize_tsv(tsv, "EHv5-bw2-optimized")
-    sub = cat[(cat["motif"] >= 2) & (cat["motif"] <= 6)]
-    same = int((sub["category"] == "Same").sum())
-    print("2-6bp alleles: %d  (published 342,406)" % len(sub))
-    print("Same / exactly-right: %d  (published 309,621)  => %.1f%%  (published 90.4%%)"
-          % (same, 100.0 * same / len(sub)))
-    print("loci: %d  (published 171,200)" % sub["locus"].nunique())
-    print("\ncategory counts:")
-    # ANALYSIS_OK[imputation]: zero-fills absent categories in this diagnostic printout only.
-    print(sub["category"].value_counts().reindex(CATEGORIES).fillna(0).astype(int).to_string())

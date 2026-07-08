@@ -25,25 +25,22 @@ echo "==== [1/3] download + build parquet ===================================="
 echo "==== [2/3] train + export model ======================================="
 "$PYTHON" train.py --data-dir "$DATA_DIR" --out "$MODEL_OUT" --train-cap "$TRAIN_CAP"
 
+# Optional external validation: build the 30 held-out HPRC per-sample parquets (absent from training;
+# of the original 43-sample panel, 13 were promoted into training) so the report's held-out HPRC
+# section is populated. Off by default (a ~7-8 GB download). Enable with RUN_HELDOUT_SAMPLES=1. Once
+# the parquets exist, report.py regenerates the held-out eval/stacked artifacts from them by default
+# (no extra gen_datasets.py step) -- pass --skip-heldout-samples to opt out.
+if [ "${RUN_HELDOUT_SAMPLES:-0}" = "1" ]; then
+  echo "==== build held-out HPRC per-sample parquets (30 samples) ============="
+  "$PYTHON" heldout.py --model "$MODEL_OUT" --build-only
+fi
+
 echo "==== [3/3] evaluate (5-fold CV) + HTML report ========================="
 # Homopolymer-only CV first (writes results_homopolymer.json + dir_oof_homopolymer.npz), so the
 # render below includes the homopolymer panels + the Excluded/Only-Homopolymers toggles.
 "$PYTHON" report.py --data-dir "$DATA_DIR" --cv-train-cap "$CV_TRAIN_CAP" --homopolymer-cv
+# The main render also regenerates the held-out HPRC artifacts from the parquets above (if built).
 "$PYTHON" report.py --data-dir "$DATA_DIR" --model "$MODEL_OUT" --cv-train-cap "$CV_TRAIN_CAP"
-
-# Optional external validation: apply the exported model to the 30 held-out HPRC samples (of the
-# original 43-sample panel; 13 were promoted into training) and fold the results into the report.
-# Off by default (a ~7-8 GB download). Enable with RUN_HOLDOUT43=1.
-if [ "${RUN_HOLDOUT43:-0}" = "1" ]; then
-  echo "==== [4] external held-out benchmark (30 HPRC samples) ================"
-  # Download + build the 30 held-out per-sample parquets (into data_eval_43/real_43/).
-  "$PYTHON" heldout.py --model "$MODEL_OUT" --build-only
-  # Generate the artifacts report.py actually reads for the held-out-43 section
-  # (report/eval_heldout43.json + report/stacked_heldout43.json). heldout.py's own
-  # report/heldout.json is a standalone dump the report does NOT consume.
-  "$PYTHON" gen_datasets.py --dataset heldout43 --model "$MODEL_OUT"
-  "$PYTHON" report.py --data-dir "$DATA_DIR" --model "$MODEL_OUT" --render-only
-fi
 
 echo "======================================================================="
 echo "DONE"

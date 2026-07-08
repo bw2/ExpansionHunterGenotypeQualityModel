@@ -1,10 +1,17 @@
 """Generate the per-dataset evaluation artifacts that feed the report's dataset pill.
 
-For each dataset (HG002 genome 31x / HG002 exome 3x / the 43 held-out HPRC samples) this writes:
+For each dataset (HG002 genome 31x / HG002 exome 3x / the held-out HPRC samples) this writes:
   - ``report/eval_<key>.json`` + ``report/eval_<key>_violin.npz`` -- the apply-based eval (MAE,
     helped/hurt, by-pOk / pdiff / LCF violins), via ``heldout.run_eval``.
   - ``report/stacked_<key>.json`` -- the stacked "accuracy by true allele size" counts (raw +
     LCF-corrected, each split non-homopolymer / homopolymer), via ``accuracy_by_size``.
+
+Every dataset is scored straight from its per-allele parquet(s) via
+``accuracy_by_size.categorize_parquet`` -- the EH calls come from the JSON (flattened into ``eh`` by
+``eh_json``) and the truth from the truth-genotypes TSV (joined into ``true`` by ``dataset``), so no
+precomputed "for_comparison" TSV is downloaded or read. Parquets built by the current ``eh_json``
+carry no-call rows, so the "No Call" category is reconstructed too (except for the legacy hand-built
+HG002 exome parquet, which predates that and has none -- see ``datasets``).
 
 The deployed model is applied unchanged (no fitting). Run one dataset at a time (foreground) so the
 heavy model-apply survives the environment's background-job limits. Coding rules: no type hints,
@@ -17,17 +24,17 @@ import json
 import os
 
 import numpy as np
-import pandas as pd
 import pyarrow.parquet as pq
 
 import accuracy_by_size as A
-import dataset
 import features
 import heldout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = "EHv5-bw2-optimized"
-_TSV = "*.for_comparison.with_%s_vs_Truth_columns.alleles.tsv.gz" % TOOL
+# Per-parquet allele caps (shared by this CLI and report.py's default held-out regeneration).
+EVAL_CAP_DEFAULT = 30_000        # apply-based eval (violins / MAE)
+CORRECTED_CAP_DEFAULT = 400_000  # stacked LCF-corrected apply
 
 
 def _heldout_parquets():
@@ -36,35 +43,28 @@ def _heldout_parquets():
     Filters the ``data_eval_43/real_43/`` glob down to ``heldout.SAMPLES`` so samples promoted into
     training (``dataset.PROMOTED_HELDOUT_SAMPLES``) -- whose parquets are left on disk for reuse as
     training-pool symlinks -- are never scored as held-out (that would leak train rows into external
-    validation). Their for-comparison TSVs aren't cached and their catalog/coverage vary per sample, so
-    the held-out accuracy-by-size is computed straight from the parquets via
-    ``accuracy_by_size.categorize_parquet`` (No-Call alleles aren't present in the parquet, hence not
-    shown for held-out -- a tiny fraction for short-read WGS).
+    validation).
     """
     all_parquets = glob.glob(os.path.join(HERE, "data_eval_43", "real_43", "*.parquet"))
     return sorted(p for p in all_parquets
                  if os.path.splitext(os.path.basename(p))[0] in heldout.SAMPLES)
 
 
-# key -> {label, coverage_label, motif descriptions, list of (parquet, tsv) pairs}.
+# key -> {label, coverage_label, list of per-allele parquets, optional no_call_note}.
 def datasets():
     return {
         "hg002_genome": {
             "label": "HG002 genome (31x)", "coverage_label": "31x Illumina Genome data",
-            "pairs": [(os.path.join(HERE, "data/real_quick/HG002_31x.parquet"),
-                       os.path.join(HERE, "data/real_quick/_downloads/HG002_31x",
-                                    "HG002.tandem_repeat_genotypes.for_comparison."
-                                    "with_%s_vs_Truth_columns.alleles.tsv.gz" % TOOL))]},
+            "parquets": [os.path.join(HERE, "data/real_quick/HG002_31x.parquet")]},
         "hg002_exome": {
             "label": "HG002 exome (3x)", "coverage_label": "3x Illumina exome data",
-            "pairs": [(os.path.join(HERE, "data_eval_misc/HG002_exome_3x.parquet"),
-                       os.path.join(HERE, "data_eval_misc/_downloads/HG002_exome_3x",
-                                    "HG002.tandem_repeat_genotypes.for_comparison."
-                                    "with_%s_vs_Truth_columns.alleles.tsv.gz" % TOOL))]},
-        "heldout43": {
+            # Legacy hand-built parquet (no downloader, predates eh_json's no-call rows), so its
+            # uncalled alleles can't be reconstructed -- flag that No-Call is absent for this dataset.
+            "no_call_note": " (No-Call alleles not shown)",
+            "parquets": [os.path.join(HERE, "data_eval_misc/HG002_exome_3x.parquet")]},
+        "heldout_hprc": {
             "label": "%d held-out HPRC samples" % len(heldout.SAMPLES),
             "coverage_label": "%d held-out HPRC samples (short-read WGS)" % len(heldout.SAMPLES),
-            "parquet_only": True, "no_call_note": " (No-Call alleles not shown)",
             "parquets": _heldout_parquets()},
     }
 
@@ -72,12 +72,10 @@ def datasets():
 def gen_stacked(spec, model_path, out_json, corrected_cap):
     """Builds the stacked accuracy-by-size counts (raw + each LCF-correction variant, non-homo + homo).
 
-    TSV-based datasets (HG002 genome / exome) categorize each (parquet, TSV) pair via ``categorize_tsv``
-    + model-prediction join (keeps the join within a sample, since LocusIds collide across samples).
-    Parquet-only datasets (the 43 held-out pool, whose TSVs aren't cached) categorize each parquet via
-    ``categorize_parquet`` (model applied row-aligned, No-Call absent). Either way the per-sample
-    category counts are ACCUMULATED (additive) rather than concatenated, so a 43-sample pool stays
-    bounded in memory. ``corrected_cap`` caps the model apply per parquet; ``None`` = all alleles.
+    Each parquet is categorized via ``accuracy_by_size.categorize_parquet`` (model applied row-aligned,
+    no join). The per-sample category counts are ACCUMULATED (additive) rather than concatenated, so a
+    many-sample pool stays bounded in memory. ``corrected_cap`` caps the model apply per parquet;
+    ``None`` = all alleles.
 
     The JSON nests ``out[homo|nonhomo][correction_variant][purity_variant][pok_variant]``: each
     ``A.CORRECTION_VARIANTS`` key (``raw`` reads the ``category`` column, every gated variant its
@@ -107,27 +105,11 @@ def gen_stacked(spec, model_path, out_json, corrected_cap):
                         a["alleles_per_bin"] += np.asarray(bc["alleles_per_bin"], int)
                         a["same"] += bc["same"]
                         a["total"] += bc["total"]
-                        a["loci"].update(bc["loci"])  # union distinct loci across samples (catalog loci repeat across the 43 held-out samples)
+                        a["loci"].update(bc["loci"])  # union distinct loci across samples (catalog loci repeat across held-out samples)
         print("  stacked: %s (%d alleles)" % (src, len(m)), flush=True)
 
-    if spec.get("parquet_only"):
-        for p in spec["parquets"]:
-            fold(A.categorize_parquet(p, model_path, corrected_cap=corrected_cap), os.path.basename(p))
-    else:
-        for parquet, tsv in spec["pairs"]:
-            preds = A.predict_lcf_pok([parquet], model_path, cap=corrected_cap)
-            cat = A.categorize_tsv(tsv, TOOL)
-            if corrected_cap is None:
-                # A cap alone makes the JSON side look artificially short of the TSV's locus catalog,
-                # so this check is only meaningful (and only run) uncapped; see
-                # dataset._assert_catalog_agreement.
-                json_side = pd.DataFrame({"locus_id": preds["locus"].unique()})
-                tsv_side = (cat[["locus", "true_repeats"]]
-                           .rename(columns={"locus": "LocusId", "true_repeats": "true"})
-                           .drop_duplicates("LocusId"))
-                dataset._assert_catalog_agreement(json_side, tsv_side, os.path.basename(parquet),
-                                                  fatal=False)
-            fold(A.add_corrected_categories(cat, preds), os.path.basename(parquet))
+    for p in spec["parquets"]:
+        fold(A.categorize_parquet(p, model_path, corrected_cap=corrected_cap), os.path.basename(p))
 
     out = {"label": spec["label"], "coverage_label": spec["coverage_label"],
            "tool_label": A.TITLE_TOOL_LABELS[TOOL]}
@@ -171,31 +153,46 @@ def _check_feature_columns(parquets):
                 "re-running gen_datasets.py." % (p, sorted(missing)))
 
 
+def generate(dataset_key, model_path, out_dir, eval_cap=EVAL_CAP_DEFAULT,
+             corrected_cap=CORRECTED_CAP_DEFAULT, skip_eval=False):
+    """Writes one dataset's eval + stacked artifacts into ``out_dir`` (no download; no fitting).
+
+    Applies the exported ``model_path`` to that dataset's local per-allele parquets. Returns the number
+    of parquets processed -- 0 (a no-op that writes nothing) when none are present locally, so callers
+    like report.py can regenerate the held-out section only when its parquets have been built. Shared by
+    this module's CLI and report.py's default held-out regeneration.
+    """
+    spec = datasets()[dataset_key]
+    parquets = spec["parquets"]
+    print("==== dataset %s: %d parquet(s) ====" % (dataset_key, len(parquets)), flush=True)
+    if not parquets:
+        return 0
+    _check_feature_columns(parquets)
+    if not skip_eval:
+        heldout.run_eval(parquets, model_path,
+                         os.path.join(out_dir, "eval_%s.json" % dataset_key), eval_cap)
+    print("\n==== stacked accuracy-by-size: %s ====" % dataset_key, flush=True)
+    gen_stacked(spec, model_path, os.path.join(out_dir, "stacked_%s.json" % dataset_key),
+                corrected_cap or None)
+    return len(parquets)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, choices=list(datasets().keys()))
     parser.add_argument("--model", required=True)
     parser.add_argument("--out-dir", default=os.path.join(HERE, "report"))
-    parser.add_argument("--eval-cap", type=int, default=30000,
+    parser.add_argument("--eval-cap", type=int, default=EVAL_CAP_DEFAULT,
                         help="per-parquet allele cap for the apply-based eval (violins/MAE)")
-    parser.add_argument("--corrected-cap", type=int, default=400000,
+    parser.add_argument("--corrected-cap", type=int, default=CORRECTED_CAP_DEFAULT,
                         help="per-parquet allele cap for the stacked LCF-corrected apply (0 = all)")
     parser.add_argument("--skip-eval", action="store_true",
                         help="only (re)generate the stacked-bar JSON")
     args = parser.parse_args()
 
-    spec = datasets()[args.dataset]
-    parquets = spec["parquets"] if spec.get("parquet_only") else [p for p, _ in spec["pairs"]]
-    print("==== dataset %s: %d parquet(s) ====" % (args.dataset, len(parquets)), flush=True)
-    _check_feature_columns(parquets)
-
-    if not args.skip_eval:
-        heldout.run_eval(parquets, args.model,
-                         os.path.join(args.out_dir, "eval_%s.json" % args.dataset), args.eval_cap)
-
-    print("\n==== stacked accuracy-by-size: %s ====" % args.dataset, flush=True)
-    gen_stacked(spec, args.model, os.path.join(args.out_dir, "stacked_%s.json" % args.dataset),
-                args.corrected_cap or None)
+    if generate(args.dataset, args.model, args.out_dir, args.eval_cap,
+                args.corrected_cap, args.skip_eval) == 0:
+        print("no parquet(s) found for dataset %s -- nothing to do" % args.dataset, flush=True)
 
 
 if __name__ == "__main__":

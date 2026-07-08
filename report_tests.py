@@ -210,7 +210,7 @@ class PillsTest(unittest.TestCase):
 
 class DsDimForTest(unittest.TestCase):
     def test_restricts_to_datasets_present_in_contents(self):
-        present = [("hg002_genome", "HG002 genome"), ("heldout43", "43 held-out")]
+        present = [("hg002_genome", "HG002 genome"), ("heldout_hprc", "held-out HPRC")]
         dim = R._ds_dim_for({("hg002_genome", "nh"): "x"}, present)
         self.assertEqual(dim, ("ds", "Dataset", [("hg002_genome", "HG002 genome")]))
 

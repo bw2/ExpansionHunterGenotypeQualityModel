@@ -52,12 +52,15 @@ class LoadTruthFromGenotypesTsvTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "truth.tsv.gz")
             _gz_tsv(path, [
-                {"LocusId": "1-1-2-A", "NumRepeatsShortAllele": 5, "NumRepeatsLongAllele": 9,
+                {"LocusId": "1-1-2-A", "Chrom": "chr1", "NumRepeatsInReference": 1,
+                 "NumRepeatsShortAllele": 5, "NumRepeatsLongAllele": 9,
                  "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 0.9},
-                {"LocusId": "1-3-4-A", "NumRepeatsShortAllele": 2, "NumRepeatsLongAllele": 2,
+                {"LocusId": "1-3-4-A", "Chrom": "chr1", "NumRepeatsInReference": 1,
+                 "NumRepeatsShortAllele": 2, "NumRepeatsLongAllele": 2,
                  "RepeatPurityShortAllele": 0.8, "RepeatPurityLongAllele": 0.8},
                 # exact duplicate row -- must be collapsed by drop_duplicates("LocusId")
-                {"LocusId": "1-3-4-A", "NumRepeatsShortAllele": 2, "NumRepeatsLongAllele": 2,
+                {"LocusId": "1-3-4-A", "Chrom": "chr1", "NumRepeatsInReference": 1,
+                 "NumRepeatsShortAllele": 2, "NumRepeatsLongAllele": 2,
                  "RepeatPurityShortAllele": 0.8, "RepeatPurityLongAllele": 0.8},
             ])
             out = dataset._load_truth_from_genotypes_tsv(path)
@@ -70,14 +73,28 @@ class LoadTruthFromGenotypesTsvTest(unittest.TestCase):
             row = out[(out["LocusId"] == "1-1-2-A") & (out["allele_rank"] == 1)].iloc[0]
             self.assertEqual(row["true"], 9)
 
-    def test_malformed_numeric_becomes_nan(self):
+    def test_eh_catalog_filters_drop_hom_ref_nonprimary_and_unparseable(self):
+        # Mirrors convert_truth_set_to_variant_catalogs.py: keep only primary-contig, variant loci
+        # with parseable repeat counts. Only the one variant primary-contig locus survives.
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "truth.tsv.gz")
-            _gz_tsv(path, [{"LocusId": "1-1-2-A", "NumRepeatsShortAllele": "NA", "NumRepeatsLongAllele": 9,
-                           "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 0.9}])
+            _gz_tsv(path, [
+                {"LocusId": "1-1-2-A", "Chrom": "chr1", "NumRepeatsInReference": 5,  # hom-ref -> drop
+                 "NumRepeatsShortAllele": 5, "NumRepeatsLongAllele": 5,
+                 "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 1.0},
+                {"LocusId": "1-3-4-A", "Chrom": "chr1", "NumRepeatsInReference": 5,  # variant -> keep
+                 "NumRepeatsShortAllele": 5, "NumRepeatsLongAllele": 9,
+                 "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 0.9},
+                {"LocusId": "M-1-2-A", "Chrom": "chrM", "NumRepeatsInReference": 1,  # non-primary -> drop
+                 "NumRepeatsShortAllele": 2, "NumRepeatsLongAllele": 4,
+                 "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 1.0},
+                {"LocusId": "1-9-9-A", "Chrom": "chr1", "NumRepeatsInReference": 1,  # unparseable -> drop
+                 "NumRepeatsShortAllele": "NA", "NumRepeatsLongAllele": 4,
+                 "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 1.0},
+            ])
             out = dataset._load_truth_from_genotypes_tsv(path)
-            short = out[(out["allele_rank"] == 0)].iloc[0]
-            self.assertTrue(pd.isna(short["true"]))
+            self.assertEqual(set(out["LocusId"]), {"1-3-4-A"})
+            self.assertEqual(len(out), 2)  # the one kept locus -> Short + Long allele rows
 
 
 class JoinTruthTest(unittest.TestCase):
@@ -444,6 +461,52 @@ class LinkPromotedHeldoutSamplesTest(unittest.TestCase):
 class PromotedHeldoutSamplesTest(unittest.TestCase):
     def test_disjoint_from_remaining_heldout_samples(self):
         self.assertEqual(set(dataset.PROMOTED_HELDOUT_SAMPLES) & set(heldout.SAMPLES), set())
+
+
+class AssertParquetsUpToDateTest(unittest.TestCase):
+    def _setup(self, d):
+        """Builds a minimal data_dir with one combo's JSON + truth TSV under _downloads; returns them."""
+        os.makedirs(os.path.join(d, "parquet"))
+        combo_dl = os.path.join(d, dataset.SOURCE_SUBDIR, "_downloads", "HG002_31x")
+        os.makedirs(combo_dl)
+        json_p = os.path.join(combo_dl, "HG002.EHv5.shard000.json.gz")
+        open(json_p, "w").close()
+        tsv_p = os.path.join(d, dataset.SOURCE_SUBDIR, "_downloads", "HG002",
+                             "HG002.tandem_repeat_genotypes.tsv.gz")
+        os.makedirs(os.path.dirname(tsv_p))
+        open(tsv_p, "w").close()
+        return json_p, tsv_p
+
+    def _write_parquets(self, d):
+        for b in ("quick", "full"):
+            open(os.path.join(d, "parquet", "%s.parquet" % b), "w").close()
+
+    def test_missing_parquet_exits(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "PROMOTED_HELDOUT_SAMPLES", ()):
+            self._setup(d)  # upstream present, but no parquet written
+            with self.assertRaises(SystemExit):
+                dataset.assert_parquets_up_to_date(d)
+
+    def test_stale_parquet_exits(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "PROMOTED_HELDOUT_SAMPLES", ()):
+            json_p, _ = self._setup(d)
+            self._write_parquets(d)
+            future = os.path.getmtime(os.path.join(d, "parquet", "quick.parquet")) + 100
+            os.utime(json_p, (future, future))  # an upstream JSON now newer than the parquet
+            with self.assertRaises(SystemExit):
+                dataset.assert_parquets_up_to_date(d)
+
+    def test_fresh_parquet_ok(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "PROMOTED_HELDOUT_SAMPLES", ()):
+            json_p, tsv_p = self._setup(d)
+            self._write_parquets(d)
+            newer = max(os.path.getmtime(json_p), os.path.getmtime(tsv_p)) + 100
+            for b in ("quick", "full"):
+                os.utime(os.path.join(d, "parquet", "%s.parquet" % b), (newer, newer))
+            dataset.assert_parquets_up_to_date(d)  # must not raise
 
 
 if __name__ == "__main__":

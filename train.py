@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
+import dataset
 import features
 import model as M
 
@@ -98,6 +99,9 @@ def main():
     parser.add_argument("--train-cap", type=int, default=1_000_000,
                         help="max train rows per genotyping_regime fit (0 = no cap)")
     args = parser.parse_args()
+
+    # Refuse to train on parquets that are missing or older than their upstream JSON/TSV sources.
+    dataset.assert_parquets_up_to_date(args.data_dir)
 
     genotyping_regimes_json = {}
     feat_names = {}
