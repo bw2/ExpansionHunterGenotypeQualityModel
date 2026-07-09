@@ -20,6 +20,7 @@ Coding rules: no type hints, Google docstrings, ``print()``. Determinism: ``SEED
 import argparse
 import base64
 import html
+import io
 import json
 import os
 
@@ -27,6 +28,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 import pandas as pd
 import pyarrow.parquet as pq
 from sklearn.inspection import permutation_importance
@@ -217,7 +219,7 @@ def evaluate_genotyping_regime(genotyping_regime, data_dir, folds, train_cap, ho
 
     The ``oof`` dict (per-allele OOF arrays from ``collect_oof``) is returned alongside the
     JSON-serializable metrics bundle so the caller can persist the direction-head probabilities for
-    the calibration / precision-recall plots (see ``_save_dir_oof``); it is NOT written to
+    the precision-recall plots (see ``_save_dir_oof``); it is NOT written to
     ``results.json``.
     """
     df, branch = _load_genotyping_regime_df(genotyping_regime, data_dir, homopolymers_only)
@@ -244,7 +246,7 @@ def _save_dir_oof(evals, path):
     """Persists each regime's OOF direction-head arrays (``dir_code``, the 3 class probabilities, and
     the signed call-error ``delta``).
 
-    Keyed ``<genotyping_regime>__{dir_code,p_ok,p_long,p_short,delta}`` so ``plot_calibration`` /
+    Keyed ``<genotyping_regime>__{dir_code,p_ok,p_long,p_short,delta}`` so
     ``plot_pr`` / ``plot_roc`` / ``plot_prob_violins`` can be regenerated in ``--render-only`` mode
     without re-running the cross-validation. ``delta = round(eh) - round(true)`` is the per-allele EH
     call error in repeat units (the size-bin x-axis).
@@ -414,65 +416,9 @@ def plot_ablation(results, out_png):
 
 
 # --- direction-head accuracy plots (pOk / pTooLong / pTooShort) -----------
-# 1×3 reliability + 1×2 precision-recall + 1×3 confusion, all on the pooled 5-fold OOF
-# probabilities. Regimes are overlaid (calibration / PR) or paneled (confusion) and read straight
-# from the dir_oof npz / results.json, so they regenerate in --render-only.
-_DIR_CLASSES = (("pOk", "p_ok", features.OK), ("pTooLong", "p_long", features.TOO_LONG),
-                ("pTooShort", "p_short", features.TOO_SHORT))
-
-
-def _reliability_points(y_binary, p, n_bins=10):
-    """Returns ``(mean_pred, obs_freq, count)`` per non-empty equal-width probability bin.
-
-    Same binning as ``metrics._ece`` so the curve and the table's ECE agree.
-    """
-    y_binary = np.asarray(y_binary, dtype=float)
-    p = np.asarray(p, dtype=float)
-    idx = np.clip((p * n_bins).astype(int), 0, n_bins - 1)
-    xs, ys, ns = [], [], []
-    for b in range(n_bins):
-        in_bin = idx == b
-        c = int(in_bin.sum())
-        if c:
-            xs.append(p[in_bin].mean()); ys.append(y_binary[in_bin].mean()); ns.append(c)
-    return np.array(xs), np.array(ys), np.array(ns)
-
-
-def plot_calibration(oof, out_png, title_tag="non-homopolymer"):
-    """One-vs-rest reliability curves for pOk / pTooLong / pTooShort, one panel per class.
-
-    Regimes are overlaid; x = mean predicted probability per bin, y = observed frequency, marker
-    area scales with the bin's allele count, and the dashed diagonal is perfect calibration. The
-    legend shows each class's own one-vs-rest ECE; the metrics table reports the mean of the
-    TOO_LONG and TOO_SHORT values only, so the table value matches neither the pOk legend value nor
-    either component alone.
-
-    Args:
-        oof: Dict of ``<genotyping_regime>__{dir_code,p_ok,p_long,p_short}`` arrays (the dir_oof npz).
-        out_png: Output path.
-        title_tag: Loci-set label for the suptitle.
-    """
-    regs = [r for r in features.GENOTYPING_REGIMES if ("%s__dir_code" % r) in oof]
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2))
-    for ax, (cname, pkey, code) in zip(axes, _DIR_CLASSES):
-        ax.plot([0, 1], [0, 1], ls="--", color="k", lw=1, alpha=0.6, zorder=1)
-        for r in regs:
-            y = np.asarray(oof["%s__dir_code" % r], dtype=int) == code
-            p = np.asarray(oof["%s__%s" % (r, pkey)], dtype=float)
-            xs, ys, ns = _reliability_points(y, p)
-            ax.plot(xs, ys, "-", color=REGIME_COLORS[r], lw=1.4, alpha=0.9, zorder=2,
-                    label="%s (ECE=%.3f)" % (features.GENOTYPING_REGIME_DISPLAY[r], metrics._ece(y, p)))
-            if ns.size:
-                ax.scatter(xs, ys, s=np.clip(ns / ns.max() * 230, 12, 240), color=REGIME_COLORS[r],
-                           alpha=0.6, edgecolors="white", linewidths=0.5, zorder=3)
-        ax.set_xlim(-0.02, 1.02); ax.set_ylim(-0.02, 1.02)
-        ax.set_xlabel("mean predicted probability"); ax.set_title(cname)
-        ax.grid(alpha=0.3); ax.legend(fontsize=8, loc="upper left")
-    axes[0].set_ylabel("observed frequency")
-    fig.suptitle("Calibration (reliability) of the direction predictor — %s (5-fold held-out); "
-                 "marker size ∝ allele count" % title_tag, fontsize=13, weight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
-    fig.savefig(out_png, dpi=150, bbox_inches="tight"); plt.close(fig)
+# 1×2 precision-recall + 1×3 confusion, on the pooled 5-fold OOF probabilities. Regimes are
+# overlaid (PR) or paneled (confusion) and read straight from the dir_oof npz / results.json, so
+# they regenerate in --render-only.
 
 
 def plot_pr(oof, out_png, title_tag="non-homopolymer"):
@@ -1004,8 +950,17 @@ def plot_violins_lcf_bins(violin, out_png, pfx="", title_tag="non-homopolymer",
 # --- HTML -----------------------------------------------------------------
 
 def _img(path):
-    with open(path, "rb") as f:
-        return '<img src="data:image/png;base64,%s" />' % base64.b64encode(f.read()).decode()
+    """Embeds a PNG as a base64 data URI, palette-quantized to keep the standalone HTML small enough
+    to commit + serve on GitHub Pages.
+
+    matplotlib charts use few distinct colors, so an adaptive 256-color palette is visually
+    near-lossless yet ~2-3x smaller than the truecolor PNG; the on-disk PNG (a gitignored build
+    artifact) is left untouched -- only the embedded copy is quantized.
+    """
+    quantized = Image.open(path).convert("RGB").convert("P", palette=Image.ADAPTIVE, colors=256)
+    buf = io.BytesIO()
+    quantized.save(buf, format="PNG", optimize=True)
+    return '<img src="data:image/png;base64,%s" />' % base64.b64encode(buf.getvalue()).decode()
 
 
 def _img_toggle(excluded_png, homopolymer_png, gid):
@@ -1031,19 +986,6 @@ def _img_toggle(excluded_png, homopolymer_png, gid):
         "<div class='htpanel htpanel-ho'>%s</div>"
         "</div>"
     ) % (gid, gid, gid, gid, gid, gid, _img(excluded_png), _img(homopolymer_png))
-
-
-def _q_table(results):
-    rows = ["<tr><th>allele size bucket</th><th>n (held-out)</th><th>raw EH MAE</th><th>LCF MAE</th>"
-            "<th>dist. reduction</th><th>median |err|: EH&rarr;LCF</th><th>exact: EH&rarr;LCF</th></tr>"]
-    for r in results:
-        q = r["q"]
-        rows.append("<tr><td>%s</td><td>%d</td><td>%.3f</td><td>%.3f</td><td>%+.1f%%</td>"
-                    "<td>%.3f &rarr; %.3f</td><td>%.3f &rarr; %.3f</td></tr>" % (
-                        features.GENOTYPING_REGIME_DISPLAY[r["genotyping_regime"]], q["n"], q["mae_eh"], q["mae_true"],
-                        100 * q["dist_reduction"], q["median_ae_eh"], q["median_ae_true"],
-                        q["eh_exact_match_rate"], q["exact_match_rate"]))
-    return "<table>%s</table>" % "".join(rows)
 
 
 def _feature_glossary(results):
@@ -1096,18 +1038,6 @@ def _model_outputs_table():
     return "<table>%s</table>" % "".join(rows)
 
 
-def _dir_table(results):
-    rows = ["<tr><th>allele size bucket</th><th>log-loss</th><th>TOO_LONG AUC</th><th>TOO_SHORT AUC</th>"
-            "<th>ECE</th><th>pOk argmax acc.</th></tr>"]
-    for r in results:
-        d = r["direction"]
-        rows.append("<tr><td>%s</td><td>%.4f</td><td>%.3f</td><td>%.3f</td><td>%.4f</td>"
-                    "<td>%.3f</td></tr>" % (
-                        features.GENOTYPING_REGIME_DISPLAY[r["genotyping_regime"]], d["log_loss"], d["too_long_auc"],
-                        d["too_short_auc"], d["ece"], d["p_ok_accuracy"]))
-    return "<table>%s</table>" % "".join(rows)
-
-
 def _holdout_results(holdout):
     """Builds a plot_mae-compatible results list from the 43-sample benchmark JSON."""
     gr = holdout["genotyping_regimes"]
@@ -1144,7 +1074,8 @@ def _holdout_table(holdout):
 # Datasets the per-plot Dataset pill switches between (key -> display label).
 DATASETS = [("hg002_genome", "HG002 genome (31x)"),
             ("heldout_hprc", "%d held-out HPRC" % len(heldout.SAMPLES)),
-            ("hg002_exome", "HG002 exome (3x)")]
+            # ("hg002_exome", "HG002 exome (3x)"),  # disabled: input parquet unavailable, can't refresh
+            ]
 
 
 def _pills(gid, dims, contents):
@@ -1205,7 +1136,7 @@ def build_dataset_sections(out_dir, regenerate=True):
     When ``regenerate`` is False (``report.py --render-text-only``) the PNGs are not re-plotted; the
     existing on-disk PNGs are embedded as-is and any that are missing are skipped.
 
-    Every plot carries a <b>Dataset</b> pill (HG002 genome 31x / 43 held-out HPRC / HG002 exome 3x)
+    Every plot carries a <b>Dataset</b> pill (HG002 genome 31x / 43 held-out HPRC)
     and the <b>Homopolymers</b> pill; the accuracy-by-size stacked-bar additionally gets an
     <b>LCF correction</b> on/off pill. Reads ``eval_<key>.json`` + ``eval_<key>_violin.npz`` (the
     apply-based eval) and ``stacked_<key>.json`` (the accuracy-by-size counts) for each dataset.
@@ -1231,9 +1162,9 @@ def build_dataset_sections(out_dir, regenerate=True):
     parts = ["<h2>External validation by dataset</h2>",
              "<p class='note'>The exported model is applied unchanged (no fitting) to each dataset, "
              "scored against truth. Use the <b>Dataset</b> pill on every plot below to switch between "
-             "<b>HG002 genome (31x)</b>, the <b>%d held-out HPRC samples</b> (absent from training -- a "
+             "<b>HG002 genome (31x)</b> and the <b>%d held-out HPRC samples</b> (absent from training -- a "
              "further %d HPRC samples were promoted into the training pool below for ancestry/sex "
-             "diversity), and <b>HG002 exome (3x)</b>.</p>"
+             "diversity).</p>"
              % (len(heldout.SAMPLES), len(dataset.PROMOTED_HELDOUT_SAMPLES))]
 
     # --- accuracy by true allele size (str-truth-set-v2 stacked-bar replica) ---
@@ -1377,8 +1308,8 @@ def build_dataset_sections(out_dir, regenerate=True):
 
 def render_html(results, mae_png, importance_png, ablation_png, model_path, out_html,
                 mae_homopolymer_png=None, ablation_homopolymer_png=None, importance_homopolymer_png=None,
-                calib_png=None, pr_png=None, roc_png=None, confusion_png=None, prob_violins_png=None,
-                calib_homopolymer_png=None, pr_homopolymer_png=None, roc_homopolymer_png=None,
+                pr_png=None, roc_png=None, confusion_png=None, prob_violins_png=None,
+                pr_homopolymer_png=None, roc_homopolymer_png=None,
                 confusion_homopolymer_png=None, prob_violins_homopolymer_png=None,
                 dataset_sections_html=""):
     """Writes the standalone HTML report embedding every plot + metric table."""
@@ -1415,7 +1346,7 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
     # actually generated (i.e. report.py --homopolymer-cv was run); otherwise _img_toggle falls back
     # to a single plot with no toggle, so the text must not claim one.
     homo_shown = any((mae_homopolymer_png, importance_homopolymer_png, ablation_homopolymer_png,
-                      confusion_homopolymer_png, calib_homopolymer_png, pr_homopolymer_png,
+                      confusion_homopolymer_png, pr_homopolymer_png,
                       roc_homopolymer_png, prob_violins_homopolymer_png))
     intro_homo = (
         ""
@@ -1469,22 +1400,6 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "MAE is computed over held-out alleles, and is measured in repeat units. The pOk &lt; 0.5 threshold "
         "concentrates the correction on the "
         "<code>full_nonspanning</code> allele size bucket, where flanking/IRR sizing makes raw EH most error-prone.</p>",
-        "<h2>Held-out LCF prediction accuracy (LCF-recovered truth vs raw EH)</h2>",
-        _q_table(results),
-        "<h2>Held-out pOk/pTooLong/pTooShort metrics</h2>",
-        _dir_table(results),
-        ("<h3>Calibration (reliability) of pOk / pTooLong / pTooShort</h3>" if calib_png else ""),
-        (_img_toggle(calib_png, calib_homopolymer_png, "cal") if calib_png else ""),
-        ("<p class='note'>Each panel is one class, one-vs-rest: the x-axis is the predicted "
-         "probability, the y-axis the <b>observed frequency</b> of that class among alleles given "
-         "that probability, binned into deciles (marker area &prop; allele count). On the dashed "
-         "diagonal the probabilities are perfectly calibrated &mdash; e.g. alleles assigned "
-         "<code>pTooShort &asymp; 0.7</code> really are TOO_SHORT ~70% of the time. The legend "
-         "<code>ECE</code> is each class's own one-vs-rest calibration error; the table's ECE is the "
-         "mean of the TOO_LONG and TOO_SHORT values only, so it equals neither the pOk legend value "
-         "nor either component alone. This "
-         "matters because the pOk &lt; 0.5 threshold applies to <code>pOk</code> directly, so "
-         "<code>pOk</code> must mean what it says.</p>" if calib_png else ""),
         "<h3>Confusion matrix (argmax prediction, row-normalized)</h3>",
         _img_toggle(confusion_png, confusion_homopolymer_png, "cm"),
         "<p class='note'>Rows are the <b>true</b> direction, columns the <b>argmax</b>-predicted "
@@ -1652,14 +1567,13 @@ def main():
     importance_png = _png("feature_importance.png", lambda p: plot_importance_panel(results, p))
     ablation_png = _png("ablation.png", lambda p: plot_ablation(results, p))
 
-    # Direction-predictor accuracy plots (calibration / PR-ROC / ROC from the dir_oof npz, confusion from
+    # Direction-predictor accuracy plots (PR-ROC / ROC from the dir_oof npz, confusion from
     # results.json).
     confusion_png = _png("confusion.png", lambda p: plot_confusion(results, p))
-    calib_png = pr_png = roc_png = prob_violins_png = None
+    pr_png = roc_png = prob_violins_png = None
     dir_oof_npz = os.path.join(args.out_dir, "dir_oof.npz")
     if args.render_text_only or os.path.exists(dir_oof_npz):
         oof_dir = None if args.render_text_only else dict(np.load(dir_oof_npz))
-        calib_png = _png("calibration.png", lambda p: plot_calibration(oof_dir, p))
         pr_png = _png("pr_curves.png", lambda p: plot_pr(oof_dir, p))
         roc_png = _png("roc_curves.png", lambda p: plot_roc(oof_dir, p))
         # prob-violins only exists once the delta-aware CV has been run; in text-only its PNG presence
@@ -1671,7 +1585,7 @@ def main():
     # charts, if the homopolymer CV (report.py --homopolymer-cv) has been run.
     htag = "homopolymer (1 bp motif)"
     mae_homopolymer_png = ablation_homopolymer_png = importance_homopolymer_png = None
-    calib_homopolymer_png = pr_homopolymer_png = roc_homopolymer_png = None
+    pr_homopolymer_png = roc_homopolymer_png = None
     confusion_homopolymer_png = prob_violins_homopolymer_png = None
     homo_json = os.path.join(args.out_dir, "results_homopolymer.json")
     if args.render_text_only or os.path.exists(homo_json):
@@ -1707,8 +1621,6 @@ def main():
             dir_oof_homo_npz = os.path.join(args.out_dir, "dir_oof_homopolymer.npz")
             if args.render_text_only or os.path.exists(dir_oof_homo_npz):
                 oof_dir_homo = None if args.render_text_only else dict(np.load(dir_oof_homo_npz))
-                calib_homopolymer_png = _png("calibration_homopolymer.png",
-                                             lambda p: plot_calibration(oof_dir_homo, p, title_tag=htag))
                 pr_homopolymer_png = _png("pr_curves_homopolymer.png",
                                           lambda p: plot_pr(oof_dir_homo, p, title_tag=htag))
                 roc_homopolymer_png = _png("roc_curves_homopolymer.png",
@@ -1736,9 +1648,9 @@ def main():
                 mae_homopolymer_png=mae_homopolymer_png,
                 ablation_homopolymer_png=ablation_homopolymer_png,
                 importance_homopolymer_png=importance_homopolymer_png,
-                calib_png=calib_png, pr_png=pr_png, roc_png=roc_png, confusion_png=confusion_png,
+                pr_png=pr_png, roc_png=roc_png, confusion_png=confusion_png,
                 prob_violins_png=prob_violins_png,
-                calib_homopolymer_png=calib_homopolymer_png, pr_homopolymer_png=pr_homopolymer_png,
+                pr_homopolymer_png=pr_homopolymer_png,
                 roc_homopolymer_png=roc_homopolymer_png,
                 confusion_homopolymer_png=confusion_homopolymer_png,
                 prob_violins_homopolymer_png=prob_violins_homopolymer_png,

@@ -18,9 +18,10 @@ import features
 import report as R
 
 
-def _write(path, data):
-    with open(path, "wb") as f:
-        f.write(data)
+def _write_png(path):
+    """Writes a tiny real PNG; ``_img`` decodes + re-encodes it, so a fake-bytes file no longer works."""
+    from PIL import Image
+    Image.new("RGB", (4, 3), (10, 20, 30)).save(path, format="PNG")
 
 
 class MakeFoldsTest(unittest.TestCase):
@@ -60,21 +61,6 @@ class CapRowsTest(unittest.TestCase):
         np.testing.assert_array_equal(R._cap_rows(idx, None, seed=1), idx)
         np.testing.assert_array_equal(R._cap_rows(idx, 0, seed=1), idx)
         np.testing.assert_array_equal(R._cap_rows(idx, 100, seed=1), idx)
-
-
-class ReliabilityPointsTest(unittest.TestCase):
-    def test_bins_by_predicted_probability(self):
-        y = [0, 0, 1, 1, 1]
-        p = [0.05, 0.15, 0.85, 0.95, 0.9]
-        xs, ys, ns = R._reliability_points(y, p, n_bins=10)
-        # bins: 0 -> [0.05], 1 -> [0.15], 8 -> [0.85], 9 -> [0.95, 0.9]
-        np.testing.assert_array_equal(ns, [1, 1, 1, 2])
-        self.assertAlmostEqual(xs[-1], (0.95 + 0.9) / 2)
-        self.assertAlmostEqual(ys[-1], 1.0)
-
-    def test_empty_input_returns_empty_arrays(self):
-        xs, ys, ns = R._reliability_points([], [])
-        self.assertEqual(xs.size, 0)
 
 
 class MotifBinTest(unittest.TestCase):
@@ -122,15 +108,6 @@ def _fake_results():
 
 
 class TableBuildersTest(unittest.TestCase):
-    def test_q_table_has_one_row_per_regime(self):
-        html = R._q_table(_fake_results())
-        self.assertEqual(html.count("<tr>"), 1 + len(features.GENOTYPING_REGIMES))
-        self.assertIn("quick", html)
-
-    def test_dir_table_has_one_row_per_regime(self):
-        html = R._dir_table(_fake_results())
-        self.assertEqual(html.count("<tr>"), 1 + len(features.GENOTYPING_REGIMES))
-
     def test_feature_glossary_ranked_by_full_nonspanning_importance(self):
         html = R._feature_glossary(_fake_results())
         self.assertIn("#1", html)
@@ -164,11 +141,11 @@ class ImgTest(unittest.TestCase):
     def test_embeds_base64_data_uri(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "x.png")
-            with open(path, "wb") as f:
-                f.write(b"fake-png-bytes")
+            _write_png(path)
             html = R._img(path)
-            self.assertIn(base64.b64encode(b"fake-png-bytes").decode(), html)
             self.assertTrue(html.startswith('<img src="data:image/png;base64,'))
+            embedded = base64.b64decode(html.split("base64,", 1)[1].split('"', 1)[0])
+            self.assertTrue(embedded.startswith(b"\x89PNG\r\n\x1a\n"))  # re-encoded to a valid PNG
 
 
 class ImgToggleTest(unittest.TestCase):
@@ -178,15 +155,15 @@ class ImgToggleTest(unittest.TestCase):
     def test_only_excluded_present_has_no_toggle_markup(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "x.png")
-            _write(path, b"a")
+            _write_png(path)
             html = R._img_toggle(path, None, "g")
             self.assertNotIn("htgroup", html)
 
     def test_both_present_renders_toggle(self):
         with tempfile.TemporaryDirectory() as d:
             ex, ho = os.path.join(d, "ex.png"), os.path.join(d, "ho.png")
-            _write(ex, b"a")
-            _write(ho, b"b")
+            _write_png(ex)
+            _write_png(ho)
             html = R._img_toggle(ex, ho, "mygroup")
             self.assertIn("htgroup", html)
             self.assertIn("mygroup", html)
@@ -230,16 +207,15 @@ class RenderHtmlTest(unittest.TestCase):
     def test_writes_html_and_skips_missing_optional_sections(self):
         with tempfile.TemporaryDirectory() as d:
             png = os.path.join(d, "p.png")
-            _write(png, b"x")
+            _write_png(png)
             out_html = os.path.join(d, "report.html")
             R.render_html(_fake_results(), png, png, png, "some_model.20260707.json.gz", out_html,
-                          confusion_png=png)  # calib/pr/roc/prob_violins left as None (optional)
+                          confusion_png=png)  # pr/roc/prob_violins left as None (optional)
             with open(out_html) as f:
                 html = f.read()
             self.assertTrue(html.startswith("<!doctype html>"))
             self.assertIn("some_model.20260707.json.gz", html)
             self.assertIn("Feature definitions", html)
-            self.assertNotIn("Calibration (reliability)", html)  # calib_png=None -> section skipped
             self.assertNotIn("PR-ROC curves", html)               # pr_png=None -> section skipped
 
 

@@ -104,9 +104,9 @@ def classify(d, n, drr_truth, drr_tool, is_ref_allele, is_hom_ref):
 # eval-side LCF correction.
 CORRECTION_VARIANTS = (
     ("raw", "Raw EH", "", None),
-    ("p050", "LCF-corrected (p < 0.5)", " — LCF-corrected (pOk < 0.5)", {"pok": 0.5}),
-    ("p025", "LCF-corrected (p < 0.25)", " — LCF-corrected (pOk < 0.25)", {"pok": 0.25}),
-    ("p050ns", "LCF-corrected (p < 0.5 and non-spanning)",
+    ("p050", "LCF-corrected (pOk < 0.5)", " — LCF-corrected (pOk < 0.5)", {"pok": 0.5}),
+    ("p025", "LCF-corrected (pOk < 0.25)", " — LCF-corrected (pOk < 0.25)", {"pok": 0.25}),
+    ("p050ns", "LCF-corrected (pOk < 0.5 and non-spanning)",
      " — LCF-corrected (pOk < 0.5, non-spanning only)", {"pok": 0.5, "nonspanning": True}),
 )
 
@@ -119,13 +119,13 @@ PURITY_VARIANTS = (
 )
 
 # pOk-stratum filter for the accuracy-by-size pill: splits alleles by the model's own predicted
-# confidence, independent of which LCF-correction variant is selected (so e.g. "Raw EH, p < 0.5" shows
+# confidence, independent of which LCF-correction variant is selected (so e.g. "Raw EH, pOk < 0.5" shows
 # how the uncorrected calls look specifically where the model would consider applying a correction).
 # (key, pill label, mode) where mode is None (no filter) / "lt" (pOk < 0.5) / "ge" (pOk >= 0.5).
 POK_VARIANTS = (
     ("all", "All", None),
-    ("lt050", "p < 0.5", "lt"),
-    ("ge050", "p ≥ 0.5", "ge"),
+    ("lt050", "pOk < 0.5", "lt"),
+    ("ge050", "pOk ≥ 0.5", "ge"),
 )
 
 

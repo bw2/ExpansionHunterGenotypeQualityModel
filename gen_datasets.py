@@ -56,12 +56,13 @@ def datasets():
         "hg002_genome": {
             "label": "HG002 genome (31x)", "coverage_label": "31x Illumina Genome data",
             "parquets": [os.path.join(HERE, "data/real_quick/HG002_31x.parquet")]},
-        "hg002_exome": {
-            "label": "HG002 exome (3x)", "coverage_label": "3x Illumina exome data",
-            # Legacy hand-built parquet (no downloader, predates eh_json's no-call rows), so its
-            # uncalled alleles can't be reconstructed -- flag that No-Call is absent for this dataset.
-            "no_call_note": " (No-Call alleles not shown)",
-            "parquets": [os.path.join(HERE, "data_eval_misc/HG002_exome_3x.parquet")]},
+        # Disabled: the legacy hand-built input parquet (data_eval_misc/HG002_exome_3x.parquet) is
+        # unavailable and has no downloader, so its eval can't be refreshed against the current model.
+        # Re-enable (and uncomment the DATASETS entry in report.py) once the parquet is rebuilt.
+        # "hg002_exome": {
+        #     "label": "HG002 exome (3x)", "coverage_label": "3x Illumina exome data",
+        #     "no_call_note": " (No-Call alleles not shown)",
+        #     "parquets": [os.path.join(HERE, "data_eval_misc/HG002_exome_3x.parquet")]},
         "heldout_hprc": {
             "label": "%d held-out HPRC samples" % len(heldout.SAMPLES),
             "coverage_label": "%d held-out HPRC samples (short-read WGS)" % len(heldout.SAMPLES),
