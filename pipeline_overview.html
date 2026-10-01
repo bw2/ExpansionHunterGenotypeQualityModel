@@ -96,7 +96,7 @@
           <span class="why"><b>Why:</b> this is the sole source of the model's <em>input features</em> and the <code>eh</code> call being corrected — every feature the model reads comes from the JSON, never from a precomputed TSV, so features are computed identically across samples/coverages/branches.</span></li>
         <li><span class="file">gs://str-truth-set-v2/filter_vcf_v2/&lt;sample&gt;/&lt;sample&gt;.tandem_repeat_genotypes.tsv.gz</span> &mdash; the tool-independent truth catalog (Short/Long allele repeat counts, <code>NumRepeatsInReference</code>, motif, per-allele purity) built from the dipcall/long-read-assembly pipeline; one file per sample (truth doesn't depend on short-read coverage). This is the <em>same</em> plain <span class="file">filter_vcf_v2</span> the genotyping pipeline reads its catalog from, so it stays consistent with the JSON (the dated <span class="file">filter_vcf_v2__…</span> variants would not).
           <span class="why"><b>Why:</b> supplies the <em>training target</em> — the true allele size each call is scored against (<code>t = log(eh) − log(true)</code>) — and, being tied to no EH run, cannot go stale relative to one. It is filtered at load to EH's catalog loci (primary contigs + variant, non-hom-ref, per <span class="file">convert_truth_set_to_variant_catalogs.py</span>) so it lines up with the loci the JSON actually contains.</span></li>
-        <li>44 <span class="file">PROMOTED_HELDOUT_SAMPLES</span> per-sample parquets (48 training sources with the 4 combos), built on demand via <span class="file">heldout.build_sample</span> from the same two GCS sources and symlinked into the training pool.
+        <li>50 <span class="file">PROMOTED_HELDOUT_SAMPLES</span> per-sample parquets (54 training sources with the 4 combos), built on demand via <span class="file">heldout.build_sample</span> from the same two GCS sources and symlinked into the training pool.
           <span class="why"><b>Why:</b> HG002+CHM1_CHM13 alone leave the large-allele tail overfit to two genomes; these add ancestry/sex diversity at large sizes.</span></li>
       </ul>
       <p class="kicker">Role</p>
@@ -165,13 +165,13 @@
   <li>
     <span class="stage-head orange">Stage 4 &mdash; External validation<span class="optional-tag">optional · RUN_HELDOUT_SAMPLES=1</span></span>
     <div class="stage-body">
-      <p>Builds the 87 truly held-out sample parquets so Stage 3 can score them (the model is applied unchanged — the realistic "train on some samples, deploy on new samples" test). A ~7&ndash;8&nbsp;GB download for the original 30 samples (roughly 3x that for all 87), off by default.</p>
+      <p>Builds the 81 truly held-out sample parquets so Stage 3 can score them (the model is applied unchanged — the realistic "train on some samples, deploy on new samples" test). A ~7&ndash;8&nbsp;GB download for the original 30 samples (roughly 3x that for all 81), off by default.</p>
       <ol class="sub-steps">
         <li>
           <strong>4a. <span class="file">heldout.py --build-only</span></strong><br>
-          <span class="kicker">Input:</span> GCS EH JSON + truth-genotypes TSV for the 87 held-out samples.
+          <span class="kicker">Input:</span> GCS EH JSON + truth-genotypes TSV for the 81 held-out samples.
           <span class="why"><b>Why:</b> same two sources / same extract-join-label pipeline as Stage 1, so the held-out parquets carry identical features (and no-call rows) — a prerequisite for applying the frozen model to them.</span><br>
-          <span class="kicker">Output:</span> <span class="file">data_eval_43/real_43/&lt;SAMPLE&gt;.parquet</span> &times; 30.
+          <span class="kicker">Output:</span> <span class="file">data_eval_43/real_43/&lt;SAMPLE&gt;.parquet</span> &times; 81.
         </li>
         <li>
           <strong>4b. Fold into the report</strong><br>
@@ -189,7 +189,7 @@
       <p class="kicker">Inputs</p>
       <ul>
         <li>the new model (<span class="file">--new-model</span> = Stage 2's export) and a <b>previous model</b> (<span class="file">--prev-model</span>): defaults to whichever model is deployed in the local <span class="file">ExpansionHunter-bw2</span> checkout (<span class="file">ehunter/data/genotype_quality_model_*.json.gz</span>), falling back to the most recent other <span class="file">model/*.json.gz</span> in this repo.</li>
-        <li>the 30 held-out HPRC per-sample parquets from Stage 4 (<span class="file">data_eval_43/real_43/&lt;SAMPLE&gt;.parquet</span>).
+        <li>the 81 held-out HPRC per-sample parquets from Stage 4 (<span class="file">data_eval_43/real_43/&lt;SAMPLE&gt;.parquet</span>).
           <span class="why"><b>Why:</b> in neither model's training pool, so applying both to them is a fair generalization comparison.</span></li>
       </ul>
       <p class="kicker">Role</p>
@@ -209,7 +209,7 @@
   <ul style="margin-top:0;">
     <li><b>The GQ model is applied post-hoc, in Python.</b> EH emits, per allele, the raw allele size (<code>eh</code>) <em>and every quality-metric feature</em> unconditionally — those fields do not depend on any GQ model. The model JSON only tells the deployed EH binary how to turn those already-emitted features into <code>PredictedLengthCorrectionFactor</code> / <code>pOk</code>. Stage 3 computes those same quantities itself (<span class="file">model.predict_lcf_json</span> / <span class="file">predict_proba_json</span>) from the cached features, so it never needs EH to produce them.</li>
     <li><b>The features are model-independent.</b> Re-running EH with a new model JSON would not change a single feature value the parquets already hold (it would only add the model's <em>outputs</em> into new JSON). Since the parquets already contain the model's inputs, the existing EH JSON serves any model version.</li>
-    <li><b>Determinism / no leakage.</b> The model uses no locus-id or raw-coverage feature, so the same cached JSON is valid regardless of which model was trained; re-running EH would only add cost (and a fresh several-hour EH run over ~1.6M loci &times; 4 combos) with no change to the evaluation inputs.</li>
+    <li><b>Determinism / no leakage.</b> The model uses no locus-id feature, and its <code>coverage</code> feature, like every other feature, is a value EH writes to its JSON whether or not a model is loaded, so the same cached JSON is valid regardless of which model was trained; re-running EH would only add cost (and a fresh several-hour EH run over ~1.6M loci &times; 4 combos) with no change to the evaluation inputs.</li>
   </ul>
   <p style="margin-bottom:0;">EH <em>would</em> need re-running only to regenerate the raw <code>*.json.gz</code> after an ExpansionHunter-bw2 code change that alters the calls or features themselves — which <span class="file">dataset._check_freshness</span> detects by comparing each JSON's stamped build commit against the local EH checkout.</p>
 </div>
@@ -258,8 +258,8 @@
   <div class="col" style="margin-top:250px;">
     <div class="branch-label">optional: RUN_HELDOUT_SAMPLES=1</div>
     <div class="box opt">
-      <div class="t">87 held-out samples (GCS, 2 sources each)</div>
-      Samples absent from training (44 others train alongside HG002 + CHM1_CHM13)
+      <div class="t">81 held-out samples (GCS, 2 sources each)</div>
+      Samples absent from training (50 others train alongside HG002 + CHM1_CHM13)
     </div>
     <div class="arrow">&#8595;</div>
     <div class="box opt">
@@ -269,7 +269,7 @@
     <div class="arrow">&#8595;</div>
     <div class="box opt">
       <div class="t">data_eval_43/real_43/*.parquet</div>
-      87 per-sample parquets (features + no-call rows)
+      81 per-sample parquets (features + no-call rows)
     </div>
     <div class="arrow">&#8595;</div>
     <div class="box opt">

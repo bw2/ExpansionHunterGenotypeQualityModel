@@ -1,7 +1,7 @@
-"""Cross-population held-out benchmark: apply the EXPORTED model to the 87 held-out samples.
+"""Cross-population held-out benchmark: apply the EXPORTED model to the 81 held-out samples.
 
 The deployed model is loaded straight from its ``.json[.gz]`` -- the exact format ExpansionHunter
-consumes -- and applied (NO fitting, no re-training) to the 87 held-out short-read samples in
+consumes -- and applied (NO fitting, no re-training) to the 81 held-out short-read samples in
 ``SAMPLES`` that are entirely absent from the training pool (the samples that train alongside
 HG002+CHM1_CHM13 are listed in ``dataset.PROMOTED_HELDOUT_SAMPLES``), scored against their truth.
 This is the realistic "train on some samples, apply to new samples" test. A single optimized-streaming source per sample (the same
@@ -40,27 +40,27 @@ GCS_ROOT = "gs://str-truth-set-v2/tool_results"
 VARIANT = "EHv5-bw2-optimized"
 CATALOG = "combined_catalog_43_samples_1.6M_loci"
 
-# The 87 held-out short-read samples (absent from the training pool): the 138 1kGP samples with a
-# DipCall high-confidence BED, a truth-genotypes TSV and a Broad short-read CRAM, minus the 43 of
+# The 81 held-out short-read samples (absent from the training pool): the 138 1kGP samples with a
+# DipCall high-confidence BED, a truth-genotypes TSV and a Broad short-read CRAM, minus the 49 of
 # them that train alongside HG002+CHM1_CHM13 (``dataset.PROMOTED_HELDOUT_SAMPLES``; see there for how
-# the split was chosen on 2026-09-25 and updated on 2026-09-28), and minus the 8 whose DipCall truth
+# the split was chosen on 2026-09-25 and updated on 2026-09-28 and 2026-10-01), and minus the 8 whose DipCall truth
 # lost almost all of chrX/chrY (listed in str-truth-set-v2's
 # filter_vcfs_v2/samples_excluded_from_downstream_analyses.tsv). Includes the 30 samples held out
 # before 2026-09-25 and the ten pOk fast-path diagnosis samples. Only the 30 pre-existing samples
-# have an EHv5-bw2-optimized run under GCS_ROOT so far; the other 57 need one before
+# have an EHv5-bw2-optimized run under GCS_ROOT so far; the other 51 need one before
 # ``build_sample`` can ingest them.
 SAMPLES = [
     "HG00423", "HG00438", "HG00514", "HG00544", "HG00558", "HG00597", "HG00609", "HG00639",
-    "HG00642", "HG00673", "HG00733", "HG00735", "HG00738", "HG00741", "HG01071", "HG01081",
-    "HG01099", "HG01109", "HG01114", "HG01175", "HG01243", "HG01252", "HG01255", "HG01261",
-    "HG01358", "HG01361", "HG01496", "HG01884", "HG01891", "HG01940", "HG01943", "HG01952",
-    "HG01969", "HG01975", "HG01978", "HG01981", "HG01993", "HG02004", "HG02015", "HG02027",
-    "HG02056", "HG02074", "HG02083", "HG02132", "HG02145", "HG02148", "HG02257", "HG02258",
-    "HG02280", "HG02293", "HG02300", "HG02514", "HG02523", "HG02572", "HG02587", "HG02602",
-    "HG02630", "HG02668", "HG02698", "HG02717", "HG02723", "HG02735", "HG02738", "HG02809",
-    "HG02818", "HG02886", "HG02984", "HG03017", "HG03041", "HG03050", "HG03098", "HG03486",
-    "HG03516", "HG03540", "HG03579", "HG03654", "HG03683", "HG03704", "HG03834", "HG03942",
-    "HG04115", "HG04157", "HG04160", "HG04184", "HG04187", "HG04199", "NA19240",
+    "HG00642", "HG00673", "HG00733", "HG00735", "HG00738", "HG00741", "HG01071", "HG01099",
+    "HG01109", "HG01114", "HG01175", "HG01243", "HG01252", "HG01255", "HG01261", "HG01358",
+    "HG01361", "HG01496", "HG01884", "HG01891", "HG01940", "HG01952", "HG01969", "HG01975",
+    "HG01978", "HG01981", "HG01993", "HG02004", "HG02015", "HG02027", "HG02056", "HG02074",
+    "HG02132", "HG02145", "HG02148", "HG02257", "HG02280", "HG02293", "HG02300", "HG02514",
+    "HG02523", "HG02572", "HG02587", "HG02602", "HG02630", "HG02668", "HG02698", "HG02717",
+    "HG02723", "HG02735", "HG02738", "HG02809", "HG02818", "HG02886", "HG02984", "HG03017",
+    "HG03050", "HG03098", "HG03486", "HG03516", "HG03540", "HG03579", "HG03654", "HG03683",
+    "HG03704", "HG03834", "HG03942", "HG04157", "HG04160", "HG04184", "HG04187", "HG04199",
+    "NA19240",
 ]
 
 

@@ -27,7 +27,7 @@ echo "==== [2/3] train + export model ======================================="
 
 # Optional external validation: build the held-out per-sample parquets (heldout.SAMPLES, absent from
 # training) so the report's held-out HPRC section is populated. Off by default (a ~7-8 GB download
-# for the original 30 samples, roughly 3x that for all 87). Enable with RUN_HELDOUT_SAMPLES=1. Once
+# for the original 30 samples, roughly 3x that for all 81). Enable with RUN_HELDOUT_SAMPLES=1. Once
 # the parquets exist, report.py regenerates the held-out eval/stacked artifacts from them by default
 # (no extra gen_datasets.py step) -- pass --skip-heldout-samples to opt out.
 if [ "${RUN_HELDOUT_SAMPLES:-0}" = "1" ]; then

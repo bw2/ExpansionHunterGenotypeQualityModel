@@ -33,7 +33,7 @@ either fast-path-called OR fallback (never both), and ``quick`` / ``full`` are s
 cross-coverage repeats of a locus are held out together by the chromosome-clean CV.
 
 The committed model is real-data-only: the four COMBOS below (HG002 10x/20x/31x + CHM1_CHM13 46x)
-plus the 44 samples in PROMOTED_HELDOUT_SAMPLES (48 training sources), which ``main()`` symlinks into
+plus the 50 samples in PROMOTED_HELDOUT_SAMPLES (54 training sources), which ``main()`` symlinks into
 the same subdir so ``assemble_branch``'s glob picks them up. No simulated rows. Determinism: no
 randomness anywhere in the ingestion path.
 Coding rules: no type hints, Google docstrings, ``print()``, ``gcloud`` (macOS).
@@ -95,14 +95,15 @@ COMBOS = [
 # and ``main()`` symlinks them into the training subdir rather than re-downloading. Disjoint from
 # ``heldout.SAMPLES`` so they are not double-counted in the external validation set.
 #
-# Panel as of 2026-09-25: 44 samples, so the pool is 48 sources with the 4 COMBOS. Drawn from the 138
+# Panel as of 2026-10-01: 50 samples, so the pool is 54 sources with the 4 COMBOS. Drawn from the 138
 # 1kGP samples that have a DipCall high-confidence BED, a truth-genotypes TSV and a Broad short-read
 # CRAM (plus NA12878, whose short reads live under tool_results instead of the 1kGP CRAM list):
 #   - the first 13 are the original promotion (2026-07), one per population of the 43-sample HPRC
 #     panel: NA12878 (CEU), HG03492 (PJL), HG00621 (CHS), HG02080 (KHV), HG01106 (PUR),
 #     HG01258 (CLM), HG01928 (PEL), HG02055 (ACB), HG02622 (GWD), HG03453 (MSL), HG03125 (ESN),
 #     NA18906 (YRI), NA20129 (ASW);
-#   - the next 31 were added deterministically for diversity: repeatedly take the 1kGP population
+#   - the next 37 were added deterministically for diversity (31 on 2026-09-25, then 6 more on
+#     2026-10-01 by extending the same pick sequence, which left the first 31 unchanged): repeatedly take the 1kGP population
 #     with the fewest training samples (ties: the larger candidate pool, then name), within it the
 #     sex with fewer training samples (HG002 counted as male), and within that the sample with the
 #     most autosomal high-confidence bases (assembly-derived sex, chrY >= 500 kb = male). Excluded
@@ -115,11 +116,11 @@ COMBOS = [
 #     HGSVC2 males whose DipCall truth lost almost all of chrX/chrY because their h1/h2 assemblies
 #     are not split into X- and Y-carrying haplotypes (7 of them are among the 138: HG00512, HG01505,
 #     HG02011, HG02492, HG03065, HG03371, HG03732, NA19650). Result: 15 populations are represented
-#     (1 to 4 samples each; IBS, ITU and MXL had only excluded samples), 23 female / 22 male
+#     (1 to 5 samples each; IBS, ITU and MXL had only excluded samples), 25 female / 26 male
 #     including HG002.
-# The 31 additions have no EHv5-bw2-optimized run under GCS_ROOT yet: each needs
-# ``<sample>/illumina/EHv5-bw2-optimized/<cov>_coverage/json/`` before ``heldout.build_sample`` can
-# ingest it.
+# The 37 additions have no EHv5-bw2-optimized run under GCS_ROOT yet: each needs
+# ``<sample>/illumina/EHv5-bw2-optimized/<cov>_coverage/combined_catalog_43_samples_1.6M_loci/json/``
+# (``heldout._catalog_base``) before ``heldout.build_sample`` can ingest it.
 PROMOTED_HELDOUT_SAMPLES = (
     "NA12878", "HG03492", "HG00621", "HG02080", "HG01106", "HG01258", "HG01928",
     "HG02055", "HG02622", "HG03453", "HG03125", "NA18906", "NA20129",
@@ -127,7 +128,8 @@ PROMOTED_HELDOUT_SAMPLES = (
     "HG01433", "HG02273", "HG01192", "HG02451", "HG03688", "NA19983", "NA12329",
     "HG02965", "HG02647", "HG02129", "HG03239", "HG03816", "HG00658", "HG01346",
     "HG01934", "HG01074", "HG01960", "HG04204", "HG02841", "HG02071", "HG03669",
-    "HG03831", "HG00706", "HG01150",
+    "HG03831", "HG00706", "HG01150", "HG01943", "HG01081", "HG02258", "HG04115",
+    "HG03041", "HG02083",
 )
 
 VALID_CHROMS = set(str(i) for i in range(1, 23)) | {"X", "Y"}

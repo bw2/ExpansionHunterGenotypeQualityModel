@@ -78,14 +78,14 @@ emits it (the accuracy-by-size report's truth join needs two rows per locus) but
 isotonic calibration. Without that filter ~15.8% of training rows were duplicate feature vectors
 joined to a *different* truth allele than their twin.
 
-**HG002** (10× / 20× / 31×) + **CHM1_CHM13** (46×), illumina WGS, plus 44 single-coverage 1kGP/HPRC
-samples (`dataset.PROMOTED_HELDOUT_SAMPLES`; 48 training sources in all) chosen for ancestry/sex
+**HG002** (10× / 20× / 31×) + **CHM1_CHM13** (46×), illumina WGS, plus 50 single-coverage 1kGP/HPRC
+samples (`dataset.PROMOTED_HELDOUT_SAMPLES`; 54 training sources in all) chosen for ancestry/sex
 diversity at large allele sizes: 15 of the 18 populations among the 138 samples that have both
-a DipCall-based truth set and a Broad short-read CRAM are represented, 23 female / 22 male. Eight of
+a DipCall-based truth set and a Broad short-read CRAM are represented, 25 female / 26 male (counting HG002). Eight of
 the 138 are excluded from both training and held-out because their DipCall truth lost almost all of
 chrX/chrY (HGSVC2 males listed in str-truth-set-v2's
 `filter_vcfs_v2/samples_excluded_from_downstream_analyses.tsv`); the 3 missing populations (IBS, ITU,
-MXL) had only excluded samples. The remaining 87 of the 138 are the held-out panel
+MXL) had only excluded samples. The remaining 81 of the 138 are the held-out panel
 (`heldout.SAMPLES`); the comment above
 `PROMOTED_HELDOUT_SAMPLES` records the selection rule. The model uses **no locus-id feature** — the realistic "train on some samples,
 apply to new samples" setting. It *does* use the per-locus `coverage` EH reports
@@ -134,21 +134,21 @@ before generating JSONs meant for training, or the stamp will name the wrong com
 | `dataset.py` | GCS download + parquet assembly |
 | `model.py` | the two heads + JSON serialization + round-trip verification + vectorized JSON inference |
 | `metrics.py` | held-out accuracy / direction / gated-MAE metrics |
-| `report.py` | 5-fold CV + HTML report (MAE chart, feature importance, ablation, optional 87-sample held-out section) |
-| `heldout.py` | external validation: apply the exported `.json.gz` to the 87 held-out samples |
+| `report.py` | 5-fold CV + HTML report (MAE chart, feature importance, ablation, optional 81-sample held-out section) |
+| `heldout.py` | external validation: apply the exported `.json.gz` to the 81 held-out samples |
 | `*_tests.py` | unit tests (`python3 -m unittest discover -p "*_tests.py"`) |
 | `original/` | the prior multi-module implementation, kept for reference |
 
 ## External validation (optional)
 
 `heldout.py` loads the exported model from its `.json.gz` (the exact format ExpansionHunter
-consumes) and **applies it unchanged — no re-fitting** — to the 87 held-out short-read samples absent
+consumes) and **applies it unchanged — no re-fitting** — to the 81 held-out short-read samples absent
 from the training pool (see Training data above), scoring against their truth. `heldout.py` itself writes a standalone
 `report/heldout.json` benchmark dump; the report's held-out HPRC section is fed by the
 `report/eval_heldout_hprc.json` / `report/stacked_heldout_hprc.json` artifacts, which `report.py`
 **regenerates by default** from the locally-built held-out parquets (via `gen_datasets.generate`, no
 download) — pass `--skip-heldout-samples` to opt out. Building those parquets (a ~7-8 GB download for
-the original 30 samples; roughly 3x that for all 87) is off by default; enable it with
+the original 30 samples; roughly 3x that for all 81) is off by default; enable it with
 `RUN_HELDOUT_SAMPLES=1 ./train_model.sh`, which builds them before the report step so the render picks
 them up.
 
