@@ -153,6 +153,39 @@ def _corrected_category(raw_call, corrected_call, gated, ref, true_round, drr_tr
     return classify(np.round(eff - true_round), eff, drr_truth, np.round(eff - ref), is_ref, is_hom_ref)
 
 
+def _share_predictions_within_locus(df, scoreable, called, lcf, pok, non_spanning):
+    """Copies each scored allele's prediction onto the duplicate genotype copy of the same call.
+
+    ExpansionHunter makes ONE prediction for a homozygous call, but this report keeps both genotype
+    copies (its truth join pairs them with the short and long truth alleles). Only the copy carrying
+    its own quality metrics is scored above; this hands the other copy that same prediction, so both
+    are categorized under the one correction the deployed binary would actually apply.
+
+    Rows are matched within a ``(locus_id, eh)`` group, which is exactly the set of genotype copies of
+    one homozygous call. A parquet predating ``has_own_quality_metrics`` has every row marked
+    scoreable, so nothing is shared and the behaviour is unchanged.
+
+    Returns:
+        The updated ``(lcf, pok, non_spanning)`` arrays.
+    """
+    unscored = called & ~scoreable & np.isnan(pok)
+    if not unscored.any() or "locus_id" not in df.columns:
+        return lcf, pok, non_spanning
+    key = pd.MultiIndex.from_arrays([df["locus_id"].to_numpy(),
+                                     pd.to_numeric(df["eh"], errors="coerce").to_numpy()])
+    scored = ~np.isnan(pok)
+    source = pd.DataFrame({"lcf": lcf[scored], "pok": pok[scored],
+                           "non_spanning": non_spanning[scored]}, index=key[scored])
+    source = source[~source.index.duplicated(keep="first")]
+    filled = source.reindex(key[unscored])
+    have = filled["pok"].notna().to_numpy()
+    target = np.where(unscored)[0][have]
+    lcf[target] = filled["lcf"].to_numpy()[have]
+    pok[target] = filled["pok"].to_numpy()[have]
+    non_spanning[target] = filled["non_spanning"].to_numpy()[have].astype(bool)
+    return lcf, pok, non_spanning
+
+
 def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     """Categorizes the alleles of a per-allele parquet (raw + each LCF-correction variant).
 
@@ -196,12 +229,30 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
 
     lcf = np.full(len(df), np.nan)
     pok = np.full(len(df), np.nan)
-    mj = M.load(model_path)["genotyping_regimes"]
-    comp = {r: (M.compile_genotyping_regime(mj[r]), features.GENOTYPING_REGIME_BRANCH[r])
+    model = M.load(model_path)
+    # Each regime's matrix is built from the MODEL's own declared feature list: the compiled trees
+    # index it positionally, so that list in that order is the only correct matrix for this model
+    # (and an older model stays applicable rather than being refused). See model.feature_names_of.
+    declared = M.feature_names_of(model, model_path)
+    mj = model["genotyping_regimes"]
+    comp = {r: (M.compile_genotyping_regime(mj[r]),
+                features.GENOTYPING_REGIME_BRANCH[r],
+                declared[features.GENOTYPING_REGIME_BRANCH[r]])
             for r in features.GENOTYPING_REGIMES}
     # Only called alleles (finite eh) can be LCF-corrected; no-call rows keep lcf/pok NaN so they drop
     # out of the corrected panels (see docstring). Cap the called-allele apply for speed.
-    sel = np.where(np.isfinite(eh))[0]
+    #
+    # ExpansionHunter emits one AlleleQualityMetrics entry -- and therefore ONE prediction -- per
+    # allele it scores, and only one for a homozygous call. eh_json still emits both genotype copies
+    # (this report's truth join needs them), so scoring the rank-1 copy independently would invent a
+    # prediction the deployed binary never makes: on real data the two copies of a hom call get
+    # different rounded LCF/pOk for the large majority of pairs, because allele_rank itself is a
+    # feature. Score only the rows EH scores, then give each duplicate its twin's prediction, so the
+    # corrected panels describe one correction per scored allele exactly as deployment would.
+    scoreable = (df["has_own_quality_metrics"].fillna(True).astype(bool).to_numpy()
+                 if "has_own_quality_metrics" in df.columns
+                 else np.ones(len(df), dtype=bool))
+    sel = np.where(np.isfinite(eh) & scoreable)[0]
     if corrected_cap and sel.size > corrected_cap:
         sel = np.sort(np.random.default_rng(20260616).choice(sel, corrected_cap, replace=False))
     # ANALYSIS_OK[imputation]: NaN spanning_at_called -> 0 is genotyping_regime_of's documented
@@ -209,17 +260,21 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     sub = df.iloc[sel].assign(_row=sel, _regime=features.genotyping_regime_of(
         df.iloc[sel]["genotyping_branch"].to_numpy(),
         pd.to_numeric(df.iloc[sel]["spanning_at_called"], errors="coerce").to_numpy()))
-    for r, (cg, branch) in comp.items():
+    for r, (cg, branch, names) in comp.items():
         ss = sub[sub["_regime"] == r]
         if ss.empty:
             continue
-        X, _ = features.build_matrix(ss, branch)
+        X, _ = features.build_matrix(ss, branch, names)
         rows = ss["_row"].to_numpy()
-        lcf[rows] = M.predict_lcf_json(cg, X)
-        pok[rows] = M.predict_proba_json(cg, X)[:, 0]
+        # Rounded to the 3 decimals ExpansionHunter emits, so the categories describe the deployed
+        # binary's output rather than full-precision predictions (model.round_like_emitted).
+        lcf[rows] = M.round_like_emitted(M.predict_lcf_json(cg, X))
+        pok[rows] = M.round_like_emitted(M.predict_proba_json(cg, X)[:, 0])
     non_spanning = np.zeros(len(df), dtype=bool)
     non_spanning[sub["_row"].to_numpy()] = (
         sub["_regime"].to_numpy() == features.GENOTYPING_REGIME_FULL_NONSPANNING)
+    lcf, pok, non_spanning = _share_predictions_within_locus(
+        df, scoreable, np.isfinite(eh), lcf, pok, non_spanning)
     corrected = np.round(np.where(lcf > 0, eh / np.where(lcf > 0, lcf, np.nan), eh))
     out = {"category": cat, "xbin": xbin(drr_truth), "motif": motif, "locus": locus, "purity": purity,
            "pok": pok}

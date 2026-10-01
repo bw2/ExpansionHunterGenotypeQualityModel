@@ -1,9 +1,10 @@
 """Tests for dataset.py: truth loading/joining, filtering, freshness checks, combo assembly.
 
-Network-touching helpers (``_gcs_md5``, ``_list_json_inputs``, ``_download``, ``_bw2_head_sha``) are
+Network-touching helpers (``_gcs_stat``, ``_list_json_inputs``, ``_download``, ``_bw2_head_sha``) are
 exercised by mocking ``subprocess.run`` / ``os.path`` rather than hitting GCS or git.
 """
 
+import glob
 import gzip
 import json
 import os
@@ -16,7 +17,22 @@ import numpy as np
 import pandas as pd
 
 import dataset
+import features
 import heldout
+
+
+def write_contract_parquet(path, n_rows=1):
+    """Writes a minimal parquet that satisfies the current feature contract (all columns, float64).
+
+    ``dataset._parquet_reusable`` / ``assert_parquets_up_to_date`` reject a parquet that is missing a
+    contract column or holds float32 feature columns, so a cache-hit fixture has to be contract-clean
+    or it is (correctly) treated as needing a rebuild. Shared with ``heldout_tests``.
+    """
+    stored = [c for c in features.FULL_FEATURES if c not in ("ci_asymmetry", "ci_over_eh")]
+    df = pd.DataFrame({c: np.ones(n_rows, dtype=np.float64) for c in stored})
+    df["has_own_quality_metrics"] = True  # not a feature, but part of what the extractor produces
+    df.to_parquet(path, index=False)
+    return df
 
 
 def _gz_tsv(path, rows):
@@ -164,7 +180,7 @@ class LabelAndFilterTest(unittest.TestCase):
         kept, drops = dataset.label_and_filter(df)
         self.assertEqual(drops, {"chrM_or_unknown_contig": 1, "negative_control_locus": 1,
                                  "missing_eh_or_true": 1, "nonpositive_eh_or_true": 1,
-                                 "missing_motif_size": 1})
+                                 "missing_motif_size": 1, "no_own_quality_metrics": 0})
         self.assertEqual(len(kept), 2)
         self.assertNotIn("locus_id", kept.columns)
         self.assertNotIn("is_negative_locus", kept.columns)
@@ -174,6 +190,36 @@ class LabelAndFilterTest(unittest.TestCase):
         full_row = kept[kept["genotyping_branch"] == "full"].iloc[0]
         self.assertEqual(full_row["chrom"], "2")
         self.assertEqual(full_row["genotyping_regime"], "full_nonspanning")  # spanning_at_called == 0
+
+    def _hom_pair(self, has_own):
+        """A homozygous call's two rows: identical features, different truth alleles."""
+        return pd.DataFrame([
+            {"locus_id": "1-9-10-A", "is_negative_locus": False, "eh": 20.0, "true": 18.0,
+             "motif_size": 3, "genotyping_branch": "quick", "spanning_at_called": 5,
+             "allele_rank": 0, "has_own_quality_metrics": has_own[0]},
+            {"locus_id": "1-9-10-A", "is_negative_locus": False, "eh": 20.0, "true": 25.0,
+             "motif_size": 3, "genotyping_branch": "quick", "spanning_at_called": 5,
+             "allele_rank": 1, "has_own_quality_metrics": has_own[1]},
+        ])
+
+    def test_drops_the_second_copy_of_a_homozygous_call(self):
+        # EH scores one allele for a hom call, so the rank-1 row is unreachable at inference: same
+        # features as rank 0 but joined to the LONG truth allele, i.e. a contradictory target.
+        kept, drops = dataset.label_and_filter(self._hom_pair([True, False]))
+        self.assertEqual(drops["no_own_quality_metrics"], 1)
+        self.assertEqual(list(kept["allele_rank"]), [0])
+        self.assertEqual(list(kept["true"]), [18.0])
+
+    def test_keeps_both_copies_when_each_has_its_own_metrics(self):
+        kept, _ = dataset.label_and_filter(self._hom_pair([True, True]))
+        self.assertEqual(list(kept["allele_rank"]), [0, 1])
+
+    def test_parquet_without_the_column_is_left_alone(self):
+        # A parquet predating the column must not be half-filtered; the freshness guards catch it.
+        old = self._hom_pair([True, False]).drop(columns=["has_own_quality_metrics"])
+        kept, drops = dataset.label_and_filter(old)
+        self.assertEqual(drops["no_own_quality_metrics"], 0)
+        self.assertEqual(len(kept), 2)
 
 
 class LocalMd5Test(unittest.TestCase):
@@ -188,38 +234,37 @@ class LocalMd5Test(unittest.TestCase):
             self.assertEqual(dataset._local_md5(path), expected)
 
 
-class GcsMd5Test(unittest.TestCase):
-    def test_parses_hash_line(self):
-        stdout = "gs://x/y.json.gz:\n    Creation time:  ...\n    Hash (md5):          abcd1234==\n"
-        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
-            self.assertEqual(dataset._gcs_md5("gs://x/y.json.gz"), "abcd1234==")
-
-    def test_missing_hash_line_returns_none(self):
-        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout="not found\n")):
-            self.assertIsNone(dataset._gcs_md5("gs://x/y.json.gz"))
-
-
-class GcsMtimeTest(unittest.TestCase):
-    def test_prefers_update_over_creation(self):
+class GcsStatTest(unittest.TestCase):
+    def test_parses_hash_and_prefers_update_over_creation(self):
         import email.utils
         stdout = ("gs://x/y:\n    Creation time:    Wed, 02 Jul 2026 10:00:00 GMT\n"
-                  "    Update time:      Wed, 02 Jul 2026 22:46:00 GMT\n    Hash (md5): abc==\n")
-        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
-            got = dataset._gcs_mtime("gs://x/y")
+                  "    Update time:      Wed, 02 Jul 2026 22:46:00 GMT\n"
+                  "    Hash (md5):          abcd1234==\n")
+        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout, returncode=0, stderr="")) as run:
+            md5, mtime = dataset._gcs_stat("gs://x/y")
+        self.assertEqual(md5, "abcd1234==")
         self.assertAlmostEqual(
-            got, email.utils.parsedate_to_datetime("Wed, 02 Jul 2026 22:46:00 GMT").timestamp())
+            mtime, email.utils.parsedate_to_datetime("Wed, 02 Jul 2026 22:46:00 GMT").timestamp())
+        self.assertEqual(run.call_count, 1)  # both signals from ONE stat, not two
 
     def test_falls_back_to_creation_time(self):
         import email.utils
         stdout = "gs://x/y:\n    Creation time:    Wed, 02 Jul 2026 10:00:00 GMT\n"
-        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
-            self.assertAlmostEqual(
-                dataset._gcs_mtime("gs://x/y"),
-                email.utils.parsedate_to_datetime("Wed, 02 Jul 2026 10:00:00 GMT").timestamp())
+        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout, returncode=0, stderr="")):
+            _, mtime = dataset._gcs_stat("gs://x/y")
+        self.assertAlmostEqual(
+            mtime, email.utils.parsedate_to_datetime("Wed, 02 Jul 2026 10:00:00 GMT").timestamp())
 
-    def test_no_time_line_returns_none(self):
-        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout="nope\n")):
-            self.assertIsNone(dataset._gcs_mtime("gs://x/y"))
+    def test_failed_stat_returns_none_and_warns(self):
+        # (None, None) reads as "unchanged" downstream, which is the right default (an unreachable
+        # bucket must not delete local data) but silent -- so the failure has to be announced.
+        failed = SimpleNamespace(stdout="", returncode=1, stderr="AccessDeniedException: 403\n")
+        with mock.patch.object(dataset.subprocess, "run", return_value=failed):
+            self.assertEqual(dataset._gcs_stat("gs://x/y"), (None, None))
+
+    def test_missing_lines_return_none(self):
+        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout="nope\n", returncode=0, stderr="")):
+            self.assertEqual(dataset._gcs_stat("gs://x/y"), (None, None))
 
 
 class Bw2HeadShaTest(unittest.TestCase):
@@ -267,12 +312,12 @@ class ListJsonInputsTest(unittest.TestCase):
     def test_prefers_combined_over_shards(self):
         stdout = ("gs://x/json/a.shard000_of_002.json.gz gs://x/json/a.shard001_of_002.json.gz "
                   "gs://x/json/a.json.gz")
-        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
+        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout, returncode=0, stderr="")):
             self.assertEqual(dataset._list_json_inputs("S", "V", "10x"), ["gs://x/json/a.json.gz"])
 
     def test_falls_back_to_shards(self):
         stdout = "gs://x/json/a.shard000_of_002.json.gz gs://x/json/a.shard001_of_002.json.gz"
-        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
+        with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout, returncode=0, stderr="")):
             self.assertEqual(dataset._list_json_inputs("S", "V", "10x"),
                              ["gs://x/json/a.shard000_of_002.json.gz", "gs://x/json/a.shard001_of_002.json.gz"])
 
@@ -302,33 +347,30 @@ class CheckFreshnessTest(unittest.TestCase):
         self.lm = os.path.getmtime(self.local)
 
     def test_no_local_file_skips_entirely(self):
-        with mock.patch.object(dataset, "_gcs_md5", side_effect=AssertionError("should not be called")):
+        with mock.patch.object(dataset, "_gcs_stat", side_effect=AssertionError("should not be called")):
             n = dataset._check_freshness("d", [("json shard", "gs://r", "/nonexistent/path")])
         self.assertEqual(n, 0)
 
     def test_up_to_date_is_a_no_op(self):
         # md5 matches AND the bucket is not newer than the local file -> keep it, nothing removed.
-        with mock.patch.object(dataset, "_gcs_md5", return_value="samehash"), \
+        with mock.patch.object(dataset, "_gcs_stat", return_value=("samehash", self.lm - 100)), \
              mock.patch.object(dataset, "_local_md5", return_value="samehash"), \
-             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm - 100), \
              mock.patch.object(dataset, "_bw2_head_sha", return_value=None):
             n = dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
         self.assertEqual(n, 0)
         self.assertTrue(os.path.exists(self.local))
 
     def test_md5_mismatch_deletes_for_redownload(self):
-        with mock.patch.object(dataset, "_gcs_md5", return_value="new"), \
+        with mock.patch.object(dataset, "_gcs_stat", return_value=("new", self.lm - 100)), \
              mock.patch.object(dataset, "_local_md5", return_value="old"), \
-             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm - 100), \
              mock.patch.object(dataset, "_bw2_head_sha", return_value=None):
             n = dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
         self.assertEqual(n, 1)
         self.assertFalse(os.path.exists(self.local))  # deleted so _download re-fetches
 
     def test_bucket_newer_mtime_deletes_for_redownload(self):
-        with mock.patch.object(dataset, "_gcs_md5", return_value="samehash"), \
+        with mock.patch.object(dataset, "_gcs_stat", return_value=("samehash", self.lm + 100)), \
              mock.patch.object(dataset, "_local_md5", return_value="samehash"), \
-             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm + 100), \
              mock.patch.object(dataset, "_bw2_head_sha", return_value=None):
             n = dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
         self.assertEqual(n, 1)
@@ -336,18 +378,16 @@ class CheckFreshnessTest(unittest.TestCase):
 
     def test_eh_build_staleness_refuses_for_kept_json(self):
         # up-to-date content but produced by an older EH build -> hard refusal (can't fix by redownload).
-        with mock.patch.object(dataset, "_gcs_md5", return_value="samehash"), \
+        with mock.patch.object(dataset, "_gcs_stat", return_value=("samehash", self.lm - 100)), \
              mock.patch.object(dataset, "_local_md5", return_value="samehash"), \
-             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm - 100), \
              mock.patch.object(dataset, "_json_eh_version", return_value="old_sha"), \
              mock.patch.object(dataset, "_bw2_head_sha", return_value="new_sha"):
             with self.assertRaises(SystemExit):
                 dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
 
     def test_eh_build_staleness_ignored_for_non_json_labels(self):
-        with mock.patch.object(dataset, "_gcs_md5", return_value="samehash"), \
+        with mock.patch.object(dataset, "_gcs_stat", return_value=("samehash", self.lm - 100)), \
              mock.patch.object(dataset, "_local_md5", return_value="samehash"), \
-             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm - 100), \
              mock.patch.object(dataset, "_json_eh_version", return_value="old_sha"), \
              mock.patch.object(dataset, "_bw2_head_sha", return_value="new_sha"):
             n = dataset._check_freshness("d", [("truth-genotypes TSV", "gs://r", self.local)])
@@ -356,9 +396,8 @@ class CheckFreshnessTest(unittest.TestCase):
     def test_cache_stale_json_is_redownloaded_without_build_refusal(self):
         # A json that is BOTH bucket-newer AND from an older build is re-downloaded (not refused): the
         # fresh copy replaces it, so its stale build sha is not judged here.
-        with mock.patch.object(dataset, "_gcs_md5", return_value="samehash"), \
+        with mock.patch.object(dataset, "_gcs_stat", return_value=("samehash", self.lm + 100)), \
              mock.patch.object(dataset, "_local_md5", return_value="samehash"), \
-             mock.patch.object(dataset, "_gcs_mtime", return_value=self.lm + 100), \
              mock.patch.object(dataset, "_json_eh_version", return_value="old_sha"), \
              mock.patch.object(dataset, "_bw2_head_sha", return_value="new_sha"):
             n = dataset._check_freshness("d", [("json shard", "gs://r", self.local)])
@@ -380,7 +419,7 @@ class BuildComboTest(unittest.TestCase):
             tsv_local = os.path.join(gt_dir, "HG002.tandem_repeat_genotypes.tsv.gz")
             open(json_local, "w").close()
             open(tsv_local, "w").close()
-            pd.DataFrame({"eh": [1.0, 2.0, 3.0]}).to_parquet(out_path)
+            write_contract_parquet(out_path, n_rows=3)
             newer = max(os.path.getmtime(json_local), os.path.getmtime(tsv_local)) + 100
             os.utime(out_path, (newer, newer))
             with mock.patch.object(dataset, "_list_json_inputs", return_value=["gs://x/a.json.gz"]), \
@@ -406,6 +445,7 @@ class BuildComboTest(unittest.TestCase):
                  mock.patch.object(dataset, "_download",
                                    side_effect=lambda remote, dest: [os.path.join(dest, os.path.basename(p))
                                                                      for p in remote]), \
+                 mock.patch.object(dataset, "assert_eh_build_matches"), \
                  mock.patch.object(dataset.eh_json, "extract_rows", return_value=fake_rows), \
                  mock.patch.object(dataset, "_load_truth_from_genotypes_tsv", return_value=fake_tsv_df):
                 n = dataset.build_combo("V", "sub", "HG002", "10x", d, force=True)
@@ -413,7 +453,9 @@ class BuildComboTest(unittest.TestCase):
             out_path = os.path.join(d, "sub", "HG002_10x.parquet")
             merged = pd.read_parquet(out_path)
             self.assertNotIn("sample_id", merged.columns)
-            self.assertEqual(merged["true"].dtype, np.float32)
+            # Float columns stay float64: the C++ scorer feeds the model full doubles, so the
+            # training data must not be quantized (see features.build_matrix).
+            self.assertEqual(merged["true"].dtype, np.float64)
             row = merged[(merged["locus_id"] == "1-1-2-A") & (merged["allele_rank"] == 1)].iloc[0]
             self.assertEqual(row["true"], 21.0)
 
@@ -423,13 +465,21 @@ class AssembleBranchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src_dir = os.path.join(d, "src")
             os.makedirs(src_dir)
+            # Every feature column must be present -- assemble_branch refuses parts that predate
+            # the current contract (they would concat to all-NaN for the missing feature).
+            base = {c: 1.0 for c in features.FULL_FEATURES
+                    if c not in ("ci_asymmetry", "ci_over_eh")}
+            base["has_own_quality_metrics"] = True  # part of the contract, though not a feature
             pd.DataFrame([
-                {"locus_id": "1-1-2-A", "is_negative_locus": False, "eh": 10.0, "true": 10.0,
-                 "motif_size": 3, "genotyping_branch": "quick", "spanning_at_called": 5},
-                {"locus_id": "1-3-4-A", "is_negative_locus": False, "eh": np.nan, "true": 10.0,
-                 "motif_size": 3, "genotyping_branch": "quick", "spanning_at_called": 5},
-                {"locus_id": "2-1-2-A", "is_negative_locus": False, "eh": 14.0, "true": 10.0,
-                 "motif_size": 3, "genotyping_branch": "full", "spanning_at_called": 0},
+                dict(base, **{"locus_id": "1-1-2-A", "is_negative_locus": False, "eh": 10.0,
+                              "true": 10.0, "motif_size": 3, "genotyping_branch": "quick",
+                              "spanning_at_called": 5}),
+                dict(base, **{"locus_id": "1-3-4-A", "is_negative_locus": False, "eh": np.nan,
+                              "true": 10.0, "motif_size": 3, "genotyping_branch": "quick",
+                              "spanning_at_called": 5}),
+                dict(base, **{"locus_id": "2-1-2-A", "is_negative_locus": False, "eh": 14.0,
+                              "true": 10.0, "motif_size": 3, "genotyping_branch": "full",
+                              "spanning_at_called": 0}),
             ]).to_parquet(os.path.join(src_dir, "combo1.parquet"))
 
             dataset.assemble_branch(d, "quick", "src")
@@ -484,7 +534,7 @@ class AssertParquetsUpToDateTest(unittest.TestCase):
 
     def _write_parquets(self, d):
         for b in ("quick", "full"):
-            open(os.path.join(d, "parquet", "%s.parquet" % b), "w").close()
+            write_contract_parquet(os.path.join(d, "parquet", "%s.parquet" % b))
 
     def test_missing_parquet_exits(self):
         with tempfile.TemporaryDirectory() as d, \
@@ -512,6 +562,124 @@ class AssertParquetsUpToDateTest(unittest.TestCase):
             for b in ("quick", "full"):
                 os.utime(os.path.join(d, "parquet", "%s.parquet" % b), (newer, newer))
             dataset.assert_parquets_up_to_date(d)  # must not raise
+
+    def test_off_contract_parquet_exits_even_when_mtimes_are_fine(self):
+        # float32 feature columns and a missing feature column both leave every upstream mtime
+        # untouched, so only the contract check can catch them.
+        for damage in ("float32", "missing_column"):
+            with tempfile.TemporaryDirectory() as d, \
+                 mock.patch.object(dataset, "PROMOTED_HELDOUT_SAMPLES", ()):
+                json_p, tsv_p = self._setup(d)
+                for b in ("quick", "full"):
+                    path = os.path.join(d, "parquet", "%s.parquet" % b)
+                    df = write_contract_parquet(path)
+                    if damage == "float32":
+                        df["coverage"] = df["coverage"].astype(np.float32)
+                    else:
+                        df = df.drop(columns=["coverage"])
+                    df.to_parquet(path, index=False)
+                newer = max(os.path.getmtime(json_p), os.path.getmtime(tsv_p)) + 100
+                for b in ("quick", "full"):
+                    os.utime(os.path.join(d, "parquet", "%s.parquet" % b), (newer, newer))
+                with self.assertRaises(SystemExit, msg=damage):
+                    dataset.assert_parquets_up_to_date(d)
+
+
+class DePromotedSymlinkCleanupTest(unittest.TestCase):
+    """De-promoting a sample must remove its training-pool symlink, or it leaks: assemble_branch
+    globs *.parquet for training while the sample is back in heldout.SAMPLES for evaluation.
+
+    Named apart from ``LinkPromotedHeldoutSamplesTest`` above -- reusing that name rebound it and
+    silently dropped that class's test from the suite.
+    """
+
+    def _setup(self, d):
+        src_dir = os.path.join(d, "src")
+        subdir = os.path.join(d, "data", dataset.SOURCE_SUBDIR)
+        os.makedirs(src_dir)
+        os.makedirs(subdir)
+        for sample in ("KEPT", "DROPPED"):
+            src = os.path.join(src_dir, "%s.parquet" % sample)
+            open(src, "w").close()
+            os.symlink(src, os.path.join(subdir, "%s.parquet" % sample))
+        open(os.path.join(subdir, "HG002_31x.parquet"), "w").close()  # a real combo parquet
+        return subdir, src_dir
+
+    def test_symlink_for_a_de_promoted_sample_is_removed(self):
+        with tempfile.TemporaryDirectory() as d:
+            subdir, src_dir = self._setup(d)
+            import heldout as heldout_module
+            with mock.patch.object(dataset, "PROMOTED_HELDOUT_SAMPLES", ("KEPT",)), \
+                 mock.patch.object(heldout_module, "build_sample",
+                                   side_effect=lambda s, dd, force: os.path.join(src_dir, "%s.parquet" % s)):
+                dataset._link_promoted_heldout_samples(os.path.join(d, "data"), force=False)
+            remaining = sorted(os.path.basename(p) for p in glob.glob(os.path.join(subdir, "*.parquet")))
+            self.assertEqual(remaining, ["HG002_31x.parquet", "KEPT.parquet"])
+
+    def test_real_combo_parquets_are_never_removed(self):
+        # Only symlinks are pruned -- a real per-combo parquet is expensive to rebuild.
+        with tempfile.TemporaryDirectory() as d:
+            subdir, src_dir = self._setup(d)
+            import heldout as heldout_module
+            with mock.patch.object(dataset, "PROMOTED_HELDOUT_SAMPLES", ()), \
+                 mock.patch.object(heldout_module, "build_sample",
+                                   side_effect=AssertionError("nothing to build")):
+                dataset._link_promoted_heldout_samples(os.path.join(d, "data"), force=False)
+            remaining = sorted(os.path.basename(p) for p in glob.glob(os.path.join(subdir, "*.parquet")))
+            self.assertEqual(remaining, ["HG002_31x.parquet"])
+
+
+class AssertEhBuildMatchesTest(unittest.TestCase):
+    def _json(self, path, version):
+        with gzip.open(path, "wt") as f:
+            json.dump({"RunInfo": {"Version": version}}, f)
+        return path
+
+    def test_mismatched_build_sha_exits(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="7ee80de"):
+            p = self._json(os.path.join(d, "a.json.gz"), "3789ba4")
+            with self.assertRaises(SystemExit):
+                dataset.assert_eh_build_matches("combo", [("json shard 0", p)])
+
+    def test_matching_build_sha_passes(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="7ee80de"):
+            p = self._json(os.path.join(d, "a.json.gz"), "7ee80de")
+            dataset.assert_eh_build_matches("combo", [("json shard 0", p)])  # must not raise
+
+    def test_no_local_checkout_skips_the_check(self):
+        # Without the checkout there is no HEAD to compare against, so the JSON is never even opened.
+        with mock.patch.object(dataset, "_bw2_head_sha", return_value=None):
+            dataset.assert_eh_build_matches("combo", [("json shard 0", "/nonexistent.json.gz")])
+
+
+class AssertPartsShareFeatureContractTest(unittest.TestCase):
+    def _write(self, path, columns):
+        df = pd.DataFrame({c: np.ones(1, dtype=np.float64) for c in columns})
+        df["has_own_quality_metrics"] = True   # part of the contract, though not a feature
+        df.to_parquet(path, index=False)
+
+    def test_accepts_parts_carrying_the_full_contract(self):
+        cols = [c for c in features.FULL_FEATURES if c not in ("ci_asymmetry", "ci_over_eh")]
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.parquet")
+            self._write(p, cols)
+            dataset._assert_parts_share_feature_contract([p])  # no raise
+
+    def test_rejects_a_part_missing_a_new_feature_column(self):
+        cols = [c for c in features.FULL_FEATURES
+                if c not in ("ci_asymmetry", "ci_over_eh", "coverage")]
+        with tempfile.TemporaryDirectory() as d:
+            good = os.path.join(d, "new.parquet")
+            stale = os.path.join(d, "old.parquet")
+            self._write(good, cols + ["coverage"])
+            self._write(stale, cols)
+            with self.assertRaises(RuntimeError) as ctx:
+                dataset._assert_parts_share_feature_contract([good, stale])
+            self.assertIn("old.parquet", str(ctx.exception))
+            self.assertIn("coverage", str(ctx.exception))
+            self.assertNotIn("new.parquet", str(ctx.exception))
 
 
 if __name__ == "__main__":

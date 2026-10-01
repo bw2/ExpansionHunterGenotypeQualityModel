@@ -10,6 +10,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
+import features
 import model as M
 
 
@@ -63,6 +64,38 @@ class RoundTripTest(unittest.TestCase):
                                    M.predict_lcf(qreg, self.Xca), atol=1e-9)
         np.testing.assert_allclose(M.predict_proba_json(comp, self.Xca),
                                    M.predict_proba(dmodel, self.Xca), atol=1e-9)
+
+
+class FeatureNamesOfTest(unittest.TestCase):
+    """The compiled trees index features by POSITION, so every applier builds its matrix from the
+    model's OWN declared list -- including a model exported under an older contract."""
+
+    def _model(self, quick=None, full=None):
+        return {"feature_names": {
+            "quick": features.QUICK_FEATURES if quick is None else quick,
+            "full": features.FULL_FEATURES if full is None else full}}
+
+    def test_returns_the_declared_lists_verbatim(self):
+        self.assertEqual(M.feature_names_of(self._model(), "m.json.gz"),
+                         {"quick": features.QUICK_FEATURES, "full": features.FULL_FEATURES})
+
+    def test_an_older_contract_is_returned_as_declared_not_rejected(self):
+        # Applying a previously deployed model (compare_models) depends on this: its list is shorter
+        # than today's, and its trees index THAT list, so it must come back unchanged.
+        older = [c for c in features.QUICK_FEATURES if c != "n_alleles"]
+        self.assertEqual(M.feature_names_of(self._model(quick=older), "old.json.gz")["quick"], older)
+
+    def test_order_is_preserved(self):
+        reordered = list(features.FULL_FEATURES)
+        reordered[0], reordered[1] = reordered[1], reordered[0]
+        self.assertEqual(M.feature_names_of(self._model(full=reordered), "m.json.gz")["full"],
+                         reordered)
+
+    def test_model_without_feature_names_is_rejected(self):
+        # Nothing can be built safely: the positional tree indices have no list to resolve against.
+        with self.assertRaises(SystemExit) as ctx:
+            M.feature_names_of({}, "m.json.gz")
+        self.assertIn("m.json.gz", str(ctx.exception))
 
 
 if __name__ == "__main__":

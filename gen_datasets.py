@@ -24,10 +24,8 @@ import json
 import os
 
 import numpy as np
-import pyarrow.parquet as pq
 
 import accuracy_by_size as A
-import features
 import heldout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +50,7 @@ def _heldout_parquets():
 
 # key -> {label, coverage_label, list of per-allele parquets, optional no_call_note}.
 def datasets():
+    heldout_parquets = _heldout_parquets()
     return {
         "hg002_genome": {
             "label": "HG002 genome (31x)", "coverage_label": "31x Illumina Genome data",
@@ -63,10 +62,12 @@ def datasets():
         #     "label": "HG002 exome (3x)", "coverage_label": "3x Illumina exome data",
         #     "no_call_note": " (No-Call alleles not shown)",
         #     "parquets": [os.path.join(HERE, "data_eval_misc/HG002_exome_3x.parquet")]},
+        # Labels count the parquets actually on disk, not heldout.SAMPLES: a partially-built panel
+        # would otherwise produce artifacts captioned with the full cohort size.
         "heldout_hprc": {
-            "label": "%d held-out HPRC samples" % len(heldout.SAMPLES),
-            "coverage_label": "%d held-out HPRC samples (short-read WGS)" % len(heldout.SAMPLES),
-            "parquets": _heldout_parquets()},
+            "label": "%d held-out HPRC samples" % len(heldout_parquets),
+            "coverage_label": "%d held-out HPRC samples (short-read WGS)" % len(heldout_parquets),
+            "parquets": heldout_parquets},
     }
 
 
@@ -135,25 +136,6 @@ def gen_stacked(spec, model_path, out_json, corrected_cap):
     print("wrote %s" % out_json, flush=True)
 
 
-def _check_feature_columns(parquets):
-    """Raises a clear error if a parquet predates the current model feature contract.
-
-    Catches a cached external-validation parquet built before a ``features.py`` feature-list
-    change (e.g. it lacks a newly added column) with an actionable message, instead of the
-    unrelated-looking ``AssertionError`` that ``features.build_matrix`` would raise deep inside
-    ``heldout.run_eval``.
-    """
-    required = set(features.FULL_FEATURES) - {"ci_asymmetry", "ci_over_eh"}  # engineered by add_engineered
-    for p in parquets:
-        missing = required - set(pq.ParquetFile(p).schema.names)
-        if missing:
-            raise RuntimeError(
-                "%s is missing feature column(s) %s -- it was built with an older feature "
-                "contract. Rebuild it (re-run its download/extract step, e.g. "
-                "heldout.build_sample(..., force=True) for a held-out-43 sample) before "
-                "re-running gen_datasets.py." % (p, sorted(missing)))
-
-
 def generate(dataset_key, model_path, out_dir, eval_cap=EVAL_CAP_DEFAULT,
              corrected_cap=CORRECTED_CAP_DEFAULT, skip_eval=False):
     """Writes one dataset's eval + stacked artifacts into ``out_dir`` (no download; no fitting).
@@ -164,11 +146,20 @@ def generate(dataset_key, model_path, out_dir, eval_cap=EVAL_CAP_DEFAULT,
     this module's CLI and report.py's default held-out regeneration.
     """
     spec = datasets()[dataset_key]
-    parquets = spec["parquets"]
+    # Configured paths are not necessarily present: hg002_genome names one path unconditionally, so
+    # without this filter an unbuilt dataset raised FileNotFoundError instead of the documented no-op.
+    parquets = [p for p in spec["parquets"] if os.path.exists(p)]
+    missing = [p for p in spec["parquets"] if p not in parquets]
+    if missing:
+        print("  %d configured parquet(s) not built locally, skipping them: %s"
+              % (len(missing), ", ".join(os.path.basename(p) for p in missing)), flush=True)
     print("==== dataset %s: %d parquet(s) ====" % (dataset_key, len(parquets)), flush=True)
     if not parquets:
         return 0
-    _check_feature_columns(parquets)
+    spec = dict(spec, parquets=parquets)
+    # run_eval checks this too, but --skip-eval bypasses run_eval entirely, so the stacked-accuracy
+    # pass below would otherwise read a stale parquet unguarded.
+    heldout.assert_parquets_carry_contract(parquets)
     if not skip_eval:
         heldout.run_eval(parquets, model_path,
                          os.path.join(out_dir, "eval_%s.json" % dataset_key), eval_cap)

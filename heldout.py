@@ -1,11 +1,10 @@
-"""Cross-population held-out benchmark: apply the EXPORTED model to the remaining 30 HPRC samples.
+"""Cross-population held-out benchmark: apply the EXPORTED model to the 87 held-out samples.
 
 The deployed model is loaded straight from its ``.json[.gz]`` -- the exact format ExpansionHunter
-consumes -- and applied (NO fitting, no re-training) to the remaining 30 HPRC short-read samples (of
-the original 43-sample panel) that are entirely absent from the HG002+CHM training pool -- the other
-13 were promoted into training, see ``dataset.PROMOTED_HELDOUT_SAMPLES`` -- scored against their
-truth. This is the realistic "train on
-some samples, apply to new samples" test. A single optimized-streaming source per sample (the same
+consumes -- and applied (NO fitting, no re-training) to the 87 held-out short-read samples in
+``SAMPLES`` that are entirely absent from the training pool (the samples that train alongside
+HG002+CHM1_CHM13 are listed in ``dataset.PROMOTED_HELDOUT_SAMPLES``), scored against their truth.
+This is the realistic "train on some samples, apply to new samples" test. A single optimized-streaming source per sample (the same
 1.6M-locus catalog, ``EHv5-bw2-optimized``) supplies all three genotyping regimes via routing: its
 ``QuickGenotype`` rows are the ``quick`` regime and its full-genotyper-fallback rows split into
 ``full_spanning`` / ``full_nonspanning``.
@@ -41,17 +40,27 @@ GCS_ROOT = "gs://str-truth-set-v2/tool_results"
 VARIANT = "EHv5-bw2-optimized"
 CATALOG = "combined_catalog_43_samples_1.6M_loci"
 
-# The remaining 30 held-out HPRC short-read samples (absent from the training pool). 13 of the
-# original 43 (see ``dataset.PROMOTED_HELDOUT_SAMPLES``) were promoted into training for
-# ancestry/sex diversity at large allele sizes, so they are excluded here to avoid double-counting
-# them in the external validation set.
+# The 87 held-out short-read samples (absent from the training pool): the 138 1kGP samples with a
+# DipCall high-confidence BED, a truth-genotypes TSV and a Broad short-read CRAM, minus the 43 of
+# them that train alongside HG002+CHM1_CHM13 (``dataset.PROMOTED_HELDOUT_SAMPLES``; see there for how
+# the split was chosen on 2026-09-25 and updated on 2026-09-28), and minus the 8 whose DipCall truth
+# lost almost all of chrX/chrY (listed in str-truth-set-v2's
+# filter_vcfs_v2/samples_excluded_from_downstream_analyses.tsv). Includes the 30 samples held out
+# before 2026-09-25 and the ten pOk fast-path diagnosis samples. Only the 30 pre-existing samples
+# have an EHv5-bw2-optimized run under GCS_ROOT so far; the other 57 need one before
+# ``build_sample`` can ingest them.
 SAMPLES = [
-    "HG00438", "HG00514", "HG00673", "HG00733", "HG00735", "HG00741", "HG01071",
-    "HG01109", "HG01175", "HG01243", "HG01358", "HG01361", "HG01891",
-    "HG01952", "HG01978", "HG02145", "HG02148", "HG02257",
-    "HG02572", "HG02630", "HG02717", "HG02723", "HG02818", "HG02886", "HG03098",
-    "HG03486", "HG03516", "HG03540", "HG03579",
-    "NA19240",
+    "HG00423", "HG00438", "HG00514", "HG00544", "HG00558", "HG00597", "HG00609", "HG00639",
+    "HG00642", "HG00673", "HG00733", "HG00735", "HG00738", "HG00741", "HG01071", "HG01081",
+    "HG01099", "HG01109", "HG01114", "HG01175", "HG01243", "HG01252", "HG01255", "HG01261",
+    "HG01358", "HG01361", "HG01496", "HG01884", "HG01891", "HG01940", "HG01943", "HG01952",
+    "HG01969", "HG01975", "HG01978", "HG01981", "HG01993", "HG02004", "HG02015", "HG02027",
+    "HG02056", "HG02074", "HG02083", "HG02132", "HG02145", "HG02148", "HG02257", "HG02258",
+    "HG02280", "HG02293", "HG02300", "HG02514", "HG02523", "HG02572", "HG02587", "HG02602",
+    "HG02630", "HG02668", "HG02698", "HG02717", "HG02723", "HG02735", "HG02738", "HG02809",
+    "HG02818", "HG02886", "HG02984", "HG03017", "HG03041", "HG03050", "HG03098", "HG03486",
+    "HG03516", "HG03540", "HG03579", "HG03654", "HG03683", "HG03704", "HG03834", "HG03942",
+    "HG04115", "HG04157", "HG04160", "HG04184", "HG04187", "HG04199", "NA19240",
 ]
 
 
@@ -95,6 +104,9 @@ def build_sample(sample, data_dir, force):
 
     json_local = dataset._download(json_remote, dl_dir)
     genotypes_tsv_local = dataset._download([genotypes_tsv_remote], dl_dir)[0]
+    # _check_freshness could only judge shards that already existed locally -- see dataset.build_combo.
+    dataset.assert_eh_build_matches(
+        sample, [("json shard %d" % i, p) for i, p in enumerate(json_local)])
 
     rows = []
     for path in json_local:
@@ -102,8 +114,10 @@ def build_sample(sample, data_dir, force):
     merged = dataset._join_truth(
         pd.DataFrame(rows), dataset._load_truth_from_genotypes_tsv(genotypes_tsv_local), sample)
     merged = merged.drop(columns=["sample_id"])
-    for c in merged.select_dtypes("float64").columns:
-        merged[c] = merged[c].astype("float32")
+    # Feature columns stay float64 all the way to fit(). Downcasting here used to halve the parquet
+    # and frame size, but it permanently quantized every value: sklearn's HistGradientBoosting upcasts
+    # back to float64 internally (X_DTYPE) and bins to uint8, so the downcast bought nothing at fit
+    # time while forcing the C++ scorer to reproduce it exactly. See features.build_matrix.
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     merged.to_parquet(out_path, index=False)
     print("    %d rows (%d matched truth)" % (len(merged), int(merged["true"].notna().sum())), flush=True)
@@ -140,19 +154,24 @@ def _strided(a, idx):
     return a[idx][:VIOLIN_PER_SAMPLE].astype(np.float32)
 
 
-def _accumulate(acc, sub, comp, branch):
+def _accumulate(acc, sub, comp, branch, names):
     """Folds one sample's rows (one genotyping regime) into the running accumulator (gated correction).
+
+    ``names`` is the feature list the model being applied declares (see ``run_eval``); the compiled
+    trees index it positionally.
 
     Homopolymer (1 bp motif) loci are dropped from every scalar metric and the red/pok/lcf violin
     sample; only the by-motif-size sample (mred/mpok/motif) retains them.
     """
-    X, _ = features.build_matrix(sub, branch)
+    X, _ = features.build_matrix(sub, branch, names)
     eh = sub["eh"].to_numpy(float)
     true = sub["true"].to_numpy(float)
     motif = sub["motif_size"].to_numpy(float)
-    lcf = M.predict_lcf_json(comp, X)
+    # Rounded to the 3 decimals ExpansionHunter emits: this benchmark exists to describe what the
+    # deployed binary does, and 3 decimals is all its JSON carries (model.round_like_emitted).
+    lcf = M.round_like_emitted(M.predict_lcf_json(comp, X))
     true_pred = eh / lcf
-    proba = M.predict_proba_json(comp, X)
+    proba = M.round_like_emitted(M.predict_proba_json(comp, X))
     p_ok = proba[:, 0]
     corrected = np.where(p_ok < 0.5, true_pred, eh)        # gate: correct only low-confidence calls
     d_raw = np.abs(true - eh)
@@ -254,6 +273,51 @@ def _finalize(acc, n_samples):
     }
 
 
+def assert_parquets_carry_contract(paths):
+    """Raises if any per-allele parquet no longer matches the current extractor/feature contract.
+
+    Delegates to ``dataset.parquet_contract_complaint``, the SAME check the training path applies in
+    ``_parquet_reusable`` / ``assert_parquets_up_to_date``, so the eval path cannot drift into
+    accepting a parquet the training path would rebuild. Checking only column NAMES here used to let
+    two conditions through: float32 feature columns (which then die inside ``build_matrix`` with the
+    bare AssertionError this guard exists to prevent) and a missing ``has_own_quality_metrics``
+    column, which does not fail at all -- ``dataset.label_and_filter`` falls back to keeping every
+    row, so the benchmark silently scores the homozygous rank-1 alleles inference never produces.
+    """
+    complaints = {p: c for p, c in ((p, dataset.parquet_contract_complaint(p)) for p in paths) if c}
+    if complaints:
+        raise RuntimeError(
+            "%d parquet(s) no longer match the current feature contract: %s."
+            % (len(complaints), _rebuild_instructions(complaints)))
+
+
+def assert_parquets_supply_features(paths, names, requested_by):
+    """Raises if any per-allele parquet is missing one of ``names``.
+
+    ``names`` is whatever list is about to be turned into a feature matrix -- the current
+    ``features.py`` contract, or an older MODEL's declared list when that model is being applied (see
+    ``run_eval``). ``requested_by`` names the source of the list, so the error says which side is
+    asking for the column that is missing.
+    """
+    stale = features.missing_feature_columns(paths, names)
+    if stale:
+        raise RuntimeError(
+            "%d parquet(s) are missing feature column(s) required by %s: %s."
+            % (len(stale), requested_by,
+               _rebuild_instructions({p: "missing %s" % m for p, m in stale.items()})))
+
+
+def _rebuild_instructions(complaints):
+    """Renders ``{path: complaint}`` as ``<path> <complaint> -- rebuild with: <command>`` lines.
+
+    The rebuild command is chosen PER PATH (``dataset.rebuild_command_for``): ``heldout.py`` cannot
+    rebuild a training-combo parquet under ``data/real_quick/`` and ``dataset.py`` cannot rebuild a
+    held-out sample's, so naming one command for every path sends the reader to a no-op.
+    """
+    return "; ".join("%s %s -- rebuild with: %s" % (p, c, dataset.rebuild_command_for(p))
+                     for p, c in sorted(complaints.items()))
+
+
 def run_eval(paths, model_path, out_json, max_alleles):
     """Applies the exported model to ``paths`` (per-allele parquets) and writes ``out_json`` + its
     ``*_violin.npz``; returns the metrics dict.
@@ -264,8 +328,22 @@ def run_eval(paths, model_path, out_json, max_alleles):
     gate.
     """
     print("\n==== load + compile the exported model: %s ====" % os.path.basename(model_path), flush=True)
-    model_json = M.load(model_path)["genotyping_regimes"]
-    compiled = {r: (M.compile_genotyping_regime(model_json[r]), features.GENOTYPING_REGIME_BRANCH[r])
+    model = M.load(model_path)
+    # Build each regime's matrix from the MODEL's own declared feature list, not this checkout's:
+    # the compiled trees index features positionally, so that list -- in that order -- is the only
+    # correct matrix for this model. It also means a model exported under an older contract can be
+    # applied here (what compare_models needs) instead of being refused.
+    declared = M.feature_names_of(model, model_path)
+    # Two different questions, both required: does each parquet still match the CURRENT extractor
+    # contract (so the rows and dtypes are the ones training would produce), and can it supply the
+    # columns THIS model declares? compare_models reaches run_eval without rebuilding anything, so
+    # this is the only place either is checked for it.
+    assert_parquets_carry_contract(paths)
+    assert_parquets_supply_features(paths, sorted(set().union(*declared.values())), model_path)
+    model_json = model["genotyping_regimes"]
+    compiled = {r: (M.compile_genotyping_regime(model_json[r]),
+                    features.GENOTYPING_REGIME_BRANCH[r],
+                    declared[features.GENOTYPING_REGIME_BRANCH[r]])
                 for r in features.GENOTYPING_REGIMES}
 
     acc = {r: _new_acc() for r in features.GENOTYPING_REGIMES}

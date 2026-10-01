@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 import dataset
+import dataset_tests  # for write_contract_parquet, so both suites build the same fixture parquet
 import features
 import heldout
 import model as M
@@ -26,7 +27,10 @@ def _raw_feature_row(**overrides):
     join/labeling columns ``dataset.label_and_filter`` needs; override any field by keyword."""
     row = {c: 1.0 for c in features.FULL_FEATURES if c not in ("ci_asymmetry", "ci_over_eh")}
     row.update({"ci_start": 1.0, "ci_end": 3.0, "locus_id": "1-1-2-AAA", "is_negative_locus": False,
-               "allele_rank": 0, "genotyping_branch": "full", "spanning_at_called": 5})
+               "allele_rank": 0, "genotyping_branch": "full", "spanning_at_called": 5,
+               # Not a feature, but part of the extractor's contract: run_eval refuses a parquet
+               # without it, since label_and_filter could not then drop unscoreable hom copies.
+               "has_own_quality_metrics": True})
     row.update(overrides)
     return row
 
@@ -84,7 +88,8 @@ class AccumulateTest(unittest.TestCase):
         with mock.patch.object(M, "predict_lcf_json", return_value=np.array([1.2, 1.4])), \
              mock.patch.object(M, "predict_proba_json",
                                return_value=np.array([[0.2, 0.7, 0.1], [0.1, 0.8, 0.1]])):
-            heldout._accumulate(acc, self._sub(), comp=None, branch="full")
+            heldout._accumulate(acc, self._sub(), comp=None, branch="full",
+                                names=features.FULL_FEATURES)
         return acc
 
     def test_non_homopolymer_scalars(self):
@@ -114,7 +119,7 @@ class AccumulateTest(unittest.TestCase):
         sub = pd.DataFrame([_raw_feature_row(eh=10.0, true=10.0, motif_size=1, dir_code=features.OK)])
         with mock.patch.object(M, "predict_lcf_json", return_value=np.array([1.0])), \
              mock.patch.object(M, "predict_proba_json", return_value=np.array([[0.9, 0.05, 0.05]])):
-            heldout._accumulate(acc, sub, comp=None, branch="full")
+            heldout._accumulate(acc, sub, comp=None, branch="full", names=features.FULL_FEATURES)
         self.assertEqual(acc["n"], 0)
         self.assertEqual(acc["h_n"], 1)
 
@@ -174,7 +179,7 @@ class BuildSampleTest(unittest.TestCase):
             tsv_local = os.path.join(dl_dir, "HG00438.tandem_repeat_genotypes.tsv.gz")
             open(json_local, "w").close()
             open(tsv_local, "w").close()
-            pd.DataFrame({"eh": [1.0, 2.0]}).to_parquet(out_path)
+            dataset_tests.write_contract_parquet(out_path, n_rows=2)
             newer = max(os.path.getmtime(json_local), os.path.getmtime(tsv_local)) + 100
             os.utime(out_path, (newer, newer))
             with mock.patch.object(heldout, "_discover_cov", return_value="30x"), \
@@ -197,6 +202,7 @@ class BuildSampleTest(unittest.TestCase):
                  mock.patch.object(dataset, "_download",
                                    side_effect=lambda remote, dest: [os.path.join(dest, os.path.basename(p))
                                                                      for p in remote]), \
+                 mock.patch.object(dataset, "assert_eh_build_matches"), \
                  mock.patch.object(heldout.eh_json, "extract_rows", return_value=fake_rows), \
                  mock.patch.object(dataset, "_load_truth_from_genotypes_tsv", return_value=fake_tsv_df):
                 out_path = heldout.build_sample("HG00438", d, force=True)
@@ -204,6 +210,61 @@ class BuildSampleTest(unittest.TestCase):
             self.assertEqual(len(merged), 1)
             self.assertNotIn("sample_id", merged.columns)
             self.assertEqual(merged["true"].iloc[0], 9.0)
+
+
+class AssertParquetsCarryContractTest(unittest.TestCase):
+    """The eval-path guard must enforce the SAME contract as the training path, or a parquet the
+    training path would rebuild slips into a benchmark."""
+
+    def _pair(self, d, damage):
+        """Writes a contract-clean NEW.parquet and an OLD.parquet damaged the given way."""
+        fresh, stale = os.path.join(d, "NEW.parquet"), os.path.join(d, "OLD.parquet")
+        dataset_tests.write_contract_parquet(fresh)
+        df = dataset_tests.write_contract_parquet(stale)
+        if damage == "missing_column":
+            df = df.drop(columns=["coverage"])
+        elif damage == "float32":
+            df["coverage"] = df["coverage"].astype(np.float32)
+        else:
+            df = df.drop(columns=["has_own_quality_metrics"])
+        df.to_parquet(stale, index=False)
+        return fresh, stale
+
+    def test_names_only_the_offending_parquet(self):
+        with tempfile.TemporaryDirectory() as d:
+            fresh, stale = self._pair(d, "missing_column")
+            heldout.assert_parquets_carry_contract([fresh])  # must not raise
+            with self.assertRaises(RuntimeError) as ctx:
+                heldout.assert_parquets_carry_contract([fresh, stale])
+            self.assertIn("OLD.parquet", str(ctx.exception))
+            self.assertIn("coverage", str(ctx.exception))
+            self.assertNotIn("NEW.parquet", str(ctx.exception))
+
+    def test_float32_and_missing_quality_metrics_column_are_caught_too(self):
+        # Neither is a missing feature NAME, so a name-only check let both through: float32 died
+        # later inside build_matrix, and the missing column silently kept unscoreable alleles.
+        for damage in ("float32", "missing_quality_metrics"):
+            with tempfile.TemporaryDirectory() as d:
+                _, stale = self._pair(d, damage)
+                with self.assertRaises(RuntimeError, msg=damage):
+                    heldout.assert_parquets_carry_contract([stale])
+
+    def test_error_names_the_command_that_can_actually_rebuild_the_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "real_43"))
+            os.makedirs(os.path.join(d, "real_quick"))
+            sample = os.path.join(d, "real_43", "HG00438.parquet")
+            combo = os.path.join(d, "real_quick", "HG002_31x.parquet")
+            for path in (sample, combo):
+                dataset_tests.write_contract_parquet(path).drop(
+                    columns=["coverage"]).to_parquet(path, index=False)
+            with self.assertRaises(RuntimeError) as ctx:
+                heldout.assert_parquets_carry_contract([sample, combo])
+            msg = str(ctx.exception)
+            # heldout.py cannot rebuild a training-combo parquet and dataset.py cannot rebuild a
+            # held-out sample's, so one blanket command would send the reader to a no-op.
+            self.assertIn("heldout.py --build-only --force --samples HG00438", msg)
+            self.assertIn("dataset.py --force", msg)
 
 
 class RunEvalTest(unittest.TestCase):
@@ -220,8 +281,12 @@ class RunEvalTest(unittest.TestCase):
             parquet_path = os.path.join(d, "S.parquet")
             pd.DataFrame(rows).to_parquet(parquet_path)
             out_json = os.path.join(d, "eval.json")
-            with mock.patch.object(M, "load",
-                                   return_value={"genotyping_regimes": {r: {} for r in features.GENOTYPING_REGIMES}}), \
+            # feature_names must match the current contract -- run_eval refuses a model exported
+            # under a different one, since the compiled trees index features positionally.
+            fake_model = {"feature_names": {b: features.feature_names(b)
+                                            for b in (features.BRANCH_QUICK, features.BRANCH_FULL)},
+                          "genotyping_regimes": {r: {} for r in features.GENOTYPING_REGIMES}}
+            with mock.patch.object(M, "load", return_value=fake_model), \
                  mock.patch.object(M, "compile_genotyping_regime", side_effect=lambda regime_json: regime_json), \
                  mock.patch.object(M, "predict_lcf_json", side_effect=lambda comp, X: np.ones(len(X))), \
                  mock.patch.object(M, "predict_proba_json",

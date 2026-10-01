@@ -10,7 +10,13 @@ import eh_json
 
 
 def _locus(genotype="20/97", quick=False, with_aqm=True):
-    """Builds a minimal EH locus_result dict with one variant."""
+    """Builds a minimal EH locus_result dict with one variant.
+
+    The AlleleQualityMetrics list mirrors what ExpansionHunter really emits: one entry per DISTINCT
+    called allele, so a homozygous or hemizygous genotype gets a single entry (see
+    ``HtsLowMemStreamingHelpers.cpp``'s ``if (isHet) {two} else {one}``). Handing a hom fixture two
+    entries would hide the very asymmetry ``has_own_quality_metrics`` exists to record.
+    """
     variant = {
         "VariantId": "L", "RepeatUnit": "CAG", "ReferenceRegion": "chr1:1000-1030",
         "Genotype": genotype, "GenotypeConfidenceInterval": "20-20/90-105",
@@ -21,7 +27,7 @@ def _locus(genotype="20/97", quick=False, with_aqm=True):
     if quick:
         variant["QuickGenotype"] = True
     if with_aqm:
-        variant["AlleleQualityMetrics"] = {"Alleles": [
+        alleles = [
             {"AlleleNumber": 1, "AlleleSize": 20, "Depth": 30, "QD": 0.4,
              "HighQualityUnambiguousReads": 6, "StrandBiasBinomialPhred": 1.0,
              "MeanInsertedBasesWithinRepeats": 0.1, "MeanDeletedBasesWithinRepeats": 0.0,
@@ -29,7 +35,9 @@ def _locus(genotype="20/97", quick=False, with_aqm=True):
             {"AlleleNumber": 2, "AlleleSize": 97, "Depth": 28, "QD": 0.3,
              "HighQualityUnambiguousReads": 1, "StrandBiasBinomialPhred": 2.0,
              "MeanInsertedBasesWithinRepeats": 0.2, "MeanDeletedBasesWithinRepeats": 0.1,
-             "LeftFlankNormalizedDepth": 1.0, "RightFlankNormalizedDepth": 1.0}]}
+             "LeftFlankNormalizedDepth": 1.0, "RightFlankNormalizedDepth": 1.0}]
+        called = eh_json.parse_genotype(genotype) or []
+        variant["AlleleQualityMetrics"] = {"Alleles": alleles[:max(1, len(set(called)))]}
     return {"LocusId": "1-1000-1030-CAG", "Coverage": 30.0, "Variants": {"L": variant}}
 
 
@@ -61,6 +69,47 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(b["spanning_at_called"], 1)   # (97, 1)
         self.assertEqual(a["flanking_above_called"], 2)  # (98,2) above eh=20
         self.assertEqual(a["left_flank_norm_depth"], 1.1)
+        self.assertEqual(a["coverage"], 30.0)             # per-locus, shared by both alleles
+        self.assertEqual(b["coverage"], 30.0)
+        self.assertEqual(a["flanking_total"], 2)          # (98, 2)
+        self.assertAlmostEqual(a["flanking_frac"], 2 / 11)  # 2 / (2 flanking + 9 spanning)
+        self.assertEqual(a["n_alleles"], 2)
+        self.assertEqual(a["n_distinct_alleles"], 2)      # 20/97 is het
+
+    def test_homozygous_genotype_has_one_distinct_allele(self):
+        rows = list(eh_json.extract_rows(
+            {"LocusResults": {"x": _locus(genotype="20/20")}}, sample_id="S"))
+        self.assertEqual([r["n_alleles"] for r in rows], [2, 2])
+        self.assertEqual([r["n_distinct_alleles"] for r in rows], [1, 1])
+
+    def test_only_the_first_copy_of_a_homozygous_call_has_its_own_quality_metrics(self):
+        # EH emits one AlleleQualityMetrics entry for a hom call and scores the model once per entry,
+        # so the rank-1 row is an allele inference never produces -- it must be marked, not silently
+        # handed the rank-0 allele's read metrics and the LONG truth allele.
+        rows = list(eh_json.extract_rows(
+            {"LocusResults": {"x": _locus(genotype="20/20")}}, sample_id="S"))
+        self.assertEqual([r["has_own_quality_metrics"] for r in rows], [True, False])
+
+    def test_both_copies_of_a_het_call_have_their_own_quality_metrics(self):
+        rows = list(eh_json.extract_rows(
+            {"LocusResults": {"x": _locus(genotype="20/97")}}, sample_id="S"))
+        self.assertEqual([r["has_own_quality_metrics"] for r in rows], [True, True])
+        self.assertEqual([r["depth"] for r in rows], [30, 28])  # each read its OWN entry
+
+    def test_hemizygous_genotype_has_one_allele(self):
+        rows = list(eh_json.extract_rows(
+            {"LocusResults": {"x": _locus(genotype="20")}}, sample_id="S"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["n_alleles"], 1)
+        self.assertEqual(rows[0]["n_distinct_alleles"], 1)
+        self.assertTrue(rows[0]["has_own_quality_metrics"])
+
+    def test_flanking_frac_is_zero_without_flanking_reads(self):
+        locus = _locus()
+        locus["Variants"]["L"]["CountsOfFlankingReads"] = ""
+        rows = list(eh_json.extract_rows({"LocusResults": {"x": locus}}, sample_id="S"))
+        self.assertEqual(rows[0]["flanking_total"], 0)
+        self.assertEqual(rows[0]["flanking_frac"], 0.0)   # 0, never NaN -- also covers 0 spanning
 
     def test_quick_contract_omits_full_only(self):
         rows = list(eh_json.extract_rows(
@@ -76,6 +125,9 @@ class ExtractTest(unittest.TestCase):
         for r in rows:
             self.assertIsNone(r["eh"])              # eh undefined -> dropped from training later
             self.assertIsNone(r["spanning_at_called"])
+            for col in ("n_alleles", "n_distinct_alleles", "flanking_total", "flanking_frac",
+                        "coverage"):
+                self.assertIsNone(r[col])           # no genotype / no reads -> nothing to report
             self.assertEqual(r["motif_size"], 3)    # catalog fields still populated for the report
             self.assertEqual(r["num_repeats_in_reference"], 10)  # (1030-1000)/3
             self.assertEqual(r["genotyping_branch"], "full")

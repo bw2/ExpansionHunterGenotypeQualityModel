@@ -71,7 +71,7 @@ def _log_loss(y_true, proba):
     return float(np.mean(-np.log(proba[np.arange(len(y_true)), y_true])))
 
 
-def _fit_early_stop(make_estimator, fit, score, X_calib):
+def _fit_early_stop(make_estimator, fit, score):
     """Runs the shared warm-start early-stopping loop and returns the best estimator.
 
     Builds one ``warm_start=True`` estimator, grows ``max_iter`` by ``_STEP`` and
@@ -83,8 +83,8 @@ def _fit_early_stop(make_estimator, fit, score, X_calib):
     Args:
         make_estimator: Zero-arg callable returning a fresh unfitted estimator.
         fit: ``fit(estimator)`` -- fits it on the (closed-over) training data.
-        score: ``score(estimator) -> calib_loss`` lower-is-better.
-        X_calib: Unused here; kept so callers document the calib dependency.
+        score: ``score(estimator) -> calib_loss`` lower-is-better. The calibration set reaches
+            this function only through this closure.
 
     Returns:
         The fitted estimator at the best observed iteration.
@@ -122,8 +122,7 @@ def train_q_median(X, t, X_calib, t_calib):
     return _fit_early_stop(
         make,
         fit=lambda e: e.fit(X, t),
-        score=lambda e: _pinball_loss(t_calib, e.predict(X_calib), 0.5),
-        X_calib=X_calib)
+        score=lambda e: _pinball_loss(t_calib, e.predict(X_calib), 0.5))
 
 
 def predict_lcf(qreg, X):
@@ -164,8 +163,7 @@ def train_direction(X, y, X_calib, y_calib):
     clf = _fit_early_stop(
         make,
         fit=lambda e: e.fit(X, y),
-        score=lambda e: _log_loss(y_calib, _proba_in_class_order(e, X_calib)),
-        X_calib=X_calib)
+        score=lambda e: _log_loss(y_calib, _proba_in_class_order(e, X_calib)))
 
     raw_calib = _proba_in_class_order(clf, X_calib)
     y_calib = np.asarray(y_calib, dtype=int)
@@ -352,6 +350,30 @@ def load(path):
         return json.loads(f.read())
 
 
+def feature_names_of(model, path):
+    """Returns ``{branch: [feature, ...]}`` as declared by a serialized model.
+
+    A model's compiled trees index the feature matrix POSITIONALLY, so the ONLY correct matrix for a
+    given model is one built from this list, in this order. Reading it back (instead of assuming the
+    current ``features.py``) is what lets a model exported under an older contract be applied
+    correctly rather than refused -- which is exactly what comparing a newly trained model against
+    the deployed one requires. The C++ consumer does the equivalent by name in
+    ``GenotypeQualityAnnotator.cpp``.
+
+    Raises:
+        SystemExit: If the model declares no feature list for a branch (nothing can be built safely).
+    """
+    declared = model.get("feature_names") or {}
+    out = {}
+    for branch in (features.BRANCH_QUICK, features.BRANCH_FULL):
+        names = list(declared.get(branch) or [])
+        if not names:
+            raise SystemExit("ERROR: %s declares no feature_names for the %s branch, so its trees' "
+                             "positional feature indices cannot be resolved." % (path, branch))
+        out[branch] = names
+    return out
+
+
 def _compile_tree(tree):
     """Compiles one serialized tree's node list to flat numpy arrays for vectorized descent."""
     nodes = tree["nodes"]
@@ -404,8 +426,24 @@ def compile_genotyping_regime(genotyping_regime_json):
     }
 
 
+def round_like_emitted(values):
+    """Rounds to 3 decimals, the way ExpansionHunter writes the model's outputs into its JSON.
+
+    ``JsonWriter.cpp`` applies ``std::round(v * 1000) / 1000`` to ``PredictedLengthCorrectionFactor``
+    and to ``pOk`` / ``pTooLong`` / ``pTooShort``, so 3 decimals is all a downstream consumer of an EH
+    run can ever see. Any evaluation meant to describe the DEPLOYED behaviour has to score these
+    rounded values: full precision silently changes both the corrected integer call and which alleles
+    fall on either side of the ``pOk < 0.5`` gate for a small but real fraction of alleles.
+    """
+    return np.round(np.asarray(values, dtype=float), 3)
+
+
 def predict_lcf_json(comp, X):
-    """Returns ``LCF = exp(t)`` for ``X`` from a compiled genotyping regime (see ``predict_lcf``)."""
+    """Returns ``LCF = exp(t)`` for ``X`` from a compiled genotyping regime (see ``predict_lcf``).
+
+    Full precision -- callers that model the deployed pipeline must pass the result through
+    ``round_like_emitted``.
+    """
     X = np.asarray(X, dtype=float)
     t = np.full(X.shape[0], comp["q_baseline"])
     for arrs in comp["q_trees"]:

@@ -33,10 +33,11 @@ BRANCH_QUICK = "quick"
 _COUNTS_RE = re.compile(r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)")
 _REGION_RE = re.compile(r"^([^:]+):(\d+)-(\d+)$")
 
-# The raw ExpansionHunter output JSON fields this parser reads (for the report): per-variant
-# top-level fields and per-allele ``AlleleQualityMetrics.Alleles[].<field>`` values. Field names are
-# leaf names. Source of truth for the field names is ``extract_variant_rows`` below.
+# The raw ExpansionHunter output JSON fields this parser reads (for the report): per-locus fields,
+# per-variant top-level fields and per-allele ``AlleleQualityMetrics.Alleles[].<field>`` values. Field
+# names are leaf names. Source of truth for the field names is ``extract_variant_rows`` below.
 EH_OUTPUT_FIELDS = [
+    ("Coverage", "Per-locus read depth over the locus's two reference flanks."),
     ("ReferenceRepeatPurity", "Per-variant: fraction of the reference repeat region matching a perfect motif tiling."),
     ("Depth", "Per-allele read depth."),
     ("HighQualityUnambiguousReads", "Per-allele high-quality unambiguous read count."),
@@ -140,15 +141,24 @@ def _no_call_rows(locus_result, sample_id, branch, motif_size, reference_repeat_
             "num_repeats_in_reference": num_ref,
             "eh": None,
             "eh_minus_ref": None,
+            # A no-call has no genotype and so no per-allele quality metrics. These rows exist only
+            # for the report's truth join and are dropped from training by `missing_eh_or_true`
+            # before the has_own_quality_metrics filter is ever consulted.
+            "has_own_quality_metrics": False,
+            "n_alleles": None,
+            "n_distinct_alleles": None,
             "ci_start": None,
             "ci_end": None,
             "ci_width": None,
             "spanning_total": None,
             "hq_unamb_total": None,
+            "flanking_total": None,
             "spanning_at_called": None,
             "spanning_above_called": None,
             "flanking_above_called": None,
             "support_frac": None,
+            "flanking_frac": None,
+            "coverage": None,
             "depth": None,
             "hq_unambiguous_reads": None,
             "strand_bias_phred": None,
@@ -190,8 +200,14 @@ def extract_variant_rows(variant, locus_result, sample_id):
     spanning = parse_counts(variant.get("CountsOfSpanningReads"))
     flanking = parse_counts(variant.get("CountsOfFlankingReads"))
     spanning_total = sum(c for _, c in spanning)
+    flanking_total = sum(c for _, c in flanking)
     hq_total = sum(c for _, c in parse_counts(
         variant.get("CountsOfHighQualityUnambiguousReads")))
+    # Flanking share of the locus's informative reads. 0 when there are no flanking reads at all,
+    # which also covers the 0/0 case (no reads of either kind) rather than emitting NaN.
+    flanking_frac = (flanking_total / (flanking_total + spanning_total)) if flanking_total else 0.0
+    # Per-locus (not per-allele) read depth, shared by every allele of every variant at the locus.
+    coverage = locus_result.get("Coverage")
 
     aqm_alleles = (variant.get("AlleleQualityMetrics") or {}).get("Alleles") or []
     aqm_by_number = {a.get("AlleleNumber"): a for a in aqm_alleles}
@@ -203,6 +219,15 @@ def extract_variant_rows(variant, locus_result, sample_id):
         aqm = _aqm_for_allele(aqm_alleles, aqm_by_number, rank, eh)
         depth = aqm.get("Depth")
         row = {
+            # Whether ExpansionHunter reported quality metrics for THIS allele specifically.
+            # It emits one AlleleQualityMetrics entry per allele for a het call, but only ONE for a
+            # homozygous or hemizygous call -- and it scores the model once per entry. So the rank-1
+            # row of a hom call is a row inference can never produce: _aqm_for_allele falls back to
+            # the size match and hands it the rank-0 allele's read metrics, giving two rows with
+            # identical features (bar allele_rank) joined to two DIFFERENT truth alleles.
+            # dataset.label_and_filter drops these before training; the accuracy-by-size report reads
+            # the parquet directly and still sees both rows, which is what its truth join needs.
+            "has_own_quality_metrics": aqm_by_number.get(rank + 1) is not None,
             "locus_id": locus_result.get("LocusId"),
             "sample_id": sample_id,
             "allele_rank": rank,
@@ -212,15 +237,20 @@ def extract_variant_rows(variant, locus_result, sample_id):
             "num_repeats_in_reference": num_ref,
             "eh": eh,
             "eh_minus_ref": (eh - num_ref) if num_ref is not None else None,
+            "n_alleles": n_alleles,
+            "n_distinct_alleles": len(set(genotype)),
             "ci_start": ci_lo,
             "ci_end": ci_hi,
             "ci_width": ci_width,
             "spanning_total": spanning_total,
             "hq_unamb_total": hq_total,
+            "flanking_total": flanking_total,
             "spanning_at_called": span_at,
             "spanning_above_called": _sum_above(spanning, eh),
             "flanking_above_called": _sum_above(flanking, eh),
             "support_frac": (span_at / spanning_total) if spanning_total else None,
+            "flanking_frac": flanking_frac,
+            "coverage": coverage,
             "depth": depth,
             "hq_unambiguous_reads": aqm.get("HighQualityUnambiguousReads"),
             "strand_bias_phred": aqm.get("StrandBiasBinomialPhred"),

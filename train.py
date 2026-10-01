@@ -124,8 +124,12 @@ def main():
     # allow_nan=False => raise rather than emit non-standard Infinity/NaN tokens (the serializer
     # clamps sklearn's +/-inf split thresholds; this guards anything else slipping through).
     blob = json.dumps(model, separators=(",", ":"), allow_nan=False).encode()
-    with gzip.open(args.out, "wb", compresslevel=9) as f:
-        f.write(blob)
+    # gzip.open would stamp the current time and the output filename into the gzip header, so two
+    # runs that fit byte-identical trees would still produce different archives. Writing through
+    # GzipFile with mtime=0 and an empty filename keeps the whole artifact a function of SEED + data.
+    with open(args.out, "wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", compresslevel=9, fileobj=raw, mtime=0) as f:
+            f.write(blob)
     with gzip.open(args.out, "rb") as f:
         json.loads(f.read(), parse_constant=_reject_nonfinite)  # confirm it reloads + is finite
     print("\nwrote %s (%d quick / %d full features, json %d bytes, gz %d bytes)"

@@ -22,17 +22,20 @@ Pure functions, no module-level mutable state, no randomness.
 import numpy as np
 import pandas as pd
 
-# Per-branch model feature lists. Identifiers, labels, and leakage columns are
-# excluded. ``coverage`` is deliberately NOT a feature (inconsistent real/sim
-# semantics); the consistently-measured ``depth`` is used instead.
+# Per-branch model feature lists. Identifiers, labels, and leakage columns are excluded.
+# ``n_alleles`` / ``n_distinct_alleles`` describe the shape of the genotype the allele came from:
+# without them a hemizygous call and the short allele of a diploid call, or a hom call and a het
+# call, are indistinguishable to the model even though their error rates at a given pOk are not.
 QUICK_FEATURES = [
     "motif_size",
     "num_repeats_in_reference", "ref_size_bp",
     "eh", "eh_minus_ref", "allele_rank",
+    "n_alleles", "n_distinct_alleles",
     "ci_width", "ci_asymmetry", "ci_over_eh",
-    "spanning_total", "hq_unamb_total",
+    "spanning_total", "hq_unamb_total", "flanking_total",
     "spanning_at_called", "spanning_above_called", "flanking_above_called",
-    "support_frac",
+    "support_frac", "flanking_frac",
+    "coverage",
     "depth", "hq_unambiguous_reads", "strand_bias_phred",
     "mean_inserted_bases", "mean_deleted_bases",
     "reference_repeat_purity", "read_repeat_purity",
@@ -53,15 +56,20 @@ FEATURE_DEFINITIONS = {
     "eh": "ExpansionHunter's called allele size (repeat units) -- the label being corrected.",
     "eh_minus_ref": "Called allele size minus num_repeats_in_reference (expansion/contraction vs the reference).",
     "allele_rank": "0-based allele index within the genotype (size-sorted).",
+    "n_alleles": "Number of alleles in EH's genotype call (1 = hemizygous, 2 = diploid).",
+    "n_distinct_alleles": "Number of distinct called sizes in the genotype (1 = hom, 2 = het).",
     "ci_width": "Width of EH's genotype confidence interval for this allele (repeats).",
     "ci_asymmetry": "Engineered: CI skew around the call, ((ci_end-eh)-(eh-ci_start))/(ci_width+1).",
     "ci_over_eh": "Engineered: relative CI width, ci_width/(eh+1).",
     "spanning_total": "Total spanning reads at the locus.",
     "hq_unamb_total": "Total high-quality unambiguous reads at the locus.",
+    "flanking_total": "Total flanking reads at the locus.",
     "spanning_at_called": "Spanning reads supporting the called size.",
     "spanning_above_called": "Spanning reads larger than the called size.",
     "flanking_above_called": "Flanking reads larger than the called size.",
     "support_frac": "Fraction of spanning reads at the call (spanning_at_called / spanning_total).",
+    "flanking_frac": "Flanking share of the locus reads, flanking_total / (flanking_total + spanning_total); 0 when there are no flanking reads.",
+    "coverage": "Per-locus read depth over the locus's two reference flanks (LocusResults.Coverage), from reads whose alignment starts in a flank. Measured outside the repeat, so unlike the per-allele depth it does not move with the called allele size.",
     "depth": "Per-allele read depth (AlleleQualityMetrics).",
     "hq_unambiguous_reads": "Per-allele high-quality unambiguous read count.",
     "strand_bias_phred": "Strand-bias binomial Phred score for this allele.",
@@ -114,6 +122,30 @@ def add_engineered(df):
     return df
 
 
+def missing_feature_columns(parquet_paths, names=None):
+    """Returns ``{path: [missing feature column, ...]}`` for parquets that cannot supply ``names``.
+
+    A parquet built before a feature was added to the lists above lacks that column. Concatenating
+    such a part with an up-to-date one fills the column with NaN instead of failing, and applying the
+    model to it fails deep inside ``build_matrix``, so both the training-pool assembly
+    (``dataset.assemble_branch``) and the eval path (``gen_datasets.generate``) screen for it first.
+    ``ci_asymmetry`` / ``ci_over_eh`` are excluded -- ``add_engineered`` rebuilds them from the raw CI
+    columns, so they are never stored. Only paths with at least one missing column are returned.
+
+    ``names`` defaults to ``FULL_FEATURES`` (the current contract); pass a MODEL's declared feature
+    list to ask instead whether the parquets can supply what that particular model needs.
+    """
+    import pyarrow.parquet as pq  # local: only the parquet-facing callers need this dependency
+
+    required = set(FULL_FEATURES if names is None else names) - {"ci_asymmetry", "ci_over_eh"}
+    out = {}
+    for path in parquet_paths:
+        missing = sorted(required - set(pq.ParquetFile(path).schema.names))
+        if missing:
+            out[path] = missing
+    return out
+
+
 def feature_names(branch):
     """Returns the ordered feature list for ``branch`` (``"full"`` or ``"quick"``)."""
     if branch not in (BRANCH_FULL, BRANCH_QUICK):
@@ -121,20 +153,36 @@ def feature_names(branch):
     return list(FULL_FEATURES if branch == BRANCH_FULL else QUICK_FEATURES)
 
 
-def build_matrix(df, branch):
+def build_matrix(df, branch, names=None):
     """Builds the float feature matrix for one branch.
 
-    Adds the engineered columns, selects the branch's feature list (in order),
-    casts to float, and preserves NaN for the gradient booster to handle natively.
+    Adds the engineered columns, selects the feature list (in order), casts to float, and preserves
+    NaN for the gradient booster to handle natively.
+
+    Args:
+        df: Rows to build from.
+        branch: ``"full"`` or ``"quick"`` -- selects the default feature list.
+        names: Optional explicit feature list, overriding the branch's. Pass a MODEL's declared
+            ``feature_names`` when applying a model that was exported under a different contract: its
+            compiled trees index the matrix positionally, so the matrix must carry that model's own
+            list in that model's own order, not this checkout's.
 
     Returns:
-        ``(X, names)`` where ``X`` is a float DataFrame whose columns are exactly
-        ``names`` (``FULL_FEATURES`` or ``QUICK_FEATURES``).
+        ``(X, names)`` where ``X`` is a float DataFrame whose columns are exactly ``names``.
     """
-    names = feature_names(branch)
+    names = feature_names(branch) if names is None else list(names)
     df = add_engineered(df)
     missing = [c for c in names if c not in df.columns]
     assert not missing, "missing feature columns for %s branch: %s" % (branch, missing)
+    # Guard against a reinstated float32 downcast upstream. The .astype(float) below would upcast such
+    # a column back to float64 and hide the damage, but the values would already be quantized, and the
+    # tree thresholds fitted on them would then sit ~1 float32 ULP away from what the C++ scorer feeds
+    # the model at inference time (it hands over full doubles). That mismatch is silent and routes
+    # alleles to the wrong child. Keep every feature column float64 end to end.
+    narrowed = [c for c in names if df[c].dtype == np.float32]
+    assert not narrowed, (
+        "feature columns were downcast to float32 before build_matrix: %s. The C++ scorer feeds the "
+        "model full float64 values, so training must not quantize them." % narrowed)
     return df[names].astype(float), names
 
 

@@ -32,8 +32,10 @@ longer applies: there is no ``EHv5`` pool to collide with, within one optimized 
 either fast-path-called OR fallback (never both), and ``quick`` / ``full`` are separate experts;
 cross-coverage repeats of a locus are held out together by the chromosome-clean CV.
 
-The committed model is real-data-only (HG002 10x/20x/31x + CHM1_CHM13 46x); no
-simulated rows. Determinism: no randomness anywhere in the ingestion path.
+The committed model is real-data-only: the four COMBOS below (HG002 10x/20x/31x + CHM1_CHM13 46x)
+plus the 44 samples in PROMOTED_HELDOUT_SAMPLES (48 training sources), which ``main()`` symlinks into
+the same subdir so ``assemble_branch``'s glob picks them up. No simulated rows. Determinism: no
+randomness anywhere in the ingestion path.
 Coding rules: no type hints, Google docstrings, ``print()``, ``gcloud`` (macOS).
 """
 
@@ -45,6 +47,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -62,6 +65,11 @@ EXPANSIONHUNTER_BW2_REPO = os.path.expanduser("~/code/ExpansionHunter-bw2")
 # tied to a specific EH run, so it cannot go stale relative to one. See
 # `_load_truth_from_genotypes_tsv`.
 TRUTH_CATALOG_ROOT = "gs://str-truth-set-v2/filter_vcf_v2"
+# The truth set exists once per catalog it was genotyped against, under
+# {TRUTH_CATALOG_ROOT}/{sample}/{TRUTH_CATALOG_NAME}_genotypes/. combined_321_catalog covers every sample in
+# PROMOTED_HELDOUT_SAMPLES and heldout.SAMPLES; combined_43_catalog only covers the 43-sample short-read
+# benchmark panel plus HG002 and CHM1_CHM13.
+TRUTH_CATALOG_NAME = "combined_321_catalog"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Single source variant: the optimized-streaming run deployed in production. Its QuickGenotype
@@ -80,21 +88,53 @@ COMBOS = [
     ("CHM1_CHM13", "46x"),
 ]
 
-# 43-held-out-HPRC samples promoted into the training pool for ancestry/sex diversity at large
-# (sparse, single-genome-dominated) allele sizes -- HG002+CHM1_CHM13 alone left the full_nonspanning
-# tail overfit to 2 genomes (helps in-sample, hurts on held-out). Picked to cover every population
-# present in the 43-sample panel and balance sex (7 male / 7 female including HG002): NA12878 (CEU),
-# HG03492 (PJL), HG00621 (CHS), HG02080 (KHV), HG01106 (PUR), HG01258 (CLM), HG01928 (PEL),
-# HG02055 (ACB), HG02622 (GWD), HG03453 (MSL), HG03125 (ESN), NA18906 (YRI), NA20129 (ASW). Their
-# per-allele parquets are already built by ``heldout.build_sample`` under ``data_eval_43/real_43/``;
-# ``main()`` symlinks them into the training subdir rather than re-downloading. Removed from
+# Single-coverage 1kGP/HPRC samples that join HG002+CHM1_CHM13 in the training pool, for ancestry/sex
+# diversity at large (sparse, single-genome-dominated) allele sizes -- HG002+CHM1_CHM13 alone left
+# the full_nonspanning tail overfit to 2 genomes (helps in-sample, hurts on held-out). Their per-allele
+# parquets are built by ``heldout.build_sample`` under ``data_eval_43/real_43/`` (historical dir name)
+# and ``main()`` symlinks them into the training subdir rather than re-downloading. Disjoint from
 # ``heldout.SAMPLES`` so they are not double-counted in the external validation set.
+#
+# Panel as of 2026-09-25: 44 samples, so the pool is 48 sources with the 4 COMBOS. Drawn from the 138
+# 1kGP samples that have a DipCall high-confidence BED, a truth-genotypes TSV and a Broad short-read
+# CRAM (plus NA12878, whose short reads live under tool_results instead of the 1kGP CRAM list):
+#   - the first 13 are the original promotion (2026-07), one per population of the 43-sample HPRC
+#     panel: NA12878 (CEU), HG03492 (PJL), HG00621 (CHS), HG02080 (KHV), HG01106 (PUR),
+#     HG01258 (CLM), HG01928 (PEL), HG02055 (ACB), HG02622 (GWD), HG03453 (MSL), HG03125 (ESN),
+#     NA18906 (YRI), NA20129 (ASW);
+#   - the next 31 were added deterministically for diversity: repeatedly take the 1kGP population
+#     with the fewest training samples (ties: the larger candidate pool, then name), within it the
+#     sex with fewer training samples (HG002 counted as male), and within that the sample with the
+#     most autosomal high-confidence bases (assembly-derived sex, chrY >= 500 kb = male). Excluded
+#     from the candidates: the 30 previously held-out samples (kept held out so old and new models
+#     stay comparable), HG00512 (father of held-out HG00514), and the ten samples of the pOk
+#     fast-path diagnosis cohort (HG00738, HG01940, HG01975, HG01993, HG02004, HG02015, HG02074,
+#     HG02293, HG03654, HG03942), so the diagnosed defects can be re-measured on them after
+#     retraining. Also excluded, from training and held-out alike (updated 2026-09-28), are the
+#     samples in str-truth-set-v2's filter_vcfs_v2/samples_excluded_from_downstream_analyses.tsv:
+#     HGSVC2 males whose DipCall truth lost almost all of chrX/chrY because their h1/h2 assemblies
+#     are not split into X- and Y-carrying haplotypes (7 of them are among the 138: HG00512, HG01505,
+#     HG02011, HG02492, HG03065, HG03371, HG03732, NA19650). Result: 15 populations are represented
+#     (1 to 4 samples each; IBS, ITU and MXL had only excluded samples), 23 female / 22 male
+#     including HG002.
+# The 31 additions have no EHv5-bw2-optimized run under GCS_ROOT yet: each needs
+# ``<sample>/illumina/EHv5-bw2-optimized/<cov>_coverage/json/`` before ``heldout.build_sample`` can
+# ingest it.
 PROMOTED_HELDOUT_SAMPLES = (
     "NA12878", "HG03492", "HG00621", "HG02080", "HG01106", "HG01258", "HG01928",
     "HG02055", "HG02622", "HG03453", "HG03125", "NA18906", "NA20129",
+    "HG03804", "HG04228", "HG02615", "HG02135", "HG03710", "HG03927", "HG00408",
+    "HG01433", "HG02273", "HG01192", "HG02451", "HG03688", "NA19983", "NA12329",
+    "HG02965", "HG02647", "HG02129", "HG03239", "HG03816", "HG00658", "HG01346",
+    "HG01934", "HG01074", "HG01960", "HG04204", "HG02841", "HG02071", "HG03669",
+    "HG03831", "HG00706", "HG01150",
 )
 
 VALID_CHROMS = set(str(i) for i in range(1, 23)) | {"X", "Y"}
+
+# The EH-build stamp, read straight out of the decompressed JSON bytes (see _json_eh_version).
+_VERSION_RE = re.compile(rb'"Version"\s*:\s*"([^"]*)"')
+_VERSION_CARRY_BYTES = 256  # comfortably longer than the longest possible key/value spelling
 
 
 def _combo_dir(sample, variant, cov_label):
@@ -102,7 +142,8 @@ def _combo_dir(sample, variant, cov_label):
 
 
 def _truth_genotypes_tsv_remote(sample):
-    return "%s/%s/%s.tandem_repeat_genotypes.tsv.gz" % (TRUTH_CATALOG_ROOT, sample, sample)
+    return "%s/%s/%s_genotypes/%s.tandem_repeat_genotypes.tsv.gz" % (
+        TRUTH_CATALOG_ROOT, sample, TRUTH_CATALOG_NAME, sample)
 
 
 def _list_json_inputs(sample, variant, cov_label):
@@ -136,33 +177,41 @@ def _download(remote_paths, dest_dir):
     return locals_
 
 
-def _gcs_md5(remote_path):
-    """Returns the base64 md5 hash GCS reports for ``remote_path`` via ``gsutil stat``, or None."""
-    result = subprocess.run(["gsutil", "stat", remote_path], capture_output=True, text=True)
-    for line in result.stdout.splitlines():
-        if line.strip().startswith("Hash (md5):"):
-            return line.split(":", 1)[1].strip()
-    return None
+def _gcs_stat(remote_path):
+    """Returns ``(md5, mtime)`` for a cloud object from ONE ``gsutil stat`` call.
 
+    Both signals come out of the same output, and ``_check_freshness`` needs both for every cached
+    file, so statting twice doubled the network round-trips for no gain (~180 process launches on a
+    fully-cached held-out build where ~90 suffice).
 
-def _gcs_mtime(remote_path):
-    """Returns the cloud object's last-modified time (Unix timestamp) via ``gsutil stat``, or None.
+    ``md5`` is the base64 hash GCS reports, or None if absent. ``mtime`` is a Unix timestamp,
+    preferring the object's ``Update time`` and falling back to ``Creation time`` (an object never
+    updated since upload reports only the latter), or None if neither parses.
 
-    Prefers the object's ``Update time`` and falls back to ``Creation time`` (an object never updated
-    since upload reports only the latter). Used to decide whether a local copy is older than the bucket
-    version and must be re-downloaded.
+    A FAILED stat (no network, no credentials, object gone) also yields ``(None, None)``, which
+    ``_check_freshness`` cannot distinguish from "unchanged" -- it keeps the local copy. That is the
+    right default for a cache check (an unreachable bucket must not delete local data), but it is
+    silent, so the failure is printed here.
     """
     result = subprocess.run(["gsutil", "stat", remote_path], capture_output=True, text=True)
-    times = {}
+    if result.returncode != 0:
+        print("    WARNING: `gsutil stat %s` failed (%s); keeping the local copy unchecked"
+              % (remote_path, (result.stderr or "").strip().splitlines()[-1:] or "no stderr"),
+              flush=True)
+        return None, None
+    md5, times = None, {}
     for line in result.stdout.splitlines():
         s = line.strip()
+        if s.startswith("Hash (md5):"):
+            md5 = s.split(":", 1)[1].strip()
+            continue
         for key in ("Update time:", "Creation time:"):
             if s.startswith(key):
                 try:
                     times[key] = email.utils.parsedate_to_datetime(s.split(":", 1)[1].strip()).timestamp()
                 except (TypeError, ValueError, IndexError):
                     pass
-    return times.get("Update time:", times.get("Creation time:"))
+    return md5, times.get("Update time:", times.get("Creation time:"))
 
 
 def _local_md5(path):
@@ -190,11 +239,58 @@ def _json_eh_version(path):
     Current builds stamp it in ``RunInfo.Version``; older builds put it in ``SampleParameters.Version``
     (checked as a fallback). Absent entirely on builds that predate the stamping (before 2026-07-01);
     ``"unknown"`` if the build couldn't capture its own commit sha (e.g. a Docker build without
-    ``.git`` in the build context)."""
+    ``.git`` in the build context).
+
+    Scans the decompressed bytes for the key instead of parsing the JSON: these shards are ~90 MB
+    gzipped and ``json.load`` cost 9 seconds and 3.3 GB of RSS to retrieve a 7-character string,
+    which the freshness check pays once per shard on every run. The LAST match wins, which reproduces
+    the RunInfo-over-SampleParameters preference (ExpansionHunter writes ``SampleParameters`` at the
+    head of the file and ``RunInfo`` at the end) while still finding the fallback in an old shard
+    that has only ``SampleParameters``. ``Version`` appears nowhere else in EH's output.
+    """
     op = gzip.open if path.endswith(".gz") else open
-    with op(path, "rt") as f:
-        d = json.load(f)
-    return d.get("RunInfo", {}).get("Version") or d.get("SampleParameters", {}).get("Version")
+    found, carry = None, b""
+    with op(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            block = carry + chunk
+            matches = _VERSION_RE.findall(block)
+            if matches:
+                found = matches[-1].decode()
+            # Keep a tail long enough that a key/value split across the chunk boundary still matches.
+            carry = block[-_VERSION_CARRY_BYTES:]
+    return found
+
+
+def assert_eh_build_matches(desc, labelled_json_paths):
+    """Exits nonzero if any EH output JSON was produced by a build other than ExpansionHunter-bw2 HEAD.
+
+    ``labelled_json_paths`` is a list of ``(label, path)``. A mismatch means the calls in that JSON came
+    from a different EH build, which matters beyond provenance: a build can change what an existing
+    field MEANS without changing its name (the ``genotype_quality_model_update`` branch redefined
+    ``LocusResults.Coverage`` for the optimized-streaming fast path, and ``coverage`` is a model
+    feature). No re-download fixes that -- EH has to be re-run -- so this is a hard refusal.
+
+    Skipped entirely when the ExpansionHunter-bw2 checkout is not present locally (``_bw2_head_sha``
+    returns None), since there is then nothing to compare against.
+
+    NOTE: the sha is stamped into the binary by CMake at CONFIGURE time, so a rebuild inside an
+    existing build directory reports whatever sha that directory was configured with. Re-run ``cmake``
+    before generating JSONs meant for training.
+    """
+    head = _bw2_head_sha()
+    if not head:
+        return
+    stale = [(label, _json_eh_version(path)) for label, path in labelled_json_paths]
+    stale = [(label, version) for label, version in stale if version != head]
+    if not stale:
+        return
+    print("\n=== STALE EH BUILD: %s ===" % desc)
+    for label, version in stale:
+        print("  - %s: produced by EH build %r, current ExpansionHunter-bw2 HEAD is %r"
+              % (label, version, head))
+    print("  refusing to proceed -- regenerate these JSONs with the current ExpansionHunter-bw2 "
+          "build, or remove the local ExpansionHunter-bw2 checkout to skip this check.")
+    sys.exit(1)
 
 
 def _check_freshness(desc, sources):
@@ -209,58 +305,105 @@ def _check_freshness(desc, sources):
        DELETED here so the subsequent ``_download`` re-fetches (overwrites with) the current bucket
        version -- an automatic update, no prompt. (Re-downloading a file also means its about-to-be-
        overwritten build sha is not judged below.)
-    2. EH-build staleness (labels starting with ``"json"``, and only for files being KEPT -- not the
-       ones already scheduled for re-download): does the JSON's stamped build commit sha match the
-       local ExpansionHunter-bw2 HEAD? A mismatch means the calls were produced by a different EH
-       build; re-downloading the same object can't fix that (it requires re-running EH externally), so
-       this is a hard refusal (exit nonzero). Skipped if that checkout isn't present locally.
+    2. EH-build staleness, via ``assert_eh_build_matches`` (labels starting with ``"json"``, and only
+       for files being KEPT -- not the ones already scheduled for re-download, whose sha is about to
+       be overwritten). Files that do NOT exist locally yet are skipped here and checked by the caller
+       AFTER ``_download``, since a first download can just as easily land a JSON from the wrong EH
+       build as a cached one can.
 
-    Returns the number of stale local files removed for re-download (0 if none), so callers can force a
-    dependent rebuild when the inputs were refreshed.
+    Returns the number of stale local files removed for re-download (0 if none). No caller needs it
+    to trigger a rebuild -- deleting the local file already makes ``_parquet_reusable`` fail its
+    "every upstream still exists" test -- so it is reported for logging and for the tests that assert
+    on the refresh decision.
     """
-    redownload, build_stale = [], []
+    redownload, keep_json = [], []
     for label, remote, local in sources:
         if not os.path.exists(local):
             continue
-        remote_md5 = _gcs_md5(remote)
-        cloud_mtime = _gcs_mtime(remote)
+        remote_md5, cloud_mtime = _gcs_stat(remote)
         if (remote_md5 and remote_md5 != _local_md5(local)) or \
                 (cloud_mtime is not None and cloud_mtime > os.path.getmtime(local)):
             redownload.append((label, local))
             continue  # being overwritten -- don't judge its stale build sha
         if label.startswith("json"):
-            version, head = _json_eh_version(local), _bw2_head_sha()
-            if head and version != head:
-                build_stale.append((label, version, head))
+            keep_json.append((label, local))
     if redownload:
         print("  refreshing %d stale local file(s) (bucket newer or content changed): %s"
               % (len(redownload), ", ".join(l for _, l in redownload)), flush=True)
         for _, local in redownload:
             os.remove(local)
-    if build_stale:
-        print("\n=== STALE EH BUILD: %s ===" % desc)
-        for label, version, head in build_stale:
-            print("  - %s: produced by EH build %r, current ExpansionHunter-bw2 HEAD is %r"
-                  % (label, version, head))
-        print("  refusing to proceed -- regenerate these JSONs with the current ExpansionHunter-bw2 "
-              "build, or remove the local ExpansionHunter-bw2 checkout to skip this check.")
-        sys.exit(1)
+    assert_eh_build_matches(desc, keep_json)
     return len(redownload)
+
+
+def rebuild_command_for(path):
+    """Returns the command that actually rebuilds ``path``.
+
+    The two builders write to different trees and neither can rebuild the other's output, so a
+    message that names one command unconditionally sends the reader to a no-op: ``heldout.py`` writes
+    only ``<data_eval_43>/real_43/<sample>.parquet``, while the training-combo parquets under
+    ``data/<SOURCE_SUBDIR>/`` come only from ``dataset.py``.
+    """
+    if os.path.basename(os.path.dirname(os.path.realpath(path))) == "real_43":
+        return ("python3 heldout.py --build-only --force --samples %s"
+                % os.path.splitext(os.path.basename(path))[0])
+    return "python3 dataset.py --force"
+
+
+def parquet_contract_complaint(path):
+    """Returns why a cached parquet no longer matches the current feature contract, or None if it does.
+
+    Three things go stale without any upstream file changing, so an mtime comparison cannot see them:
+
+    - a column the contract has since gained (``features.missing_feature_columns``),
+    - ``has_own_quality_metrics``, which is not a feature but decides which rows
+      ``label_and_filter`` keeps, so a parquet without it silently trains on alleles
+      ExpansionHunter never scores, and
+    - float32 feature columns, left by the pipeline that downcast every float64 column before
+      writing. ``features.build_matrix`` now refuses those, because the C++ scorer feeds the model
+      full doubles and training on quantized values puts tree thresholds ~1 float32 ULP away from
+      what inference sees.
+
+    All three are rebuild-able, so reporting them here lets the normal (no ``--force``) run fix itself
+    instead of failing several steps later with an assertion that names neither the file nor the fix.
+    """
+    import pyarrow.parquet as pq  # local: only the parquet-facing callers need this dependency
+
+    missing = features.missing_feature_columns([path]).get(path)
+    if missing:
+        return "missing feature column(s) %s" % missing
+    if "has_own_quality_metrics" not in set(pq.ParquetFile(path).schema.names):
+        return ("missing the has_own_quality_metrics column, so the second genotype copy of every "
+                "homozygous call (an allele ExpansionHunter never scores) cannot be filtered out")
+    contract = set(features.FULL_FEATURES)
+    narrowed = sorted(f.name for f in pq.ParquetFile(path).schema_arrow
+                      if f.name in contract and str(f.type) == "float")
+    if narrowed:
+        return ("%d feature column(s) are float32 (e.g. %s); training requires float64 end to end"
+                % (len(narrowed), ", ".join(narrowed[:3])))
+    return None
 
 
 def _parquet_reusable(out_path, upstream_locals, force):
     """Returns True iff the cached per-combo/per-sample parquet can be reused as-is.
 
     Reuse requires: not ``force``, the parquet exists, every upstream local source (EH JSON shards +
-    truth TSV) still exists, and the parquet is at least as new as all of them. If ``_check_freshness``
-    just deleted a stale upstream (so it is missing / about to be re-downloaded with a newer mtime), or
-    an upstream is otherwise newer, the parquet is rebuilt rather than silently reused.
+    truth TSV) still exists, the parquet is at least as new as all of them, AND it still satisfies the
+    current feature contract (``parquet_contract_complaint``). If ``_check_freshness`` just deleted a
+    stale upstream (so it is missing / about to be re-downloaded with a newer mtime), or an upstream is
+    otherwise newer, the parquet is rebuilt rather than silently reused.
     """
     if force or not os.path.exists(out_path):
         return False
     if not all(os.path.exists(u) for u in upstream_locals):
         return False
-    return os.path.getmtime(out_path) >= max((os.path.getmtime(u) for u in upstream_locals), default=0)
+    if os.path.getmtime(out_path) < max((os.path.getmtime(u) for u in upstream_locals), default=0):
+        return False
+    complaint = parquet_contract_complaint(out_path)
+    if complaint:
+        print("    rebuilding %s: %s" % (os.path.basename(out_path), complaint))
+        return False
+    return True
 
 
 def _load_truth_from_genotypes_tsv(tsv_path):
@@ -295,6 +438,9 @@ def _load_truth_from_genotypes_tsv(tsv_path):
     # EH-catalog-generation filters (convert_truth_set_to_variant_catalogs.py): primary contigs only,
     # and variant (non-hom-ref) loci with parseable repeat counts. NaN ref/short/long -> not parseable.
     n0 = len(df)
+    # ANALYSIS_OK[imputation]: nothing is imputed -- errors="coerce" turns an unparseable repeat
+    # count into NaN precisely so the `parseable` mask below drops that locus, mirroring the EH
+    # catalog-generation filter. No NaN survives into any downstream value.
     ref = pd.to_numeric(df["NumRepeatsInReference"], errors="coerce")
     short_n = pd.to_numeric(df["NumRepeatsShortAllele"], errors="coerce")
     long_n = pd.to_numeric(df["NumRepeatsLongAllele"], errors="coerce")
@@ -451,6 +597,10 @@ def build_combo(variant, subdir, sample, cov_label, data_dir, force):
     print("    %d JSON file(s) + 1 truth TSV" % len(json_remote))
     json_local = _download(json_remote, dl_dir)
     genotypes_tsv_local = _download([genotypes_tsv_remote], genotypes_dl_dir)[0]
+    # _check_freshness could only judge shards that already existed locally. Anything just fetched
+    # (a first download, or a refreshed object) is judged here, before it is parsed into features.
+    assert_eh_build_matches("%s %s" % (sample, cov_label),
+                            [("json shard %d" % i, p) for i, p in enumerate(json_local)])
 
     rows = []
     for path in json_local:
@@ -459,8 +609,10 @@ def build_combo(variant, subdir, sample, cov_label, data_dir, force):
     tsv_df = _load_truth_from_genotypes_tsv(genotypes_tsv_local)
     merged = _join_truth(json_df, tsv_df, "%s %s" % (sample, cov_label))
     merged = merged.drop(columns=["sample_id"])
-    for c in merged.select_dtypes("float64").columns:
-        merged[c] = merged[c].astype("float32")
+    # Feature columns stay float64 all the way to fit(). Downcasting here used to halve the parquet
+    # and frame size, but it permanently quantized every value: sklearn's HistGradientBoosting upcasts
+    # back to float64 internally (X_DTYPE) and bins to uint8, so the downcast bought nothing at fit
+    # time while forcing the C++ scorer to reproduce it exactly. See features.build_matrix.
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     merged.to_parquet(out_path, index=False)
@@ -481,8 +633,10 @@ def _chrom_from_locus(locus_id):
 def label_and_filter(df):
     """Adds ``chrom`` + the q/direction labels and drops unusable rows.
 
-    Drops chrM/unknown contigs, negative-control loci, missing/non-positive ``eh``/``true``, and
-    missing motif, then derives the labels + genotyping-regime routing via ``features.add_labels``.
+    Drops chrM/unknown contigs, negative-control loci, missing/non-positive ``eh``/``true``, missing
+    motif, and alleles ExpansionHunter never scores (``has_own_quality_metrics`` False -- the second
+    genotype copy of a homozygous call), then derives the labels + genotyping-regime routing via
+    ``features.add_labels``.
     Shared by the training-pool assembly and the held-out-sample benchmark so both apply identical
     filtering. Does NOT filter on truth repeat purity -- impure loci are kept in both training and
     eval (purity is available to the report's opt-in stratification pill via ``accuracy_by_size.py``
@@ -500,13 +654,25 @@ def label_and_filter(df):
     motif = pd.to_numeric(df["motif_size"], errors="coerce")
     negative = df["is_negative_locus"].fillna(False).astype(bool)
 
+    # ExpansionHunter scores the model once per AlleleQualityMetrics entry, and emits only ONE entry
+    # for a homozygous or hemizygous call. The extractor still yields one row per genotype copy (the
+    # accuracy-by-size report's truth join needs two rows per locus), so a hom call's rank-1 row is a
+    # row inference can never produce: same features as its rank-0 twin, but joined to the LONG truth
+    # allele. Training and isotonic calibration must not see them. Parquets built before this column
+    # existed have no such marker, so they are left alone rather than silently half-filtered -- the
+    # freshness guards catch those separately.
+    no_own_metrics = (~df["has_own_quality_metrics"].fillna(True).astype(bool)
+                      if "has_own_quality_metrics" in df.columns
+                      else pd.Series(False, index=df.index))
+
     keep = pd.Series(True, index=df.index)
     drops = {}
     for name, bad in (("chrM_or_unknown_contig", df["chrom"].isna()),
                       ("negative_control_locus", negative),
                       ("missing_eh_or_true", eh.isna() | true.isna()),
                       ("nonpositive_eh_or_true", (eh <= 0) | (true <= 0)),
-                      ("missing_motif_size", motif.isna() | (motif <= 0))):
+                      ("missing_motif_size", motif.isna() | (motif <= 0)),
+                      ("no_own_quality_metrics", no_own_metrics)):
         bad = bad & keep
         drops[name] = int(bad.sum())
         keep &= ~bad
@@ -517,12 +683,35 @@ def label_and_filter(df):
     return df, drops
 
 
+def _assert_parts_share_feature_contract(parts):
+    """Raises if any per-combo parquet no longer matches the current extractor/feature contract.
+
+    ``assemble_branch`` concatenates these parts, and ``pd.concat`` silently fills a column that
+    only some parts carry with NaN -- so a part built before a ``features.py`` feature addition
+    would contribute all-NaN values for the new feature instead of failing. Checking up front turns
+    that into an actionable error naming the stale parquets.
+
+    Uses the same ``parquet_contract_complaint`` as ``_parquet_reusable`` and the eval path, so all
+    three agree on what "off-contract" means: a missing feature column, a missing
+    ``has_own_quality_metrics``, or float32 feature storage. The rebuild command is chosen per path,
+    since ``dataset.py`` and ``heldout.py`` each write only their own tree.
+    """
+    stale = {p: c for p, c in ((p, parquet_contract_complaint(p)) for p in parts) if c}
+    if stale:
+        raise RuntimeError(
+            "%d per-combo parquet(s) no longer match the current feature contract and would "
+            "contribute all-NaN or quantized columns if concatenated: %s."
+            % (len(stale), "; ".join("%s %s -- rebuild with: %s" % (p, c, rebuild_command_for(p))
+                                     for p, c in sorted(stale.items()))))
+
+
 def assemble_branch(data_dir, branch, subdir):
     """Assembles one branch's per-combo parquets, labels + filters, writes data/parquet/<branch>."""
     parts = sorted(glob.glob(os.path.join(data_dir, subdir, "*.parquet")))
     if not parts:
         print("\n%s branch: no per-combo parquets in %s/ -- skipping" % (branch, subdir))
         return
+    _assert_parts_share_feature_contract(parts)
     df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
     # Both branches are carved from the same optimized-streaming run by genotyping_branch:
     # quick = fast-path QuickGenotype rows; full = full-genotyper fallback rows (the deploy-matched
@@ -547,32 +736,54 @@ def assemble_branch(data_dir, branch, subdir):
 
 
 def _link_promoted_heldout_samples(data_dir, force):
-    """Symlinks each ``PROMOTED_HELDOUT_SAMPLES`` parquet into the training subdir.
+    """Syncs the training subdir's promoted-sample symlinks to ``PROMOTED_HELDOUT_SAMPLES``.
 
-    Builds the parquet via ``heldout.build_sample`` under ``data_eval_43/real_43/`` first if it
-    isn't already there (same schema as a per-combo training parquet), then reuses it instead of
-    re-downloading; ``assemble_branch`` picks it up via its ``*.parquet`` glob. Imports ``heldout``
-    lazily here (not at module level) since ``heldout`` itself imports ``dataset``. ``force`` is
-    threaded through from ``main()`` so ``--force`` also rebuilds promoted-sample parquets instead
-    of silently reusing stale ones.
+    Builds each promoted sample's parquet via ``heldout.build_sample`` under ``data_eval_43/real_43/``
+    if it isn't already there (same schema as a per-combo training parquet), then symlinks it into the
+    training subdir instead of re-downloading; ``assemble_branch`` picks it up via its ``*.parquet``
+    glob. Imports ``heldout`` lazily here (not at module level) since ``heldout`` itself imports
+    ``dataset``. ``force`` is threaded through from ``main()`` so ``--force`` also rebuilds
+    promoted-sample parquets instead of silently reusing stale ones.
+
+    Symlinks for samples no longer in the tuple are REMOVED. ``PROMOTED_HELDOUT_SAMPLES`` is a tuning
+    knob, and de-promoting a sample puts it back in ``heldout.SAMPLES``; leaving its symlink behind
+    would keep feeding it to training via that glob while the held-out benchmark scores it, which is
+    train/eval leakage that no test catches (``dataset_tests`` compares the two Python lists, not the
+    filesystem). Only symlinks are removed -- the real per-combo parquets are never touched.
     """
     import heldout
+    subdir = os.path.join(data_dir, SOURCE_SUBDIR)
     for sample in PROMOTED_HELDOUT_SAMPLES:
         src = heldout.build_sample(sample, os.path.join(HERE, "data_eval_43"), force=force)
-        dst = os.path.join(data_dir, SOURCE_SUBDIR, "%s.parquet" % sample)
+        dst = os.path.join(subdir, "%s.parquet" % sample)
         if not os.path.exists(dst):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst)
+    orphaned = [p for p in sorted(glob.glob(os.path.join(subdir, "*.parquet")))
+                if os.path.islink(p)
+                and os.path.splitext(os.path.basename(p))[0] not in PROMOTED_HELDOUT_SAMPLES]
+    for path in orphaned:
+        os.remove(path)
+    if orphaned:
+        print("  unlinked %d de-promoted sample(s) from the training pool: %s"
+              % (len(orphaned), ", ".join(os.path.basename(p) for p in orphaned)))
 
 
 def _upstream_source_files(data_dir):
-    """Returns the raw upstream files the training-pool parquets derive from: the EH JSON shards and
-    the truth-genotypes TSVs for the training combos (under ``data_dir/<SOURCE_SUBDIR>/_downloads``) and
-    for the promoted held-out samples (under ``data_eval_43/real_43/_downloads/<sample>``). Only the
-    promoted samples' download dirs are scanned there -- the other held-out samples never feed the
-    training pool, so a newer download of one of them must not flag the pool as stale.
+    """Returns everything the assembled branch parquets derive from, for the freshness comparison.
+
+    Two layers, because ``assemble_branch`` reads the per-combo parquets and those read the downloads:
+
+    - the per-combo parquets themselves (``data_dir/<SOURCE_SUBDIR>/*.parquet``, promoted-sample
+      symlinks included). Rebuilding one of these without re-running ``assemble_branch`` leaves the
+      branch parquet older than its own direct input, which no JSON/TSV mtime reflects.
+    - the raw EH JSON shards and truth-genotypes TSVs for the training combos (under
+      ``data_dir/<SOURCE_SUBDIR>/_downloads``) and for the promoted held-out samples (under
+      ``data_eval_43/real_43/_downloads/<sample>``). Only the promoted samples' download dirs are
+      scanned there -- the other held-out samples never feed the training pool, so a newer download
+      of one of them must not flag the pool as stale.
     """
-    files = []
+    files = glob.glob(os.path.join(data_dir, SOURCE_SUBDIR, "*.parquet"))
     combo_dl = os.path.join(data_dir, SOURCE_SUBDIR, "_downloads")
     files += glob.glob(os.path.join(combo_dl, "**", "*.json.gz"), recursive=True)
     files += glob.glob(os.path.join(combo_dl, "**", "*.tandem_repeat_genotypes.tsv.gz"), recursive=True)
@@ -584,13 +795,22 @@ def _upstream_source_files(data_dir):
 
 
 def assert_parquets_up_to_date(data_dir, branches=("quick", "full")):
-    """Exits nonzero if a branch parquet is missing or older than any upstream JSON/TSV it derives from.
+    """Exits nonzero if a branch parquet is missing, older than an upstream JSON/TSV, or off-contract.
 
-    A guard for the downstream train/report steps: catches reusing a parquet whose source EH JSON or
-    truth-genotypes TSV has been re-downloaded (or the parquet was never rebuilt after a code change)
-    since it was assembled. Compares file mtimes -- an upstream file newer than the parquet means the
-    parquet is stale. Raises ``SystemExit`` with an actionable message rather than silently training on
-    stale data.
+    A guard for the downstream train/report steps, covering two kinds of staleness:
+
+    - **Refreshed inputs**: an upstream file whose mtime is newer than the branch parquet -- an EH
+      JSON or truth-genotypes TSV that was re-downloaded, or a per-combo parquet that was rebuilt
+      (see ``_upstream_source_files``) -- after the branch parquet was assembled.
+    - **Contract drift**: a parquet missing a feature column the contract has since gained, or holding
+      float32 feature columns from the old downcasting pipeline (``parquet_contract_complaint``).
+
+    What it does NOT catch is a changed FORMULA for a column that already exists: editing
+    ``eh_json.py``'s ``flanking_frac`` expression touches no upstream file's mtime and no column name,
+    so a parquet built by the old code still passes. Re-run ``dataset.py --force`` yourself after
+    changing how an existing feature is computed.
+
+    Raises ``SystemExit`` with an actionable message rather than silently training on stale data.
     """
     upstream = _upstream_source_files(data_dir)
     for branch in branches:
@@ -601,10 +821,15 @@ def assert_parquets_up_to_date(data_dir, branches=("quick", "full")):
         pq_mtime = os.path.getmtime(parquet)
         newer = sorted(f for f in upstream if os.path.getmtime(f) > pq_mtime)
         if newer:
-            sys.exit("ERROR: %s is STALE -- %d upstream JSON/TSV file(s) are newer than it (e.g. %s). "
+            sys.exit("ERROR: %s is STALE -- %d upstream file(s) are newer than it (e.g. %s). "
                      "Re-run `python3 dataset.py --data-dir %s --force` to rebuild it."
                      % (parquet, len(newer), newer[0], data_dir))
-    print("  parquet freshness OK: %s newer than all %d upstream JSON/TSV source file(s)"
+        complaint = parquet_contract_complaint(parquet)
+        if complaint:
+            sys.exit("ERROR: %s does not match the current feature contract -- %s. Re-run "
+                     "`python3 dataset.py --data-dir %s --force` to rebuild it."
+                     % (parquet, complaint, data_dir))
+    print("  parquet freshness OK: %s newer than all %d upstream source file(s)"
           % (", ".join(branches), len(upstream)), flush=True)
 
 

@@ -103,6 +103,11 @@ def _fake_results():
             "direction": {"log_loss": 0.3, "too_long_auc": 0.9, "too_short_auc": 0.85, "ece": 0.02,
                          "p_ok_accuracy": 0.88, "confusion": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]},
             "importance": [("eh", 0.9, 0.01), ("depth", 0.5, 0.02)],
+            "importance_direction": [("depth", 0.7, 0.03), ("eh", 0.2, 0.01)],
+            "ablation": [{"k": 0, "feature": "(raw EH)", "mae": 2.0},
+                         {"k": 1, "feature": "eh", "mae": 1.4}],
+            "dir_ablation": [{"k": 0, "feature": "(class prior)", "log_loss": 1.0},
+                             {"k": 1, "feature": "depth", "log_loss": 0.6}],
         })
     return out
 
@@ -113,6 +118,28 @@ class TableBuildersTest(unittest.TestCase):
         self.assertIn("#1", html)
         self.assertIn("eh", html)
         self.assertLess(html.index(">eh<"), html.index(">depth<"))  # #1 (eh) listed before #2 (depth)
+
+    def test_feature_glossary_lists_every_current_feature_even_if_the_cache_is_short(self):
+        # A ranking cached before a feature was added used to silently omit that feature's row --
+        # the published report shipped 24 rows while the contract already had 29.
+        html = R._feature_glossary(_fake_results())   # its ranking covers only eh + depth
+        for feat in features.FULL_FEATURES:
+            self.assertIn(">%s<" % feat, html, feat)
+        self.assertIn("#-", html)                     # unranked features are marked, not dropped
+        self.assertLess(html.index(">eh<"), html.index(">coverage<"))  # ranked ones still sort first
+
+    def test_stale_cache_warning_names_the_missing_features(self):
+        note = R._stale_contract_warning(_fake_results())
+        self.assertIn("Stale cache", note)
+        self.assertIn("coverage", note)
+
+    def test_no_stale_warning_when_the_ranking_covers_the_contract(self):
+        full = [(f, 1.0, 0.0) for f in features.FULL_FEATURES]
+        quick = [(f, 1.0, 0.0) for f in features.QUICK_FEATURES]
+        results = [dict(r, importance=(quick if r["genotyping_regime"] == features.GENOTYPING_REGIME_QUICK
+                                       else full))
+                   for r in _fake_results()]
+        self.assertEqual(R._stale_contract_warning(results), "")
 
     def test_eh_output_glossary_lists_every_field(self):
         html = R._eh_output_glossary()
@@ -203,6 +230,141 @@ class PlotViolinsTest(unittest.TestCase):
             self.assertTrue(os.path.exists(out_png))
 
 
+class DirAblationTest(unittest.TestCase):
+    """The direction-head ablation's pure pieces (the fitting loop itself needs a real pool)."""
+
+    def test_scores_drop_the_non_plottable_entries(self):
+        y = np.array([0, 0, 1, 2, 1, 0, 2, 0])
+        proba = np.full((y.size, 3), 1.0 / 3)
+        scored = R._dir_ablation_scores(y, proba)
+        self.assertIn("log_loss", scored)
+        self.assertIn("too_short_ap", scored)
+        # "n" and the 3x3 confusion matrix are per-k noise in a curve, not something to plot vs k.
+        self.assertNotIn("confusion", scored)
+        self.assertNotIn("n", scored)
+
+    def test_uniform_proba_log_loss_is_log_three(self):
+        y = np.array([0, 1, 2])
+        scored = R._dir_ablation_scores(y, np.full((3, 3), 1.0 / 3))
+        self.assertAlmostEqual(scored["log_loss"], float(np.log(3)), places=6)
+
+    def test_plot_returns_false_and_writes_nothing_without_a_curve(self):
+        cached_without_curve = [{"genotyping_regime": r} for r in features.GENOTYPING_REGIMES]
+        with tempfile.TemporaryDirectory() as d:
+            out_png = os.path.join(d, "dir_ablation.png")
+            self.assertFalse(R.plot_dir_ablation(cached_without_curve, out_png))
+            self.assertFalse(os.path.exists(out_png))
+
+    def test_plot_draws_when_every_regime_has_a_curve(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_png = os.path.join(d, "dir_ablation.png")
+            self.assertTrue(R.plot_dir_ablation(_fake_results(), out_png))
+            self.assertTrue(os.path.exists(out_png))
+
+
+class DirImportanceTest(unittest.TestCase):
+    """Direct coverage of the in-place column shuffle in ``_dir_importance``."""
+
+    def _fitted_two_signals(self):
+        """Fits a head where ``depth`` and ``coverage`` BOTH carry signal, ``noise`` none.
+
+        A column that is shuffled and not restored would corrupt every feature measured after it, so
+        the later informative feature would score near zero. One informative feature cannot show
+        that; two, with the noise column last, can.
+        """
+        import pandas as pd
+        import model as M
+        rng = np.random.default_rng(1)
+        n = 4000
+        X = pd.DataFrame({"depth": rng.normal(size=n), "coverage": rng.normal(size=n),
+                          "noise": rng.normal(size=n)})
+        signal = X["depth"] + X["coverage"]
+        y = np.where(signal > 0.7, features.TOO_LONG,
+                     np.where(signal < -0.7, features.TOO_SHORT, features.OK)).astype(int)
+        half = n // 2
+        dmodel = M.train_direction(X.iloc[:half], y[:half], X.iloc[half:], y[half:])
+        return dmodel, X.iloc[half:].reset_index(drop=True), y[half:]
+
+    def test_a_shuffled_column_is_restored_before_the_next_feature_is_measured(self):
+        dmodel, X, y = self._fitted_two_signals()
+        ranked = dict((f, m) for f, m, _ in R._dir_importance(dmodel, X, y, list(X.columns)))
+        # Both informative features must score well above the noise one. If the shuffle of an
+        # earlier column leaked, whichever informative column came after it would collapse.
+        self.assertGreater(ranked["depth"], 10 * abs(ranked["noise"]) + 0.01)
+        self.assertGreater(ranked["coverage"], 10 * abs(ranked["noise"]) + 0.01)
+
+    def _fitted(self):
+        """Fits a small direction head where only ``depth`` carries signal.
+
+        ``model._GBM_KWARGS`` sets ``min_samples_leaf=300``, so a fixture of a few hundred rows
+        cannot split at all and fits a CONSTANT predictor -- against which permuting any feature
+        is a genuine no-op and the test would assert nothing. 4000 rows (2000 train) is the
+        smallest size tried that actually learns the rule.
+        """
+        import pandas as pd
+        import model as M
+        rng = np.random.default_rng(0)
+        n = 4000
+        X = pd.DataFrame({"depth": rng.normal(size=n), "noise": rng.normal(size=n)})
+        y = np.where(X["depth"] > 0.4, features.TOO_LONG,
+                     np.where(X["depth"] < -0.4, features.TOO_SHORT, features.OK)).astype(int)
+        half = n // 2
+        dmodel = M.train_direction(X.iloc[:half], y[:half], X.iloc[half:], y[half:])
+        return dmodel, X.iloc[half:].reset_index(drop=True), y[half:]
+
+    def test_ranks_the_informative_feature_first_and_leaves_the_caller_frame_untouched(self):
+        dmodel, X, y = self._fitted()
+        before = X.copy()
+        ranked = R._dir_importance(dmodel, X, y, list(X.columns))
+        self.assertEqual([f for f, _, _ in ranked], ["depth", "noise"])
+        self.assertGreater(ranked[0][1], 0.0)  # permuting the signal raises log-loss
+        # The permutation is applied in place on an internal copy; the caller's frame and dtypes
+        # must come back exactly as they went in.
+        self.assertTrue(before.equals(X))
+        self.assertEqual(list(before.dtypes), list(X.dtypes))
+
+    def test_is_deterministic(self):
+        dmodel, X, y = self._fitted()
+        first = R._dir_importance(dmodel, X, y, list(X.columns))
+        second = R._dir_importance(dmodel, X, y, list(X.columns))
+        self.assertEqual(first, second)
+
+
+class ImportancePanelTest(unittest.TestCase):
+    def test_missing_ranking_returns_false_and_writes_nothing(self):
+        # a results.json cached before the direction ranking existed must skip the panel, not crash
+        stale = [{"genotyping_regime": r, "importance": [("eh", 1.0, 0.0)]}
+                 for r in features.GENOTYPING_REGIMES]
+        with tempfile.TemporaryDirectory() as d:
+            out_png = os.path.join(d, "imp.png")
+            self.assertFalse(R.plot_importance_panel(stale, out_png, key="importance_direction"))
+            self.assertFalse(os.path.exists(out_png))
+
+    def test_panel_rows_read_the_requested_ranking(self):
+        # _fake_results gives the two keys OPPOSITE orders (importance: eh > depth,
+        # importance_direction: depth > eh), so the first row identifies which one was read.
+        # Asserting on _panel_rows rather than on "a PNG appeared" is what makes this catch a panel
+        # that plots the q-head bars under a direction-head title.
+        results = _fake_results()
+        for key, expected_first in (("importance", "eh"), ("importance_direction", "depth")):
+            rank, by_reg = R._panel_rows(results, key, top_n=R.TOP_N)
+            self.assertEqual(rank[expected_first], 1, key)
+            for regime, ranked in by_reg.items():
+                self.assertEqual(ranked[0][0], expected_first, "%s / %s" % (key, regime))
+
+    def test_panel_rows_returns_nothing_when_a_regime_lacks_the_ranking(self):
+        partial = _fake_results()
+        del partial[1]["importance_direction"]
+        self.assertEqual(R._panel_rows(partial, "importance_direction", top_n=5), ({}, {}))
+
+    def test_direction_ranking_orders_bars_by_its_own_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_png = os.path.join(d, "imp.png")
+            self.assertTrue(R.plot_importance_panel(_fake_results(), out_png,
+                                                    key="importance_direction"))
+            self.assertTrue(os.path.exists(out_png))
+
+
 class RenderHtmlTest(unittest.TestCase):
     def test_writes_html_and_skips_missing_optional_sections(self):
         with tempfile.TemporaryDirectory() as d:
@@ -217,6 +379,21 @@ class RenderHtmlTest(unittest.TestCase):
             self.assertIn("some_model.20260707.json.gz", html)
             self.assertIn("Feature definitions", html)
             self.assertNotIn("PR-ROC curves", html)               # pr_png=None -> section skipped
+            # the direction-head panels are optional too
+            self.assertNotIn("Add-one-feature ablation (direction prediction)", html)
+
+    def test_direction_ablation_sections_render_when_their_pngs_are_supplied(self):
+        with tempfile.TemporaryDirectory() as d:
+            png = os.path.join(d, "p.png")
+            _write_png(png)
+            out_html = os.path.join(d, "report.html")
+            R.render_html(_fake_results(), png, png, png, "m.json.gz", out_html,
+                          dir_importance_png=png, dir_ablation_png=png)
+            with open(out_html) as f:
+                html = f.read()
+            self.assertIn("Add-one-feature ablation (direction prediction)", html)
+            self.assertIn("Relative feature importance (per allele size bucket, direction prediction)",
+                          html)
 
 
 if __name__ == "__main__":

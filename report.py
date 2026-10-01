@@ -12,7 +12,10 @@ The report (a single standalone ``.html`` with embedded plots) shows:
   - the raw-EH vs gated-LCF MAE chart (apply the LCF only where ``pOk < 0.5``),
     per genotyping_regime, on a broken linear axis;
   - per-genotyping_regime held-out accuracy + direction-head metrics;
-  - per-genotyping_regime q-head permutation feature importance (relative).
+  - per-genotyping_regime permutation feature importance (relative), for the q head
+    and for the direction head separately;
+  - add-one-feature ablation curves for both heads (q head scored by corrected-size
+    MAE, direction head by calibrated multinomial log-loss).
 
 Coding rules: no type hints, Google docstrings, ``print()``. Determinism: ``SEED``.
 """
@@ -32,7 +35,7 @@ from PIL import Image
 import pandas as pd
 import pyarrow.parquet as pq
 from sklearn.inspection import permutation_importance
-from sklearn.metrics import (average_precision_score, make_scorer, mean_pinball_loss,
+from sklearn.metrics import (average_precision_score, log_loss, make_scorer, mean_pinball_loss,
                              precision_recall_curve, roc_auc_score, roc_curve)
 
 import accuracy_by_size as ABS
@@ -48,8 +51,12 @@ SEED = 20260616
 ALL_CHROMS = [str(i) for i in range(1, 23)] + ["X", "Y"]
 GRAY, ORANGE = "#888888", "#F58518"
 IMPORTANCE_CAP = 30_000  # held-out rows used for permutation importance
+IMPORTANCE_REPEATS = 5   # permutation repeats per feature (both heads)
 TOP_N = 15               # features shown per importance panel
-ABLATION_KMAX = 22       # max # of top features in the add-one ablation curve (full: 22 of 24; quick: all 22, never truncated)
+# Max # of top features in the add-one ablation curve. Derived from the feature lists so the curve
+# always runs to "all features" as the report text claims, instead of silently truncating when a
+# feature is added.
+ABLATION_KMAX = len(features.FULL_FEATURES)
 ABLATION_TRAIN_CAP = 120_000
 ABLATION_TEST_CAP = 150_000
 REGIME_COLORS = {"quick": "#4c72b0", "full_spanning": "#dd8452", "full_nonspanning": "#55a868"}
@@ -88,15 +95,18 @@ def collect_oof(df, branch, folds, train_cap):
     """Runs 5-fold OOF training for one genotyping_regime; returns pooled per-row arrays + importance.
 
     Returns:
-        ``(oof, ranked)`` where ``oof`` is a dict of concatenated arrays (``eh``,
-        ``true``, ``true_pred``, ``t``, ``t_pred``, ``p_ok``, ``dir_code``,
-        ``tol_repeats``) and ``ranked`` is the fold-0 q-head permutation importance
-        list ``[(feature, mean, std), ...]`` (or ``None`` if it could not be run).
+        ``(oof, ranked, ranked_dir)`` where ``oof`` is a dict of concatenated arrays
+        (``eh``, ``true``, ``true_pred``, ``t``, ``t_pred``, ``p_ok``, ``dir_code``,
+        ``tol_repeats``), ``ranked`` is the fold-0 q-head permutation importance list
+        ``[(feature, mean, std), ...]`` and ``ranked_dir`` the fold-0 direction-head one
+        (either is ``None`` if it could not be run). The two heads get separate rankings
+        because they answer different questions, and each head's ablation adds features
+        in its own order.
     """
     chrom = df["chrom"].astype(str)
     acc = {k: [] for k in ("eh", "true", "true_pred", "t", "t_pred", "p_ok", "p_long", "p_short",
                            "dir_code", "tol_repeats")}
-    ranked = None
+    ranked = ranked_dir = None
     for i, f in enumerate(folds):
         m_tr = chrom.isin(set(f["train"])).to_numpy()
         m_ca = chrom.isin(set(f["calib"])).to_numpy()
@@ -127,41 +137,107 @@ def collect_oof(df, branch, folds, train_cap):
         acc["tol_repeats"].append(df.loc[m_te, "tol_repeats"].to_numpy(float))
         print("    fold %d: train=%d test=%d" % (i, tr_idx.size, int(m_te.sum())), flush=True)
         if ranked is None:
-            ranked = _importance(qreg, Xte, df.loc[m_te, "t"].to_numpy(float), names)
-    return {k: np.concatenate(v) for k, v in acc.items()}, ranked
+            # Both rankings are measured on the CALIBRATION chromosomes, not the test ones. The
+            # ablation curves add features in these orders and then score each prefix on the fold's
+            # TEST chromosomes; ranking on those same test rows would let their labels pick the
+            # feature subsets whose held-out score is then reported, biasing both curves optimistically.
+            # The calib chromosomes are disjoint from both train and test, so the ordering is chosen
+            # without seeing a single ablation-scoring row. They are not pristine either: they steer
+            # early stopping for both heads AND the direction head's isotonic calibrators are fit on
+            # them, so these bars are out-of-training but not out-of-sample. The report's importance
+            # note says so.
+            ranked = _importance(qreg, Xca, tca, names)
+            ranked_dir = _dir_importance(dmodel, Xca, yca, names)
+    return {k: np.concatenate(v) for k, v in acc.items()}, ranked, ranked_dir
 
 
-def _importance(qreg, Xte, t_te, names):
-    """Returns fold-0 q-head permutation importance (pinball-scored), most important first."""
-    idx = _cap_rows(np.arange(len(Xte)), IMPORTANCE_CAP, SEED)
+def _importance(qreg, X, t_true, names):
+    """Returns fold-0 q-head permutation importance (pinball-scored), most important first.
+
+    ``X`` / ``t_true`` are the fold's calibration rows (see ``collect_oof``). Positive = the loss ROSE
+    when the feature was permuted, so bigger is more important.
+    """
+    idx = _cap_rows(np.arange(len(X)), IMPORTANCE_CAP, SEED)
     res = permutation_importance(
-        qreg, Xte.iloc[idx], t_te[idx],
+        qreg, X.iloc[idx], np.asarray(t_true, dtype=float)[idx],
         scoring=make_scorer(mean_pinball_loss, alpha=0.5, greater_is_better=False),
-        n_repeats=5, random_state=SEED)
+        n_repeats=IMPORTANCE_REPEATS, random_state=SEED)
     order = np.argsort(res.importances_mean)[::-1]
     return [(names[i], float(res.importances_mean[i]), float(res.importances_std[i])) for i in order]
+
+
+def _dir_log_loss(y, proba):
+    """Multinomial cross-entropy of ``proba`` (``(n, 3)`` in ``[pOk, pTooLong, pTooShort]``) against ``y``."""
+    return float(log_loss(y, proba, labels=list(range(M.N_CLASSES))))
+
+
+def _dir_importance(dmodel, X_in, y_true, names):
+    """Returns fold-0 direction-head permutation importance (log-loss-scored), most important first.
+
+    Hand-rolled rather than ``permutation_importance`` because the deployed direction predictor is a
+    classifier PLUS per-class isotonic calibrators (``model.predict_proba``), not a bare sklearn
+    estimator -- scoring the classifier alone would rank features against a predictor that is not the
+    one shipped. Each feature's column is shuffled ``IMPORTANCE_REPEATS`` times in place and the
+    importance is the mean RISE in log-loss, so the sign convention matches ``_importance``'s
+    loss-increase-when-destroyed and the two panels read the same way.
+
+    ``X_in`` / ``y_true`` are the fold's calibration rows (see ``collect_oof``); ``X_in`` is copied
+    before any shuffling, so the caller's frame is never mutated.
+    """
+    idx = _cap_rows(np.arange(len(X_in)), IMPORTANCE_CAP, SEED)
+    X = X_in.iloc[idx].copy()
+    y = np.asarray(y_true, dtype=int)[idx]
+    base = _dir_log_loss(y, M.predict_proba(dmodel, X))
+    rng = np.random.default_rng(SEED)
+    ranked = []
+    for j, name in enumerate(names):
+        # Shuffle the column in place and restore it, rather than copying the whole (up to
+        # IMPORTANCE_CAP x 29) frame once per repeat per feature.
+        original = X.iloc[:, j].to_numpy(copy=True)
+        rises = []
+        for _ in range(IMPORTANCE_REPEATS):
+            X.iloc[:, j] = rng.permutation(original)
+            rises.append(_dir_log_loss(y, M.predict_proba(dmodel, X)) - base)
+        X.iloc[:, j] = original
+        ranked.append((name, float(np.mean(rises)), float(np.std(rises))))
+    return sorted(ranked, key=lambda e: e[1], reverse=True)
+
+
+def _ablation_split(df, branch, fold):
+    """Builds the one-fold train/calib/test slices both ablation curves are computed on.
+
+    Shared so the q-head and direction-head curves are always fit and scored on exactly the same
+    rows (same fold, same seeded caps), which is what makes them comparable side by side. The caps
+    are smaller than the headline CV's because an ablation re-fits a head once per prefix length.
+
+    Returns:
+        ``(Xtr, Xca, Xte, tr_idx, ca_mask, te_idx)`` -- three feature matrices carrying every
+        feature column, plus the row selectors the caller uses to slice its own labels.
+    """
+    chrom = df["chrom"].astype(str)
+    tr_idx = _cap_rows(np.where(chrom.isin(set(fold["train"])).to_numpy())[0], ABLATION_TRAIN_CAP, SEED)
+    te_idx = _cap_rows(np.where(chrom.isin(set(fold["test"])).to_numpy())[0], ABLATION_TEST_CAP, SEED)
+    ca_mask = chrom.isin(set(fold["calib"])).to_numpy()
+    Xtr, _ = features.build_matrix(df.iloc[tr_idx], branch)
+    Xca, _ = features.build_matrix(df[ca_mask], branch)
+    Xte, _ = features.build_matrix(df.iloc[te_idx], branch)
+    return Xtr, Xca, Xte, tr_idx, ca_mask, te_idx
 
 
 def _ablation_curve(df, branch, fold, order):
     """Add-one-feature held-out MAE curve: fit the q-head on the top-1, top-2, ... features.
 
-    Features are added in ``order`` (this genotyping regime's own importance ranking). Each q-head
-    is fit on one fold's training chromosomes and scored on its test chromosomes by the MAE of the
-    corrected call ``eh/LCF`` against the truth (repeat units) -- i.e. how close the corrected call
-    is to the true size. Uses a single fold and smaller caps than the headline CV.
+    Features are added in ``order`` (this genotyping regime's own q-head importance ranking). Each
+    q-head is fit on one fold's training chromosomes and scored on its test chromosomes by the MAE
+    of the corrected call ``eh/LCF`` against the truth (repeat units) -- i.e. how close the
+    corrected call is to the true size.
 
     Returns:
         A list of ``{"k", "feature", "mae"}`` dicts: ``k=0`` is the raw-EH baseline (no correction)
         on the fold-0 test rows, then one dict per prefix length ``k=1, 2, ...``.
     """
-    chrom = df["chrom"].astype(str)
-    tr_idx = _cap_rows(np.where(chrom.isin(set(fold["train"])).to_numpy())[0], ABLATION_TRAIN_CAP, SEED)
-    te_idx = _cap_rows(np.where(chrom.isin(set(fold["test"])).to_numpy())[0], ABLATION_TEST_CAP, SEED)
-    m_ca = chrom.isin(set(fold["calib"])).to_numpy()
-    Xtr, _ = features.build_matrix(df.iloc[tr_idx], branch)
-    Xca, _ = features.build_matrix(df[m_ca], branch)
-    Xte, _ = features.build_matrix(df.iloc[te_idx], branch)
-    ttr, tca = df["t"].to_numpy(float)[tr_idx], df.loc[m_ca, "t"].to_numpy(float)
+    Xtr, Xca, Xte, tr_idx, ca_mask, te_idx = _ablation_split(df, branch, fold)
+    ttr, tca = df["t"].to_numpy(float)[tr_idx], df.loc[ca_mask, "t"].to_numpy(float)
     eh_te = df["eh"].to_numpy(float)[te_idx]
     true_te = df["true"].to_numpy(float)[te_idx]
     # k=0 baseline: raw-EH MAE on the SAME fold-0 capped test rows as the k>=1 points, so the curve's
@@ -174,6 +250,127 @@ def _ablation_curve(df, branch, fold, order):
         mae = float(np.mean(np.abs(true_te - true_pred)))
         curve.append({"k": k, "feature": order[k - 1], "mae": mae})
         print("    ablation k=%2d (+%-24s) MAE=%.4f" % (k, order[k - 1], mae), flush=True)
+    return curve
+
+
+def _ranking_contract_gap(ranking, branch):
+    """Returns how a cached importance ranking differs from the branch's current feature list, or None.
+
+    An ablation loop runs to ``min(ABLATION_KMAX, len(order))``, so a ranking written before a feature
+    was added is SHORT and its curve stops early while the report's text says it runs up to all
+    features. Both consumers of a cached ranking have to know: ``--ablation-only`` recomputes curves
+    from it, and ``--render-only`` re-plots the curve it already produced.
+    """
+    want, got = features.feature_names(branch), [f for f, _, _ in ranking]
+    if set(want) == set(got):
+        return None
+    return ("covers %d feature(s) but the %s branch now has %d (only in the cache: %s; only in "
+            "features.py: %s)" % (len(got), branch, len(want),
+                                  sorted(set(got) - set(want)) or "(none)",
+                                  sorted(set(want) - set(got)) or "(none)"))
+
+
+def _assert_ranking_covers_contract(ranking, branch, genotyping_regime, key):
+    """Raises if a cached importance ranking does not cover the branch's current feature list.
+
+    Used by ``--ablation-only``, which RECOMPUTES curves from the cached ranking: a short ranking
+    would silently produce a truncated curve, so refusing is better than warning.
+    """
+    gap = _ranking_contract_gap(ranking, branch)
+    if gap:
+        raise SystemExit(
+            "ERROR: results.json's %r ranking for %s %s.\nThe ablation curve would stop short of "
+            "'all features' without saying so. Re-run `python3 report.py` without --ablation-only "
+            "to recompute the rankings first." % (key, genotyping_regime, gap))
+
+
+def _stale_contract_warning(results, homo_results=None):
+    """Returns a reader-facing note when a cached result set predates the current code.
+
+    The render paths must still work from cached artifacts (that is what they are for), so this
+    warns rather than refusing -- but the warning goes into the HTML as well as stdout, because two
+    sections make claims a stale cache breaks: the ablation note promises a curve running "up to all
+    features", and the importance note says the bars were measured on the CALIBRATION chromosomes.
+
+    Both caches are checked. The homopolymer panels come from ``results_homopolymer.json``, whose
+    only other guard is a per-regime row count -- which passes unchanged when the code, not the data,
+    is what moved on.
+
+    ``importance_direction`` doubles as the provenance marker for the second claim: it was added by
+    the same change that moved importance off the test chromosomes, so a ranking without it was
+    ranked on the test chromosomes.
+    """
+    gaps = {}
+    for label, bundle in (("results.json", results), ("results_homopolymer.json", homo_results)):
+        for r in bundle or []:
+            branch = features.GENOTYPING_REGIME_BRANCH[r["genotyping_regime"]]
+            ranking = r.get("importance") or []
+            reasons = []
+            if not ranking:
+                reasons.append("carries no ranking at all")
+            else:
+                gap = _ranking_contract_gap(ranking, branch)
+                if gap:
+                    reasons.append(gap)
+                if not r.get("importance_direction"):
+                    reasons.append("was ranked on the TEST chromosomes, not the calibration ones")
+            if reasons:
+                gaps["%s / %s" % (label, r["genotyping_regime"])] = "; ".join(reasons)
+    if not gaps:
+        return ""
+    for where, why in sorted(gaps.items()):
+        print("  WARNING: cached %s %s" % (where, why), flush=True)
+    return ("<p class='note' style='color:#a33'><b>Stale cache:</b> this report reuses cached "
+            "cross-validation results that predate the current code, so the importance and ablation "
+            "panels below do not match the descriptions beside them (%s). Re-run "
+            "<code>python3 report.py --homopolymer-cv</code> and <code>python3 report.py</code> to "
+            "recompute them.</p>"
+            % html.escape("; ".join("%s: %s" % (k, v) for k, v in sorted(gaps.items()))))
+
+
+def _dir_ablation_scores(y_te, proba):
+    """Returns the per-``k`` direction-head scores stored in a ``dir_ablation`` curve entry.
+
+    ``log_loss`` is the plotted one (the head's own training objective, and a proper scoring rule,
+    so it rewards calibration and not just ranking); the AUC / average-precision / calibration-error
+    columns ride along so the curve can be re-plotted against a different metric without re-fitting
+    every prefix. Mirrors ``metrics.direction_metrics`` minus the confusion matrix, which is not
+    meaningful to plot against ``k``.
+    """
+    scored = metrics.direction_metrics(y_te, proba)
+    return {k: v for k, v in scored.items() if k not in ("n", "confusion")}
+
+
+def _dir_ablation_curve(df, branch, fold, order):
+    """Add-one-feature held-out log-loss curve: fit the direction head on the top-1, top-2, ... features.
+
+    The direction-head counterpart of ``_ablation_curve``: same fold, same rows (``_ablation_split``),
+    features added in this genotyping regime's own DIRECTION-head importance order, and each prefix
+    scored on the calibrated ``[pOk, pTooLong, pTooShort]`` probabilities the deployed predictor emits
+    (classifier + isotonic, i.e. ``model.predict_proba``).
+
+    Returns:
+        A list of ``{"k", "feature", <scores from _dir_ablation_scores>}`` dicts. ``k=0`` is the
+        feature-free baseline: the class prior measured on this fold's training rows, predicted
+        constantly for every test row -- the log-loss any feature has to beat.
+    """
+    Xtr, Xca, Xte, tr_idx, ca_mask, te_idx = _ablation_split(df, branch, fold)
+    ytr = df["dir_code"].to_numpy(int)[tr_idx]
+    yca = df.loc[ca_mask, "dir_code"].to_numpy(int)
+    yte = df["dir_code"].to_numpy(int)[te_idx]
+
+    prior = np.bincount(ytr, minlength=M.N_CLASSES) / ytr.size
+    curve = [{"k": 0, "feature": "(class prior)",
+              **_dir_ablation_scores(yte, np.tile(prior, (yte.size, 1)))}]
+    print("    dir ablation k= 0 (%-25s) log_loss=%.4f" % ("class prior", curve[0]["log_loss"]),
+          flush=True)
+    for k in range(1, min(ABLATION_KMAX, len(order)) + 1):
+        cols = order[:k]
+        dmodel = M.train_direction(Xtr[cols], ytr, Xca[cols], yca)
+        scores = _dir_ablation_scores(yte, M.predict_proba(dmodel, Xte[cols]))
+        curve.append({"k": k, "feature": order[k - 1], **scores})
+        print("    dir ablation k=%2d (+%-24s) log_loss=%.4f"
+              % (k, order[k - 1], scores["log_loss"]), flush=True)
     return curve
 
 
@@ -225,10 +422,13 @@ def evaluate_genotyping_regime(genotyping_regime, data_dir, folds, train_cap, ho
     df, branch = _load_genotyping_regime_df(genotyping_regime, data_dir, homopolymers_only)
     print("=== %s (branch %s): %d rows ===" % (genotyping_regime, branch, len(df)), flush=True)
 
-    oof, ranked = collect_oof(df, branch, folds, train_cap)
+    oof, ranked, ranked_dir = collect_oof(df, branch, folds, train_cap)
     order = [f for f, _, _ in (ranked or [])]
-    print("  ablation (add-one curve) ...", flush=True)
+    order_dir = [f for f, _, _ in (ranked_dir or [])]
+    print("  ablation (add-one curve, LCF head) ...", flush=True)
     ablation = _ablation_curve(df, branch, folds[0], order) if order else []
+    print("  ablation (add-one curve, direction head) ...", flush=True)
+    dir_ablation = _dir_ablation_curve(df, branch, folds[0], order_dir) if order_dir else []
     return {
         "genotyping_regime": genotyping_regime,
         "n_rows": len(df),
@@ -238,7 +438,9 @@ def evaluate_genotyping_regime(genotyping_regime, data_dir, folds, train_cap, ho
             oof["dir_code"], np.column_stack([oof["p_ok"], oof["p_long"], oof["p_short"]])),
         "gated": metrics.gated_mae(oof["eh"], oof["true"], oof["true_pred"], oof["p_ok"]),
         "importance": ranked,
+        "importance_direction": ranked_dir,
         "ablation": ablation,
+        "dir_ablation": dir_ablation,
     }, oof
 
 
@@ -326,43 +528,82 @@ def plot_mae(results, out_png):
     fig.savefig(out_png, dpi=150, bbox_inches="tight"); plt.close(fig)
 
 
-def plot_importance_panel(results, out_png, top_n=TOP_N, loci_label="non-homopolymer loci"):
-    """Draws the three q-head importance charts in one horizontal row, full_nonspanning first.
+def _panel_rows(results, key, top_n):
+    """Selects the bars each importance panel draws, reading ranking ``key`` and nothing else.
+
+    Split out of ``plot_importance_panel`` so the choice of ranking is testable without rendering:
+    the panel is parameterized by ``key`` (q head vs direction head) and drawing the wrong one under
+    the right title is a silent, plausible mistake that a "did a PNG appear" test cannot catch.
+
+    Returns:
+        ``(rank, by_regime)`` where ``rank`` maps a feature to its 1-based position in the
+        ``full_nonspanning`` ranking (the cross-panel ``#n`` suffix) and ``by_regime`` maps each
+        genotyping regime to its own top-``top_n`` ``[(feature, mean, std), ...]``. Both are empty
+        when any regime is missing that ranking (a cached ``results.json`` predating it).
+    """
+    by_reg = {r["genotyping_regime"]: r for r in results}
+    if any(not (by_reg.get(reg) or {}).get(key) for reg in features.GENOTYPING_REGIMES):
+        return {}, {}
+    rank = {f: i + 1 for i, (f, _, _) in
+            enumerate(by_reg[features.GENOTYPING_REGIME_FULL_NONSPANNING][key])}
+    return rank, {reg: by_reg[reg][key][:top_n] for reg in features.GENOTYPING_REGIMES}
+
+
+def plot_importance_panel(results, out_png, top_n=TOP_N, loci_label="non-homopolymer loci",
+                          key="importance", head_label="LCF prediction",
+                          score_label="mean pinball-loss rise"):
+    """Draws the three per-regime importance charts in one horizontal row.
+
+    Charts run quick, full_spanning, full_nonspanning left to right; the ``#n`` ranks are set by
+    full_nonspanning.
 
     The ``(#rank)`` suffix on every feature label is that feature's rank in the
     ``full_nonspanning`` importance order (1 = most important there); the same suffix is reused on
     the other two charts so a feature can be cross-referenced across genotyping regimes. Bars within
     each chart are still sorted by that chart's own importance.
+
+    Args:
+        results: The per-regime metrics bundles.
+        out_png: Output path.
+        top_n: How many features to show per chart.
+        loci_label: Which loci the panel was computed on (title only).
+        key: Which ranking to read -- ``"importance"`` (q head) or ``"importance_direction"``.
+        head_label: Which head the ranking scores (title only).
+        score_label: What the bar length means (x-axis label).
+
+    Returns:
+        True if the panel was drawn, False if ``key`` is absent/empty for some regime (a cached
+        ``results.json`` predating that ranking), in which case no file is written.
     """
-    by_reg = {r["genotyping_regime"]: r for r in results}
-    nonspan = features.GENOTYPING_REGIME_FULL_NONSPANNING
-    rank = {f: i + 1 for i, (f, _, _) in enumerate(by_reg[nonspan]["importance"])}
-    order_reg = list(features.GENOTYPING_REGIMES)  # quick, full_spanning, full_nonspanning (left to right)
+    rank, by_reg = _panel_rows(results, key, top_n)
+    if not by_reg:
+        return False
 
     fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    for ax, reg in zip(axes, order_reg):
-        ranked = by_reg[reg]["importance"][:top_n]
+    for ax, reg in zip(axes, features.GENOTYPING_REGIMES):
+        ranked = by_reg[reg]
         peak = max((m for _, m, _ in ranked), default=1.0) or 1.0
         pos = np.arange(len(ranked))[::-1]
         ax.barh(pos, [m / peak for _, m, _ in ranked], xerr=[s / peak for _, _, s in ranked],
                 color="#4c72b0", ecolor="gray", capsize=3)
         ax.set_yticks(pos)
         ax.set_yticklabels(["%s (#%d)" % (f, rank.get(f, 0)) for f, _, _ in ranked])
-        ax.set_xlabel("relative importance (mean pinball-loss drop)")
+        ax.set_xlabel("relative importance (%s)" % score_label)
         ax.set_title(features.GENOTYPING_REGIME_DISPLAY[reg])
         ax.grid(True, axis="x", alpha=0.3)
-    fig.suptitle("Relative feature importance (LCF prediction, held-out; %s) — rank # set by full_nonspanning"
-                 % loci_label, fontsize=14, weight="bold")
+    fig.suptitle("Relative feature importance (%s, calibration chromosomes; %s) — rank # set by "
+                 "full_nonspanning" % (head_label, loci_label), fontsize=14, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_png, dpi=150, bbox_inches="tight"); plt.close(fig)
+    return True
 
 
 def plot_ablation(results, out_png):
     """Add-one-feature held-out MAE curve per genotyping regime, with a k=0 raw-EH point.
 
-    k=0 is the uncorrected raw-EH MAE (``q.mae_eh``); k>=1 are the corrected MAEs from the ablation.
-    A broken y-axis keeps the large raw-EH baseline (e.g. ~53 for full_nonspanning) and the corrected
-    detail (~0-7) both readable in one plot.
+    k=0 is the raw-EH MAE (no correction) on the same capped fold-0 test rows as the k>=1 points, as
+    carried in the curve itself; ``q.mae_eh`` is only a fallback for cached curves that predate that
+    k=0 row and is measured on the whole pool, so the two are not interchangeable.
     """
     series = []  # (display, color, xs, ys)
     for r in results:
@@ -376,13 +617,61 @@ def plot_ablation(results, out_png):
             ys = [r["q"]["mae_eh"]] + ys
         series.append((features.GENOTYPING_REGIME_DISPLAY[r["genotyping_regime"]],
                        REGIME_COLORS.get(r["genotyping_regime"]), xs, ys))
+    return _plot_ablation_series(
+        series, out_png,
+        title="Add-one-feature ablation (LCF prediction)",
+        xlabel="number of top features included (LCF prediction importance order; 0 = raw EH)",
+        ylabel="MAE |true − corrected|  (repeat units, held-out)")
 
-    biggest = max(ys[0] for _, _, _, ys in series)                       # raw-EH MAE of the worst regime
-    rest = max(v for _, _, _, ys in series for v in ys if v < biggest)   # everything below it
+
+def plot_dir_ablation(results, out_png, title_tag=""):
+    """Add-one-feature held-out log-loss curve per genotyping regime, with a k=0 class-prior point.
+
+    The direction-head counterpart of ``plot_ablation``: k=0 is the feature-free class-prior
+    predictor and k>=1 the calibrated 3-class head fit on that many top features.
+
+    Returns:
+        ``"single"`` or ``"broken"`` (which y-axis treatment was used) once the plot is drawn, or
+        False when no regime carries a ``dir_ablation`` curve (a cached ``results.json`` predating
+        it), in which case no file is written. Both strings are truthy, so callers that only ask
+        "was anything drawn?" still read correctly.
+    """
+    series = []
+    for r in results:
+        curve = r.get("dir_ablation") or []
+        if not curve:
+            continue
+        series.append((features.GENOTYPING_REGIME_DISPLAY[r["genotyping_regime"]],
+                       REGIME_COLORS.get(r["genotyping_regime"]),
+                       [d["k"] for d in curve], [d["log_loss"] for d in curve]))
+    if not series:
+        return False
+    return _plot_ablation_series(
+        series, out_png,
+        title="Add-one-feature ablation (direction prediction)%s" % (" — %s" % title_tag if title_tag else ""),
+        xlabel="number of top features included (direction importance order; 0 = class prior)",
+        ylabel="multinomial log-loss  (held-out, calibrated)")
+
+
+def _plot_ablation_series(series, out_png, title, xlabel, ylabel):
+    """Draws add-one-feature curves (one line per genotyping regime) and writes ``out_png``.
+
+    ``series`` is a list of ``(display_name, color, xs, ys)``. ONLY when the k=0 anchor of the worst
+    regime towers over everything else (more than 2.5x the next value) is the y-axis broken, so the
+    baseline and the post-correction detail are both readable in one plot; otherwise a single
+    continuous axis is used. Whether that happened is returned, because the report's prose describes
+    the axis and must not claim a break that is not there.
+
+    Returns:
+        ``"broken"`` or ``"single"`` once the figure is written; False when there is nothing to draw
+        (both truthy strings, so callers can keep treating the result as a drew-anything flag).
+    """
+    if not series:
+        return False
+    biggest = max(ys[0] for _, _, _, ys in series)                            # worst regime's k=0 anchor
+    below = [v for _, _, _, ys in series for v in ys if v < biggest]
+    rest = max(below) if below else biggest
     broken = biggest > 2.5 * rest
-    title = "Add-one-feature ablation (LCF prediction)"
-    xlabel = "number of top features included (LCF prediction importance order; 0 = raw EH)"
-    ylabel = "MAE |true − corrected|  (repeat units, held-out)"
 
     def draw(ax):
         for disp, color, xs, ys in series:
@@ -394,7 +683,7 @@ def plot_ablation(results, out_png):
         draw(ax); ax.set_ylim(bottom=0)
         ax.set_xlabel(xlabel); ax.set_ylabel(ylabel); ax.set_title(title); ax.legend()
         fig.savefig(out_png, dpi=150, bbox_inches="tight"); plt.close(fig)
-        return
+        return "single"
 
     lo = (0, rest * 1.15)
     hi = (biggest * 0.95, biggest * 1.04)
@@ -413,6 +702,7 @@ def plot_ablation(results, out_png):
     ax_lo.set_xlabel(xlabel); ax_hi.set_title(title); ax_hi.legend(fontsize=9)
     fig.supylabel(ylabel, fontsize=10)
     fig.savefig(out_png, dpi=150, bbox_inches="tight"); plt.close(fig)
+    return "broken"
 
 
 # --- direction-head accuracy plots (pOk / pTooLong / pTooShort) -----------
@@ -989,13 +1279,22 @@ def _img_toggle(excluded_png, homopolymer_png, gid):
 
 
 def _feature_glossary(results):
-    """Feature definition table ordered by the full_nonspanning importance rank (#)."""
+    """Feature definition table: EVERY current feature, ordered by full_nonspanning importance rank.
+
+    Driven by ``features.feature_names`` rather than by the cached ranking. Enumerating the ranking
+    instead silently dropped any feature added after ``results.json`` was written -- the published
+    report shipped a 24-row table while the contract already had 29 features, with no warning.
+    Features the cached ranking does not cover sort last and show ``#-`` instead of a rank.
+    """
     ranked = {r["genotyping_regime"]: r for r in
               results}[features.GENOTYPING_REGIME_FULL_NONSPANNING]["importance"]
+    rank = {feat: i for i, (feat, _, _) in enumerate(ranked, start=1)}
+    branch = features.GENOTYPING_REGIME_BRANCH[features.GENOTYPING_REGIME_FULL_NONSPANNING]
+    names = sorted(features.feature_names(branch), key=lambda f: rank.get(f, len(rank) + 1))
     rows = ["<tr><th>rank</th><th>feature</th><th>definition</th></tr>"]
-    for i, (feat, _, _) in enumerate(ranked, start=1):
-        rows.append("<tr><td>#%d</td><td><code>%s</code></td><td>%s</td></tr>" % (
-            i, html.escape(feat),
+    for feat in names:
+        rows.append("<tr><td>%s</td><td><code>%s</code></td><td>%s</td></tr>" % (
+            "#%d" % rank[feat] if feat in rank else "#-", html.escape(feat),
             html.escape(features.FEATURE_DEFINITIONS.get(feat, ""))))
     return "<table>%s</table>" % "".join(rows)
 
@@ -1014,11 +1313,11 @@ def _eh_output_glossary():
 
 # The per-allele quantities each regime model predicts: (output, head, meaning, range, use).
 _MODEL_OUTPUTS = (
-    ("pOk", "direction predictor (3-class softmax)", "probability that the EH call is correct (within tolerance)",
+    ("pOk", "direction predictor (3-class classifier + per-class isotonic calibration)", "probability that the EH call is correct (within tolerance)",
      "0&ndash;1"),
-    ("pTooLong", "direction predictor (3-class softmax)",
+    ("pTooLong", "direction predictor (3-class classifier + per-class isotonic calibration)",
      "probability that the true allele size is shorter than what EH called", "0&ndash;1"),
-    ("pTooShort", "direction predictor (3-class softmax)",
+    ("pTooShort", "direction predictor (3-class classifier + per-class isotonic calibration)",
      "probability that the true allele size is longer than what EH called", "0&ndash;1"),
     ("LCF", "length predictor (regression)",
      "<span style='white-space:nowrap'>predicted length-correction factor = "
@@ -1136,7 +1435,8 @@ def build_dataset_sections(out_dir, regenerate=True):
     When ``regenerate`` is False (``report.py --render-text-only``) the PNGs are not re-plotted; the
     existing on-disk PNGs are embedded as-is and any that are missing are skipped.
 
-    Every plot carries a <b>Dataset</b> pill (HG002 genome 31x / 43 held-out HPRC)
+    Every plot carries a <b>Dataset</b> pill (HG002 genome 31x / the held-out HPRC samples,
+    sized from ``len(heldout.SAMPLES)``)
     and the <b>Homopolymers</b> pill; the accuracy-by-size stacked-bar additionally gets an
     <b>LCF correction</b> on/off pill. Reads ``eval_<key>.json`` + ``eval_<key>_violin.npz`` (the
     apply-based eval) and ``stacked_<key>.json`` (the accuracy-by-size counts) for each dataset.
@@ -1311,9 +1611,10 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
                 pr_png=None, roc_png=None, confusion_png=None, prob_violins_png=None,
                 pr_homopolymer_png=None, roc_homopolymer_png=None,
                 confusion_homopolymer_png=None, prob_violins_homopolymer_png=None,
-                dataset_sections_html=""):
+                dir_importance_png=None, dir_importance_homopolymer_png=None,
+                dir_ablation_png=None, dir_ablation_homopolymer_png=None,
+                stale_contract_html="", ablation_axis="single", dataset_sections_html=""):
     """Writes the standalone HTML report embedding every plot + metric table."""
-    non_homo, homo = "All non-homopolymer loci", "Homopolymer loci (1 bp motif)"
     css = ("body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;"
            "color:#222;max-width:1180px}h1{font-size:22px}h2{font-size:17px;margin-top:34px;"
            "border-bottom:1px solid #ddd;padding-bottom:4px}table{border-collapse:collapse;"
@@ -1347,7 +1648,8 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
     # to a single plot with no toggle, so the text must not claim one.
     homo_shown = any((mae_homopolymer_png, importance_homopolymer_png, ablation_homopolymer_png,
                       confusion_homopolymer_png, pr_homopolymer_png,
-                      roc_homopolymer_png, prob_violins_homopolymer_png))
+                      roc_homopolymer_png, prob_violins_homopolymer_png,
+                      dir_importance_homopolymer_png, dir_ablation_homopolymer_png))
     intro_homo = (
         ""
         if homo_shown else
@@ -1380,7 +1682,8 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "used as a training filter, but is available below as an opt-in <b>Repeat Purity Filter</b> "
         "stratification pill.</p>",
         "<p class='note'>Held-out accuracy is measured by 5-fold cross validation: "
-        "each fold trains on ~19 chromosomes and tests on the held-out ones.</p>",
+        "each fold trains on 17-18 chromosomes, early-stops on 2 calibration chromosomes, and "
+        "tests on the remaining 4-5.</p>",
         "<h2>ExpansionHunter output fields used for model training</h2>",
         "<p class='note'>The raw per-allele <code>AlleleQualityMetrics.Alleles[]</code> fields read from "
         "each ExpansionHunter output JSON.</p>",
@@ -1390,6 +1693,7 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "(<code>#1</code> = most important there). These are derived (and two engineered: "
         "<code>ci_asymmetry</code>, <code>ci_over_eh</code>) from the ExpansionHunter output fields "
         "above.</p>",
+        stale_contract_html,
         _feature_glossary(results),
         "<h2>Mean absolute error: raw EH allele size vs allele size after LCF correction</h2>",
         _img_toggle(mae_png, mae_homopolymer_png, "mae"),
@@ -1445,7 +1749,14 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "<code>full_nonspanning</code> allele size bucket; the same number is reused across all three "
         "charts so a feature can be tracked between allele size buckets. Toggle between "
         "<b>non-homopolymer</b> loci and <b>homopolymer</b> (1&nbsp;bp motif) loci (the homopolymer panel's "
-        "<code>#</code> ranks are set by its own homopolymer full_nonspanning order).</p>",
+        "<code>#</code> ranks are set by its own homopolymer full_nonspanning order). "
+        "Bars are the rise in loss when that feature's column is shuffled, measured on fold&nbsp;0's "
+        "<b>calibration</b> chromosomes &mdash; not its test chromosomes, so that the ablation curves "
+        "below, which add features in this order and score on the test chromosomes, never have their "
+        "feature subsets chosen using the rows they are scored on. Those calibration chromosomes are "
+        "held out of <i>training</i> but are not untouched: they stop both heads early, and the "
+        "direction head's isotonic calibrators are fit on them, so read these bars as a feature "
+        "ranking rather than as an out-of-sample effect size.</p>",
         "<h2>Add-one-feature ablation (LCF prediction)</h2>",
         _img_toggle(ablation_png, ablation_homopolymer_png, "abl"),
         "<p class='note'>The LCF prediction (the regressor predicting the length-correction factor "
@@ -1453,11 +1764,42 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "its top-1 most-important feature, then top-2, ... up to all features (x-axis; added in each "
         "allele size bucket's own importance order). The y-axis is the <b>held-out MAE</b> "
         "<code>mean|true &minus; eh/LCF|</code> (repeat units, fold-0 test chromosomes, within-pool CV). "
-        "<b>x = 0 is raw EH</b> (no correction); <b>x &ge; 1</b> apply the LCF fit on that many features "
-        "(the y-axis is broken so the large raw-EH baseline and the corrected detail are both readable). "
-        "Ungated (the correction is applied to every allele, unlike the "
+        "<b>x = 0 is raw EH</b> (no correction); <b>x &ge; 1</b> apply the LCF fit on that many features"
+        "%s. Ungated (the correction is applied to every allele, unlike the "
+        % (". The y-axis is broken so the large raw-EH baseline and the corrected detail are both "
+           "readable" if ablation_axis == "broken" else ""),
         "gated MAE bar chart above which compares raw EH vs the pOk&lt;0.5-gated correction).</p>",
     ]
+    if dir_importance_png:
+        parts += [
+            "<h2>Relative feature importance (per allele size bucket, direction prediction)</h2>",
+            _img_toggle(dir_importance_png, dir_importance_homopolymer_png, "dirimp"),
+            "<p class='note'>The same permutation analysis as the panel above, but scoring the "
+            "<b>direction predictor</b> (<code>pOk</code> / <code>pTooLong</code> / "
+            "<code>pTooShort</code>) instead of the LCF regressor: each feature's column is shuffled "
+            "and the bar is the resulting <b>rise in log-loss</b> of the calibrated probabilities "
+            "(classifier + isotonic, exactly what ExpansionHunter emits). The two heads are ranked "
+            "separately because they answer different questions -- a feature that pins down "
+            "<i>how far off</i> a call is need not be the one that says <i>whether</i> it is off. "
+            "Because the rankings differ, the <code>(#n)</code> suffixes on THIS panel are "
+            "direction-head ranks and do not match the <code>#n</code> used in the feature-definition "
+            "table or in the LCF importance panel above.</p>",
+        ]
+    if dir_ablation_png:
+        parts += [
+            "<h2>Add-one-feature ablation (direction prediction)</h2>",
+            _img_toggle(dir_ablation_png, dir_ablation_homopolymer_png, "dirabl"),
+            "<p class='note'>The direction predictor is re-fit using only its top-1 most-important "
+            "feature, then top-2, ... up to all features (x-axis; added in each allele size bucket's "
+            "own <b>direction</b> importance order, not the LCF order used by the chart above). The "
+            "y-axis is the <b>held-out multinomial log-loss</b> of the calibrated "
+            "<code>[pOk, pTooLong, pTooShort]</code> probabilities -- the head's own training "
+            "objective, so lower is strictly better and it rewards calibration, not just ranking. "
+            "<b>x = 0 is the class prior</b> (the feature-free predictor: this fold's training-set "
+            "class frequencies emitted for every allele), which is the log-loss any feature has to "
+            "beat. Same fold, rows and caps as the LCF ablation above, so the two curves describe "
+            "the same alleles.</p>",
+        ]
     parts.append(dataset_sections_html)
     parts += ["</body></html>"]
     with open(out_html, "w") as f:
@@ -1540,9 +1882,24 @@ def main():
         if args.ablation_only:
             folds = make_folds(n_folds=args.folds)
             for r in results:
-                df, branch = _load_genotyping_regime_df(r["genotyping_regime"], args.data_dir)
-                print("=== ablation %s (%d rows) ===" % (r["genotyping_regime"], len(df)), flush=True)
+                regime = r["genotyping_regime"]
+                df, branch = _load_genotyping_regime_df(regime, args.data_dir)
+                print("=== ablation %s (%d rows) ===" % (regime, len(df)), flush=True)
+                # Both curves reuse the cached rankings rather than recomputing them, so a cache
+                # written under an older feature contract would silently truncate the curve.
+                _assert_ranking_covers_contract(r["importance"], branch, regime, "importance")
                 r["ablation"] = _ablation_curve(df, branch, folds[0], [f for f, _, _ in r["importance"]])
+                # The direction curve needs the direction-head ranking, which only a full CV run
+                # produces; a results.json from before that ranking existed keeps its old curve.
+                if r.get("importance_direction"):
+                    _assert_ranking_covers_contract(r["importance_direction"], branch, regime,
+                                                    "importance_direction")
+                    r["dir_ablation"] = _dir_ablation_curve(
+                        df, branch, folds[0], [f for f, _, _ in r["importance_direction"]])
+                else:
+                    print("  no importance_direction in results.json -- skipping the direction "
+                          "ablation (re-run report.py without --ablation-only to compute it)",
+                          flush=True)
             with open(results_json, "w") as f:
                 json.dump(results, f)
     else:
@@ -1554,18 +1911,31 @@ def main():
             json.dump(results, f)
         _save_dir_oof(evals, os.path.join(args.out_dir, "dir_oof.npz"))
 
+    drawn = {}  # name -> what plot_fn returned, for the few callers that need it
+
     def _png(name, plot_fn):
         """Path to ``out_dir/name``, regenerating it via ``plot_fn(path)`` unless ``--render-text-only``
         (which reuses the cached PNG and never calls ``plot_fn``). Returns None when the PNG is absent,
-        so its report section is skipped rather than embedding a missing file."""
+        so its report section is skipped rather than embedding a missing file. Each plot function's
+        own return value is recorded in ``drawn`` for callers whose prose depends on it."""
         path = os.path.join(args.out_dir, name)
         if not args.render_text_only:
-            plot_fn(path)
+            drawn[name] = plot_fn(path)
         return path if os.path.exists(path) else None
 
     mae_png = _png("mae_raw_vs_gated.png", lambda p: plot_mae(results, p))
     importance_png = _png("feature_importance.png", lambda p: plot_importance_panel(results, p))
     ablation_png = _png("ablation.png", lambda p: plot_ablation(results, p))
+    # plot_ablation reports whether it actually broke the y-axis. --render-text-only never redraws,
+    # so it falls back to the wording that claims nothing about the axis.
+    # Direction-head counterparts of the two panels above. Both self-skip (write nothing, so _png
+    # returns None and the section is omitted) on a cached results.json that predates them.
+    dir_importance_png = _png("feature_importance_direction.png",
+                              lambda p: plot_importance_panel(
+                                  results, p, key="importance_direction",
+                                  head_label="direction prediction",
+                                  score_label="mean log-loss rise"))
+    dir_ablation_png = _png("ablation_direction.png", lambda p: plot_dir_ablation(results, p))
 
     # Direction-predictor accuracy plots (PR-ROC / ROC from the dir_oof npz, confusion from
     # results.json).
@@ -1587,10 +1957,13 @@ def main():
     mae_homopolymer_png = ablation_homopolymer_png = importance_homopolymer_png = None
     pr_homopolymer_png = roc_homopolymer_png = None
     confusion_homopolymer_png = prob_violins_homopolymer_png = None
+    dir_importance_homopolymer_png = dir_ablation_homopolymer_png = None
+    homo_results = None  # also read by the stale-cache check at the end of main()
     homo_json = os.path.join(args.out_dir, "results_homopolymer.json")
     if args.render_text_only or os.path.exists(homo_json):
-        homo_results = None
-        if not args.render_text_only:
+        # Loaded regardless of --render-text-only: that mode still EMBEDS the homopolymer panels, so
+        # the stale-cache check at the end of main() has to be able to inspect their source.
+        if os.path.exists(homo_json):
             with open(homo_json) as f:
                 homo_results = json.load(f)
         # Guard against a stale results_homopolymer.json (computed from a different data pool) being
@@ -1616,6 +1989,15 @@ def main():
             importance_homopolymer_png = _png("feature_importance_homopolymer.png",
                                               lambda p: plot_importance_panel(homo_results, p,
                                                                               loci_label="homopolymer loci"))
+            dir_importance_homopolymer_png = _png(
+                "feature_importance_direction_homopolymer.png",
+                lambda p: plot_importance_panel(homo_results, p, loci_label="homopolymer loci",
+                                                key="importance_direction",
+                                                head_label="direction prediction",
+                                                score_label="mean log-loss rise"))
+            dir_ablation_homopolymer_png = _png(
+                "ablation_direction_homopolymer.png",
+                lambda p: plot_dir_ablation(homo_results, p, title_tag=htag))
             confusion_homopolymer_png = _png("confusion_homopolymer.png",
                                              lambda p: plot_confusion(homo_results, p, title_tag=htag))
             dir_oof_homo_npz = os.path.join(args.out_dir, "dir_oof_homopolymer.npz")
@@ -1630,6 +2012,11 @@ def main():
                     prob_violins_homopolymer_png = _png("prob_violins_homopolymer.png",
                                                         lambda p: plot_prob_violins(oof_dir_homo, p,
                                                                                     title_tag=htag))
+
+    # Both panels sit under one toggle and each chooses its own axis, so the sentence is emitted only
+    # when they agree (or only one exists); otherwise it would describe whichever panel is not shown.
+    ablation_axes = {drawn.get(n) for n in ("ablation.png", "ablation_homopolymer.png")} - {None}
+    ablation_axis = ablation_axes.pop() if len(ablation_axes) == 1 else "single"
 
     # By default, regenerate the held-out HPRC eval/stacked artifacts from any locally-built held-out
     # parquets so the section always reflects the current model (no download; --skip-heldout-samples
@@ -1654,6 +2041,12 @@ def main():
                 roc_homopolymer_png=roc_homopolymer_png,
                 confusion_homopolymer_png=confusion_homopolymer_png,
                 prob_violins_homopolymer_png=prob_violins_homopolymer_png,
+                dir_importance_png=dir_importance_png,
+                dir_importance_homopolymer_png=dir_importance_homopolymer_png,
+                dir_ablation_png=dir_ablation_png,
+                dir_ablation_homopolymer_png=dir_ablation_homopolymer_png,
+                stale_contract_html=_stale_contract_warning(results, homo_results),
+                ablation_axis=ablation_axis,
                 dataset_sections_html=dataset_sections_html)
 
 
