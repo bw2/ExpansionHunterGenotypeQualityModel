@@ -42,8 +42,10 @@ Coding rules: no type hints, Google docstrings, ``print()``, ``gcloud`` (macOS).
 import argparse
 import base64
 import email.utils
+import functools
 import glob
 import gzip
+import io
 import hashlib
 import json
 import os
@@ -65,8 +67,12 @@ EXPANSIONHUNTER_BW2_REPO = os.path.expanduser("~/code/ExpansionHunter-bw2")
 # tied to a specific EH run, so it cannot go stale relative to one. See
 # `_load_truth_from_genotypes_tsv`.
 TRUTH_CATALOG_ROOT = "gs://str-truth-set-v2/filter_vcf_v2"
+# filter_vcf_v2/ keeps each sample under the batch subdirectory of the dipcall run its truth came from (top level,
+# HPRC_release2/ or human579_assemblies/), as dipcall_pipeline/ does. This table, written by str-truth-set-v2's
+# filter_vcfs_v2/build_sample_to_dipcall_batch_table.py, maps each sample to that batch.
+SAMPLE_TO_DIPCALL_BATCH_TSV = TRUTH_CATALOG_ROOT + "/sample_to_dipcall_batch.tsv"
 # The truth set exists once per catalog it was genotyped against, under
-# {TRUTH_CATALOG_ROOT}/{sample}/{TRUTH_CATALOG_NAME}_genotypes/. combined_321_catalog covers every sample in
+# {TRUTH_CATALOG_ROOT}/[{batch}/]{sample}/{TRUTH_CATALOG_NAME}_genotypes/. combined_321_catalog covers every sample in
 # PROMOTED_HELDOUT_SAMPLES and heldout.SAMPLES; combined_43_catalog only covers the 43-sample short-read
 # benchmark panel plus HG002 and CHM1_CHM13.
 TRUTH_CATALOG_NAME = "combined_321_catalog"
@@ -143,9 +149,24 @@ def _combo_dir(sample, variant, cov_label):
     return "%s/%s/illumina/%s/%s_coverage/" % (GCS_ROOT, sample, variant, cov_label)
 
 
+@functools.lru_cache(maxsize=None)
+def _dipcall_batch_by_sample():
+    """Returns ``{sample: dipcall batch}`` from ``SAMPLE_TO_DIPCALL_BATCH_TSV`` (read once)."""
+    table = subprocess.run(["gsutil", "cat", SAMPLE_TO_DIPCALL_BATCH_TSV],
+                           capture_output=True, text=True, check=True).stdout
+    df = pd.read_table(io.StringIO(table), keep_default_na=False)
+    return dict(zip(df.sample_id, df.dipcall_batch))
+
+
+def _truth_sample_dir(sample):
+    """Returns the sample's truth directory: ``{TRUTH_CATALOG_ROOT}/[{batch}/]{sample}`` (no batch for top level)."""
+    batch = _dipcall_batch_by_sample()[sample]
+    return "%s/%s" % (TRUTH_CATALOG_ROOT, sample) if batch == "top_level" else "%s/%s/%s" % (
+        TRUTH_CATALOG_ROOT, batch, sample)
+
+
 def _truth_genotypes_tsv_remote(sample):
-    return "%s/%s/%s_genotypes/%s.tandem_repeat_genotypes.tsv.gz" % (
-        TRUTH_CATALOG_ROOT, sample, TRUTH_CATALOG_NAME, sample)
+    return "%s/%s_genotypes/%s.tandem_repeat_genotypes.tsv.gz" % (_truth_sample_dir(sample), TRUTH_CATALOG_NAME, sample)
 
 
 def _list_json_inputs(sample, variant, cov_label):
