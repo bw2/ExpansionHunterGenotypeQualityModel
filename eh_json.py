@@ -22,8 +22,9 @@ iterations are intentionally dropped). Pure functions, no global state, no rando
 """
 
 import gzip
-import json
 import re
+
+import ijson
 
 # Genotyping-branch labels (shared with features.genotyping_regime_of). The "quick" branch is
 # EH's QuickGenotype fast path (processLocusFast); "full" is the full genotyper.
@@ -50,9 +51,18 @@ EH_OUTPUT_FIELDS = [
 ]
 
 
-def _open(path):
-    """Opens ``path`` for text reading, transparently decompressing ``.gz``."""
-    return gzip.open(path, "rt") if path.endswith(".gz") else open(path)
+def _open_binary(path):
+    """Opens ``path`` for binary reading (what ijson's C backend wants), transparently decompressing ``.gz``."""
+    return gzip.open(path, "rb") if path.endswith(".gz") else open(path, "rb")
+
+
+def _sample_id_in_file(path):
+    """Returns ``SampleParameters.SampleId`` from an EH JSON file, or None.
+
+    EH writes ``SampleParameters`` at the head of the file, so this reads only that far.
+    """
+    with _open_binary(path) as f:
+        return next(ijson.items(f, "SampleParameters.SampleId"), None)
 
 
 def parse_counts(s):
@@ -278,10 +288,19 @@ def extract_rows(eh_json, sample_id=None):
 
     Yields:
         Per-allele row dicts (see ``extract_variant_rows``).
+
+    A path is read one ``LocusResults`` record at a time (ijson) rather than with ``json.load``: a
+    JSON on the 5.65M-locus TRExplorer v2.1 catalog would need ~50GB as parsed Python objects (1.08GB
+    for 108,701 loci), against ~20MB streamed. ``use_float=True`` makes numbers come back as the same
+    floats ``json.load`` returns, not Decimals.
     """
     if isinstance(eh_json, str):
-        with _open(eh_json) as f:
-            eh_json = json.load(f)
+        sid = sample_id or _sample_id_in_file(eh_json)
+        with _open_binary(eh_json) as f:
+            for _, locus_result in ijson.kvitems(f, "LocusResults", use_float=True):
+                for variant in (locus_result.get("Variants") or {}).values():
+                    yield from extract_variant_rows(variant, locus_result, sid)
+        return
     sid = sample_id or (eh_json.get("SampleParameters") or {}).get("SampleId")
     for locus_result in eh_json.get("LocusResults", {}).values():
         for variant in (locus_result.get("Variants") or {}).values():

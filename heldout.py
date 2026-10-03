@@ -4,8 +4,8 @@ The deployed model is loaded straight from its ``.json[.gz]`` -- the exact forma
 consumes -- and applied (NO fitting, no re-training) to the 81 held-out short-read samples in
 ``SAMPLES`` that are entirely absent from the training pool (the samples that train alongside
 HG002+CHM1_CHM13 are listed in ``dataset.PROMOTED_HELDOUT_SAMPLES``), scored against their truth.
-This is the realistic "train on some samples, apply to new samples" test. A single optimized-streaming source per sample (the same
-1.6M-locus catalog, ``EHv5-bw2-optimized``) supplies all three genotyping regimes via routing: its
+This is the realistic "train on some samples, apply to new samples" test. A single optimized-streaming source per sample (the
+TRExplorer v2.1 catalog, ``dataset.EH_RESULTS_ROOT``) supplies all three genotyping regimes via routing: its
 ``QuickGenotype`` rows are the ``quick`` regime and its full-genotyper-fallback rows split into
 ``full_spanning`` / ``full_nonspanning``.
 
@@ -24,21 +24,15 @@ import argparse
 import datetime
 import json
 import os
-import re
-import subprocess
 
 import numpy as np
 import pandas as pd
 
 import dataset
-import eh_json
 import features
 import model as M
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GCS_ROOT = "gs://str-truth-set-v2/tool_results"
-VARIANT = "EHv5-bw2-optimized"
-CATALOG = "combined_catalog_43_samples_1.6M_loci"
 
 # The 81 held-out short-read samples (absent from the training pool): the 138 1kGP samples with a
 # DipCall high-confidence BED, a truth-genotypes TSV and a Broad short-read CRAM, minus the 49 of
@@ -46,9 +40,7 @@ CATALOG = "combined_catalog_43_samples_1.6M_loci"
 # the split was chosen on 2026-09-25 and updated on 2026-09-28 and 2026-10-01), and minus the 8 whose DipCall truth
 # lost almost all of chrX/chrY (listed in str-truth-set-v2's
 # filter_vcfs_v2/samples_excluded_from_downstream_analyses.tsv). Includes the 30 samples held out
-# before 2026-09-25 and the ten pOk fast-path diagnosis samples. Only the 30 pre-existing samples
-# have an EHv5-bw2-optimized run under GCS_ROOT so far; the other 51 need one before
-# ``build_sample`` can ingest them.
+# before 2026-09-25 and the ten pOk fast-path diagnosis samples.
 SAMPLES = [
     "HG00423", "HG00438", "HG00514", "HG00544", "HG00558", "HG00597", "HG00609", "HG00639",
     "HG00642", "HG00673", "HG00733", "HG00735", "HG00738", "HG00741", "HG01071", "HG01099",
@@ -64,56 +56,35 @@ SAMPLES = [
 ]
 
 
-def _discover_cov(sample):
-    """Returns the coverage label (e.g. ``"32x"``) auto-discovered from the GCS path."""
-    out = subprocess.run(["gsutil", "ls", "%s/%s/illumina/%s/" % (GCS_ROOT, sample, VARIANT)],
-                         capture_output=True, text=True).stdout
-    for line in out.split():
-        m = re.search(r"/(\d+)x_coverage/", line)
-        if m:
-            return "%sx" % m.group(1)
-    raise RuntimeError("no Nx_coverage dir for %s" % sample)
-
-
-def _catalog_base(sample, cov):
-    return "%s/%s/illumina/%s/%s_coverage/%s/" % (GCS_ROOT, sample, VARIANT, cov, CATALOG)
-
-
 def build_sample(sample, data_dir, force):
-    """Downloads + joins one held-out sample and writes its per-sample parquet."""
+    """Downloads + joins one held-out sample and writes its per-sample parquet.
+
+    ``sample`` is both the sample label of its ``dataset.EH_RESULTS_ROOT`` folder and its truth sample id.
+    """
     out_path = os.path.join(data_dir, "real_43", "%s.parquet" % sample)
-    cov = _discover_cov(sample)
-    base = _catalog_base(sample, cov)
-    listing = subprocess.run(["gsutil", "ls", base + "json/"],
-                             capture_output=True, text=True, check=True).stdout.split()
-    json_remote = sorted(p for p in listing if p.endswith(".json") or p.endswith(".json.gz"))
+    json_remote = dataset._list_json_inputs(sample)
 
     dl_dir = os.path.join(data_dir, "real_43", "_downloads", sample)
-    genotypes_tsv_remote = dataset._truth_genotypes_tsv_remote(sample)
     json_locals = [os.path.join(dl_dir, os.path.basename(r)) for r in json_remote]
-    genotypes_tsv_local = os.path.join(dl_dir, os.path.basename(genotypes_tsv_remote))
+    truth_sources = dataset._truth_sources(sample, dl_dir)
     # Checked even when the parquet cache below is about to be reused -- see dataset.build_combo.
     # Deletes any bucket-newer / content-changed local copy so _download re-fetches it below.
     dataset._check_freshness(sample,
                              [("json shard %d" % i, r, l) for i, (r, l) in enumerate(zip(json_remote, json_locals))]
-                             + [("truth-genotypes TSV", genotypes_tsv_remote, genotypes_tsv_local)])
+                             + truth_sources)
 
-    if dataset._parquet_reusable(out_path, json_locals + [genotypes_tsv_local], force):
+    if dataset._parquet_reusable(out_path, json_locals + [l for _, _, l in truth_sources], force):
         return out_path
-    print("=== %s (%s): %d json file(s) ===" % (sample, cov, len(json_remote)), flush=True)
+    print("=== %s: %d json file(s) ===" % (sample, len(json_remote)), flush=True)
 
     json_local = dataset._download(json_remote, dl_dir)
-    genotypes_tsv_local = dataset._download([genotypes_tsv_remote], dl_dir)[0]
+    genotypes_tsv_local, high_confidence_bed_local = dataset._download([r for _, r, _ in truth_sources], dl_dir)
     # _check_freshness could only judge shards that already existed locally -- see dataset.build_combo.
     dataset.assert_eh_build_matches(
         sample, [("json shard %d" % i, p) for i, p in enumerate(json_local)])
 
-    rows = []
-    for path in json_local:
-        rows.extend(eh_json.extract_rows(path, sample_id=sample))
-    merged = dataset._join_truth(
-        pd.DataFrame(rows), dataset._load_truth_from_genotypes_tsv(genotypes_tsv_local), sample)
-    merged = merged.drop(columns=["sample_id"])
+    merged = dataset.extract_rows_and_join_truth(
+        json_local, genotypes_tsv_local, high_confidence_bed_local, sample, sample).drop(columns=["sample_id"])
     # Feature columns stay float64 all the way to fit(). Downcasting here used to halve the parquet
     # and frame size, but it permanently quantized every value: sklearn's HistGradientBoosting upcasts
     # back to float64 internally (X_DTYPE) and bins to uint8, so the downcast bought nothing at fit

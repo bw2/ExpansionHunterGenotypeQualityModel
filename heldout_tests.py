@@ -9,7 +9,6 @@ import json
 import os
 import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -33,25 +32,6 @@ def _raw_feature_row(**overrides):
                "has_own_quality_metrics": True})
     row.update(overrides)
     return row
-
-
-class CatalogBaseTest(unittest.TestCase):
-    def test_path_shape(self):
-        base = heldout._catalog_base("HG00438", "30x")
-        self.assertEqual(base, "%s/HG00438/illumina/%s/30x_coverage/%s/"
-                         % (heldout.GCS_ROOT, heldout.VARIANT, heldout.CATALOG))
-
-
-class DiscoverCovTest(unittest.TestCase):
-    def test_parses_coverage_dir(self):
-        with mock.patch.object(heldout.subprocess, "run",
-                               return_value=SimpleNamespace(stdout="gs://x/illumina/32x_coverage/\n")):
-            self.assertEqual(heldout._discover_cov("HG00438"), "32x")
-
-    def test_missing_coverage_dir_raises(self):
-        with mock.patch.object(heldout.subprocess, "run", return_value=SimpleNamespace(stdout="")):
-            with self.assertRaises(RuntimeError):
-                heldout._discover_cov("HG00438")
 
 
 class NewAccTest(unittest.TestCase):
@@ -179,12 +159,11 @@ class BuildSampleTest(unittest.TestCase):
             tsv_local = os.path.join(dl_dir, "HG00438.tandem_repeat_genotypes.tsv.gz")
             open(json_local, "w").close()
             open(tsv_local, "w").close()
+            open(os.path.join(dl_dir, "HG00438.dip.bed.gz"), "w").close()  # basename from high_confidence_beds.tsv
             dataset_tests.write_contract_parquet(out_path, n_rows=2)
             newer = max(os.path.getmtime(json_local), os.path.getmtime(tsv_local)) + 100
             os.utime(out_path, (newer, newer))
-            with mock.patch.object(heldout, "_discover_cov", return_value="30x"), \
-                 mock.patch.object(heldout.subprocess, "run",
-                                   return_value=SimpleNamespace(stdout="gs://x/json/a.json.gz")), \
+            with mock.patch.object(dataset, "_list_json_inputs", return_value=["gs://x/json/a.json.gz"]), \
                  mock.patch.object(dataset, "_check_freshness", return_value=0), \
                  mock.patch.object(dataset, "_download", side_effect=AssertionError("should not download")):
                 out = heldout.build_sample("HG00438", d, force=False)
@@ -196,15 +175,14 @@ class BuildSampleTest(unittest.TestCase):
         fake_tsv_df = pd.DataFrame({"LocusId": ["1-1-2-A"], "allele_rank": [0], "true": [9.0],
                                    "purity": [1.0], "is_negative_locus": [False]})
         with tempfile.TemporaryDirectory() as d:
-            with mock.patch.object(heldout, "_discover_cov", return_value="30x"), \
-                 mock.patch.object(heldout.subprocess, "run",
-                                   return_value=SimpleNamespace(stdout="gs://x/json/a.json.gz")), \
+            with mock.patch.object(dataset, "_list_json_inputs", return_value=["gs://x/json/a.json.gz"]), \
                  mock.patch.object(dataset, "_download",
                                    side_effect=lambda remote, dest: [os.path.join(dest, os.path.basename(p))
                                                                      for p in remote]), \
                  mock.patch.object(dataset, "assert_eh_build_matches"), \
-                 mock.patch.object(heldout.eh_json, "extract_rows", return_value=fake_rows), \
-                 mock.patch.object(dataset, "_load_truth_from_genotypes_tsv", return_value=fake_tsv_df):
+                 mock.patch.object(dataset.eh_json, "extract_rows", return_value=fake_rows), \
+                 mock.patch.object(dataset, "_load_truth_from_genotypes_tsv",
+                                   return_value=(fake_tsv_df, {"1-1-2-A"})):
                 out_path = heldout.build_sample("HG00438", d, force=True)
             merged = pd.read_parquet(out_path)
             self.assertEqual(len(merged), 1)

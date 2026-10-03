@@ -141,6 +141,18 @@ class ExtractTest(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[0]["sample_id"], "S")
 
+    def test_path_rows_match_parsed_dict_rows(self):
+        # A path is streamed with ijson; its rows (floats included) must equal those from the parsed dict.
+        eh = {"SampleParameters": {"SampleId": "FromFile", "Sex": "Female"},
+              "LocusResults": {"x": _locus(), "y": _locus()}}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.json")
+            with open(path, "w") as f:
+                json.dump(eh, f)
+            from_path = list(eh_json.extract_rows(path))
+        self.assertEqual(from_path, list(eh_json.extract_rows(eh)))
+        self.assertEqual(from_path[0]["sample_id"], "FromFile")
+
 
 if __name__ == "__main__":
     unittest.main()

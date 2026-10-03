@@ -2,17 +2,17 @@
 
 For each ``(sample, coverage)`` combo on each genotyping branch this module:
 
-  1. Idempotently downloads the per-shard EH JSON (``*.json.gz``) from
-     ``gs://str-truth-set-v2/tool_results/...`` plus the tool-independent truth-genotypes TSV
-     (``TRUTH_CATALOG_ROOT``, used for the actual truth join, shared across a sample's coverages).
+  1. Idempotently downloads the EH JSON (``*.json.gz``) from ``EH_RESULTS_ROOT`` plus the
+     tool-independent truth-genotypes TSV (``TRUTH_GENOTYPES_ROOT``, used for the actual truth join,
+     shared across a sample's coverages). Both come from the same run on the TRExplorer v2.1 catalog.
      A local file is kept only if it is present AND still current; ``_check_freshness`` re-downloads
      any local copy whose bucket object is newer (by last-modified) or whose content (md5) has changed.
-  2. Extracts per-allele feature rows from the JSON via ``eh_json.extract_rows``
-     (``eh`` and every feature come from the JSON, never a TSV).
-  3. Filters the truth-genotypes TSV to EH's catalog loci (primary contigs + variant, non-hom-ref;
-     see ``_load_truth_from_genotypes_tsv``) and joins it on ``(locus_id, allele_rank)`` --
-     ascending-by-truth-value Short/Long pairing -- attaching only ``true`` / ``purity`` / the
-     negative-control flag (always False for this source).
+  2. Filters the truth-genotypes TSV to primary-contig loci where the sample differs from the
+     reference (see ``_load_truth_from_genotypes_tsv``), then extracts per-allele feature rows from
+     the JSON via ``eh_json.extract_rows``, keeping only rows at those loci (``eh`` and every feature
+     come from the JSON, never a TSV).
+  3. Joins the truth on ``(locus_id, allele_rank)`` -- ascending-by-truth-value Short/Long pairing --
+     attaching only ``true`` / ``purity`` / the negative-control flag (always False for this source).
   4. Writes one parquet per combo, then assembles + labels + filters into
      ``data/parquet/{quick,full}.parquet``.
 
@@ -42,10 +42,8 @@ Coding rules: no type hints, Google docstrings, ``print()``, ``gcloud`` (macOS).
 import argparse
 import base64
 import email.utils
-import functools
 import glob
 import gzip
-import io
 import hashlib
 import json
 import os
@@ -53,45 +51,55 @@ import re
 import subprocess
 import sys
 
+import numpy as np
 import pandas as pd
 
 import eh_json
 import features
 
-GCS_ROOT = "gs://str-truth-set-v2/tool_results"
+# ExpansionHunter-bw2 (optimized-streaming) results on the TRExplorer v2.1 catalog (5.65M loci), one
+# folder per sample label, written by tandem-repeat-explorer's
+# data-prep/expansion_hunter_genotype_quality/run_expansion_hunter_on_selected_samples.py from
+# short_read_samples_with_truth_data.tsv: {EH_RESULTS_ROOT}/{sample_label}/json/<catalog name>.json.gz.
+EH_RESULTS_ROOT = "gs://tandem-repeat-explorer/tool_genotype_quality/expansion_hunter_v2.1"
+# Tool-independent truth on the same catalog, built directly from the dipcall/long-read-assembly
+# pipeline (run_truth_genotyping_on_selected_samples.py in the same folder), one file per sample (not
+# per sample+coverage -- truth doesn't depend on short-read coverage). Never tied to a specific EH run,
+# so it cannot go stale relative to one. Unlike the earlier per-catalog truth files it lists nearly
+# every catalog locus (5,657,793 of 5,657,854 for HG01993), hom-ref ones included. See
+# `_load_truth_from_genotypes_tsv`.
+TRUTH_GENOTYPES_ROOT = "gs://tandem-repeat-explorer/tool_genotype_quality/truth_genotypes_v2.1"
+HERE = os.path.dirname(os.path.abspath(__file__))
+# The truth genotyper reports the reference length both for a locus that matches the reference and for
+# one DipCall could not call, so a truth genotype only counts inside the sample's DipCall
+# high-confidence regions (the truth run leaves that filter to its readers, as compare_eh_to_truth.py
+# does). This table maps each sample_id to its DipCall BED. It is a copy, made on 2026-10-02, of the
+# sample_id / high_confidence_bed_path columns of tandem-repeat-explorer's
+# data-prep/expansion_hunter_genotype_quality/short_read_samples_with_truth_data.tsv, the table the EH
+# and truth runs were launched from; re-copy it if that table changes.
+HIGH_CONFIDENCE_BEDS_TSV = os.path.join(HERE, "high_confidence_beds.tsv")
 # Local checkout used only to compare a downloaded EH JSON's stamped build version against the
 # current ExpansionHunter-bw2 HEAD (see ``_check_freshness``). Skipped if not present.
 EXPANSIONHUNTER_BW2_REPO = os.path.expanduser("~/code/ExpansionHunter-bw2")
-# Tool-independent truth catalog: built directly from the dipcall/long-read-assembly pipeline, one
-# file per sample (not per sample+coverage -- truth doesn't depend on short-read coverage). Never
-# tied to a specific EH run, so it cannot go stale relative to one. See
-# `_load_truth_from_genotypes_tsv`.
-TRUTH_CATALOG_ROOT = "gs://str-truth-set-v2/filter_vcf_v2"
-# filter_vcf_v2/ keeps each sample under the batch subdirectory of the dipcall run its truth came from (top level,
-# HPRC_release2/ or human579_assemblies/), as dipcall_pipeline/ does. This table, written by str-truth-set-v2's
-# filter_vcfs_v2/build_sample_to_dipcall_batch_table.py, maps each sample to that batch.
-SAMPLE_TO_DIPCALL_BATCH_TSV = TRUTH_CATALOG_ROOT + "/sample_to_dipcall_batch.tsv"
-# The truth set exists once per catalog it was genotyped against, under
-# {TRUTH_CATALOG_ROOT}/[{batch}/]{sample}/{TRUTH_CATALOG_NAME}_genotypes/. combined_321_catalog covers every sample in
-# PROMOTED_HELDOUT_SAMPLES and heldout.SAMPLES; combined_43_catalog only covers the 43-sample short-read
-# benchmark panel plus HG002 and CHM1_CHM13.
-TRUTH_CATALOG_NAME = "combined_321_catalog"
-HERE = os.path.dirname(os.path.abspath(__file__))
+# Files whose changes cannot alter the ExpansionHunter binary: docs, CI workflows, and the image
+# digest the Docker workflow commits back after each build. A JSON stamped with an older commit still
+# counts as current-build if only these changed since (see ``assert_eh_build_matches``).
+_FILES_THAT_DO_NOT_AFFECT_THE_EH_BUILD_RE = re.compile(r"(\.md$|^\.github/|^docker/sha256\.txt$)")
 
-# Single source variant: the optimized-streaming run deployed in production. Its QuickGenotype
-# rows feed the `quick` branch and its full-genotyper fallback rows feed the `full` branch (the
-# split happens in assemble_branch by genotyping_branch). The variant token is also templated into
-# the truth-TSV column headers. SOURCE_SUBDIR keeps its historical name ("real_quick") so existing
-# local downloads/parquets are reused; it now feeds BOTH branches.
-SOURCE_VARIANT = "EHv5-bw2-optimized"
+# Single source: the optimized-streaming run deployed in production. Its QuickGenotype rows feed the
+# `quick` branch and its full-genotyper fallback rows feed the `full` branch (the split happens in
+# assemble_branch by genotyping_branch). SOURCE_SUBDIR keeps its historical name ("real_quick"); it
+# feeds BOTH branches.
 SOURCE_SUBDIR = "real_quick"
 
-# (sample, coverage-dir label) -- illumina WGS only.
+# (sample, coverage label, sample label of its EH_RESULTS_ROOT folder) -- illumina WGS only. The
+# sample label comes from short_read_samples_with_truth_data.tsv, where the full-depth HG002 is plain
+# "HG002". Local parquets and downloads stay keyed by "<sample>_<coverage>".
 COMBOS = [
-    ("HG002", "10x"),
-    ("HG002", "20x"),
-    ("HG002", "31x"),
-    ("CHM1_CHM13", "46x"),
+    ("HG002", "10x", "HG002_10x"),
+    ("HG002", "20x", "HG002_20x"),
+    ("HG002", "31x", "HG002"),
+    ("CHM1_CHM13", "46x", "CHM1_CHM13"),
 ]
 
 # Single-coverage 1kGP/HPRC samples that join HG002+CHM1_CHM13 in the training pool, for ancestry/sex
@@ -124,9 +132,6 @@ COMBOS = [
 #     HG02011, HG02492, HG03065, HG03371, HG03732, NA19650). Result: 15 populations are represented
 #     (1 to 5 samples each; IBS, ITU and MXL had only excluded samples), 25 female / 26 male
 #     including HG002.
-# The 37 additions have no EHv5-bw2-optimized run under GCS_ROOT yet: each needs
-# ``<sample>/illumina/EHv5-bw2-optimized/<cov>_coverage/combined_catalog_43_samples_1.6M_loci/json/``
-# (``heldout._catalog_base``) before ``heldout.build_sample`` can ingest it.
 PROMOTED_HELDOUT_SAMPLES = (
     "NA12878", "HG03492", "HG00621", "HG02080", "HG01106", "HG01258", "HG01928",
     "HG02055", "HG02622", "HG03453", "HG03125", "NA18906", "NA20129",
@@ -145,33 +150,31 @@ _VERSION_RE = re.compile(rb'"Version"\s*:\s*"([^"]*)"')
 _VERSION_CARRY_BYTES = 256  # comfortably longer than the longest possible key/value spelling
 
 
-def _combo_dir(sample, variant, cov_label):
-    return "%s/%s/illumina/%s/%s_coverage/" % (GCS_ROOT, sample, variant, cov_label)
-
-
-@functools.lru_cache(maxsize=None)
-def _dipcall_batch_by_sample():
-    """Returns ``{sample: dipcall batch}`` from ``SAMPLE_TO_DIPCALL_BATCH_TSV`` (read once)."""
-    table = subprocess.run(["gsutil", "cat", SAMPLE_TO_DIPCALL_BATCH_TSV],
-                           capture_output=True, text=True, check=True).stdout
-    df = pd.read_table(io.StringIO(table), keep_default_na=False)
-    return dict(zip(df.sample_id, df.dipcall_batch))
-
-
-def _truth_sample_dir(sample):
-    """Returns the sample's truth directory: ``{TRUTH_CATALOG_ROOT}/[{batch}/]{sample}`` (no batch for top level)."""
-    batch = _dipcall_batch_by_sample()[sample]
-    return "%s/%s" % (TRUTH_CATALOG_ROOT, sample) if batch == "top_level" else "%s/%s/%s" % (
-        TRUTH_CATALOG_ROOT, batch, sample)
-
-
 def _truth_genotypes_tsv_remote(sample):
-    return "%s/%s_genotypes/%s.tandem_repeat_genotypes.tsv.gz" % (_truth_sample_dir(sample), TRUTH_CATALOG_NAME, sample)
+    return "%s/%s/%s.tandem_repeat_genotypes.tsv.gz" % (TRUTH_GENOTYPES_ROOT, sample, sample)
 
 
-def _list_json_inputs(sample, variant, cov_label):
-    """Lists the combo's JSON shard paths (prefers a single combined file if present)."""
-    listing = subprocess.run(["gsutil", "ls", _combo_dir(sample, variant, cov_label) + "json/"],
+def _high_confidence_bed_remote(sample):
+    """Returns the sample's DipCall high-confidence BED path from ``HIGH_CONFIDENCE_BEDS_TSV``."""
+    table = pd.read_table(HIGH_CONFIDENCE_BEDS_TSV)
+    paths = table.loc[table["sample_id"] == sample, "high_confidence_bed_path"]
+    if len(paths) != 1:
+        raise RuntimeError("%s lists %d high-confidence BEDs for %s, expected 1"
+                           % (HIGH_CONFIDENCE_BEDS_TSV, len(paths), sample))
+    return paths.iloc[0]
+
+
+def _truth_sources(sample, dl_dir):
+    """Returns ``(label, remote, local)`` for the sample's truth TSV and its high-confidence BED,
+    both downloaded into ``dl_dir`` (in the form ``_check_freshness`` takes)."""
+    remotes = [("truth-genotypes TSV", _truth_genotypes_tsv_remote(sample)),
+               ("high-confidence BED", _high_confidence_bed_remote(sample))]
+    return [(label, remote, os.path.join(dl_dir, os.path.basename(remote))) for label, remote in remotes]
+
+
+def _list_json_inputs(sample_label):
+    """Lists the sample label's JSON shard paths (prefers a single combined file if present)."""
+    listing = subprocess.run(["gsutil", "ls", "%s/%s/json/" % (EH_RESULTS_ROOT, sample_label)],
                              capture_output=True, text=True, check=True).stdout.split()
     jsons = [p for p in listing if p.endswith(".json") or p.endswith(".json.gz")]
     combined = sorted(p for p in jsons if ".shard" not in os.path.basename(p))
@@ -256,6 +259,25 @@ def _bw2_head_sha():
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def _bw2_files_changed_since(sha):
+    """Returns the files that differ between ExpansionHunter-bw2 commit ``sha`` and HEAD, or None if
+    the local checkout does not know ``sha`` (e.g. ``"unknown"``, or a commit not yet pulled)."""
+    result = subprocess.run(["git", "-C", EXPANSIONHUNTER_BW2_REPO, "diff", "--name-only", sha, "HEAD", "--"],
+                            capture_output=True, text=True)
+    return result.stdout.split() if result.returncode == 0 else None
+
+
+def _eh_build_is_current(version, head):
+    """Returns True iff a JSON stamped with ``version`` came from a build equivalent to ``head``: the
+    same commit, or one from which only files that cannot affect the binary have changed since."""
+    if version == head:
+        return True
+    if not version:
+        return False
+    changed = _bw2_files_changed_since(version)
+    return changed is not None and all(_FILES_THAT_DO_NOT_AFFECT_THE_EH_BUILD_RE.search(f) for f in changed)
+
+
 def _json_eh_version(path):
     """Returns the short commit sha of the ExpansionHunter-bw2 build that produced a JSON shard.
 
@@ -287,6 +309,11 @@ def _json_eh_version(path):
 def assert_eh_build_matches(desc, labelled_json_paths):
     """Exits nonzero if any EH output JSON was produced by a build other than ExpansionHunter-bw2 HEAD.
 
+    A JSON stamped with an older commit still passes when every file changed between that commit and
+    HEAD is a doc, CI workflow or image-digest file (``_FILES_THAT_DO_NOT_AFFECT_THE_EH_BUILD_RE``):
+    README edits and the digest commit the Docker workflow pushes after each build land on top of the
+    commit the image was built from, and would otherwise make every current JSON look stale.
+
     ``labelled_json_paths`` is a list of ``(label, path)``. A mismatch means the calls in that JSON came
     from a different EH build, which matters beyond provenance: a build can change what an existing
     field MEANS without changing its name (the ``genotype_quality_model_update`` branch redefined
@@ -304,7 +331,7 @@ def assert_eh_build_matches(desc, labelled_json_paths):
     if not head:
         return
     stale = [(label, _json_eh_version(path)) for label, path in labelled_json_paths]
-    stale = [(label, version) for label, version in stale if version != head]
+    stale = [(label, version) for label, version in stale if not _eh_build_is_current(version, head)]
     if not stale:
         return
     print("\n=== STALE EH BUILD: %s ===" % desc)
@@ -429,37 +456,59 @@ def _parquet_reusable(out_path, upstream_locals, force):
     return True
 
 
-def _load_truth_from_genotypes_tsv(tsv_path):
-    """Loads the tool-independent truth-genotypes TSV (see ``TRUTH_CATALOG_ROOT``), applies the
-    EH-catalog-generation filters, and reshapes it from wide (Short/Long allele columns) to long.
+def _inside_high_confidence_regions(chrom, start_0based, end, bed_path):
+    """Returns a boolean array: is each interval wholly inside a single region of ``bed_path``?
 
-    Built directly from the dipcall/long-read-assembly pipeline, never tied to a specific EH run, so it
-    cannot go stale relative to one. It is a superset of the loci ExpansionHunter actually genotypes:
-    ``str-truth-set-v2/run_tools/convert_truth_set_to_variant_catalogs.py`` builds the EH catalog from
-    this same table by keeping only (a) primary-assembly contigs (chr1-22, X, Y) and (b) *variant*
-    (non-reference) loci with parseable repeat counts -- a locus whose Short AND Long alleles both equal
-    the reference is hom-ref and is dropped. We apply those same two filters here so the truth we join
-    against is the set of loci EH's catalog contains (this is what closes most of the JSON-vs-truth
-    catalog gap; see ``_assert_catalog_agreement``). The IlluminaEHv5-only prefilters (>=500 bp
-    reference-interval cap, >5 flanking Ns) are deliberately NOT applied: they are specific to the
-    official Illumina build, whereas the ``EHv5-bw2-optimized`` source tolerates large loci, and the
-    held-out validation depends on evaluating those large alleles.
+    Same rule as tandem-repeat-explorer's compare_eh_to_truth.is_fully_callable: DipCall's regions are
+    disjoint, so it is enough to find the last region starting at or before the interval and check that
+    it also covers the interval's end. ``chrom`` must use the BED's naming (both use ``chr``).
+    """
+    bed = pd.read_csv(bed_path, sep="\t", header=None, usecols=[0, 1, 2], names=["chrom", "start", "end"],
+                      dtype={"chrom": str}, compression="infer").sort_values(["chrom", "start"])
+    chrom, start_0based, end = np.asarray(chrom), np.asarray(start_0based), np.asarray(end)
+    inside = np.zeros(len(chrom), dtype=bool)
+    for name, regions in bed.groupby("chrom"):
+        on_chrom = chrom == name
+        starts, ends = regions["start"].to_numpy(), regions["end"].to_numpy()
+        index = np.searchsorted(starts, start_0based[on_chrom], side="right") - 1
+        inside[on_chrom] = (index >= 0) & (end[on_chrom] <= ends[np.maximum(index, 0)])
+    return inside
+
+
+def _load_truth_from_genotypes_tsv(tsv_path, high_confidence_bed_path):
+    """Loads the tool-independent truth-genotypes TSV (see ``TRUTH_GENOTYPES_ROOT``), keeps the loci
+    the model trains on, and reshapes them from wide (Short/Long allele columns) to long.
+
+    Built directly from the dipcall/long-read-assembly pipeline on the same catalog EH genotyped, and
+    never tied to a specific EH run, so it cannot go stale relative to one. It lists nearly every
+    catalog locus, most of them hom-ref. Two filters apply: (a) primary-assembly contigs (chr1-22, X,
+    Y) with parseable repeat counts, wholly inside one of the sample's DipCall high-confidence regions
+    (``high_confidence_bed_path``; outside them a reference-length truth call cannot be told apart from
+    a locus DipCall could not call, see ``HIGH_CONFIDENCE_BEDS_TSV``), which defines the truth loci EH
+    is expected to have genotyped (see ``_assert_catalog_agreement``), and then (b) *variant* loci
+    only -- a locus whose Short AND Long alleles both equal the reference is hom-ref and is dropped,
+    so training covers the same kind of loci as with the earlier variant-only catalogs.
 
     ``is_negative_locus`` is always False (no negative-control rows). HOM/HEMI rows have
     ``NumRepeatsShortAllele == NumRepeatsLongAllele``, so every kept locus yields exactly two allele
     rows: ``allele_rank=0`` from the Short columns, ``allele_rank=1`` from the Long columns
     (ascending-by-truth-value pairing). Duplicate LocusId rows are collapsed via ``drop_duplicates``
-    before filtering. Returns the ``{LocusId, allele_rank, true, purity, is_negative_locus}`` contract
-    ``_join_truth`` expects.
+    before filtering. A leading ``chr`` is stripped from every LocusId (EH's v2.1 LocusIds have none).
+
+    Returns:
+        A ``(truth_df, truth_locus_ids)`` tuple. ``truth_df`` holds the variant loci in the
+        ``{LocusId, allele_rank, true, purity, is_negative_locus}`` contract ``_join_truth`` expects;
+        ``truth_locus_ids`` is the set of LocusIds passing filter (a), hom-ref loci included.
     """
-    cols = ["LocusId", "Chrom", "NumRepeatsInReference",
+    cols = ["LocusId", "Chrom", "Start0Based", "End", "NumRepeatsInReference",
            "NumRepeatsShortAllele", "NumRepeatsLongAllele",
            "RepeatPurityShortAllele", "RepeatPurityLongAllele"]
     df = pd.read_csv(tsv_path, sep="\t", compression="gzip", usecols=cols,
                      dtype={"LocusId": str, "Chrom": str}).drop_duplicates("LocusId")
+    df["LocusId"] = df["LocusId"].str.replace(r"^chr", "", regex=True)
 
-    # EH-catalog-generation filters (convert_truth_set_to_variant_catalogs.py): primary contigs only,
-    # and variant (non-hom-ref) loci with parseable repeat counts. NaN ref/short/long -> not parseable.
+    # Primary contigs with parseable repeat counts inside the high-confidence regions, then variant
+    # (non-hom-ref) loci only. NaN ref/short/long -> not parseable.
     n0 = len(df)
     # ANALYSIS_OK[imputation]: nothing is imputed -- errors="coerce" turns an unparseable repeat
     # count into NaN precisely so the `parseable` mask below drops that locus, mirroring the EH
@@ -470,9 +519,12 @@ def _load_truth_from_genotypes_tsv(tsv_path):
     primary = df["Chrom"].astype(str).str.replace(r"^chr", "", regex=True).isin(VALID_CHROMS)
     parseable = ref.notna() & short_n.notna() & long_n.notna()
     variant = ~((short_n == ref) & (long_n == ref))
-    df = df[primary & parseable & variant]
-    print("    truth catalog: %d loci -> %d after EH-catalog filters (primary contig + variant), "
-          "dropped %d" % (n0, len(df), n0 - len(df)))
+    confident = _inside_high_confidence_regions(df["Chrom"], df["Start0Based"], df["End"],
+                                                high_confidence_bed_path)
+    truth_locus_ids = set(df.loc[primary & parseable & confident, "LocusId"])
+    df = df[primary & parseable & confident & variant]
+    print("    truth catalog: %d loci -> %d on primary contigs with parseable counts inside the "
+          "high-confidence regions -> %d variant" % (n0, len(truth_locus_ids), len(df)))
 
     short = df[["LocusId", "NumRepeatsShortAllele", "RepeatPurityShortAllele"]].rename(
         columns={"NumRepeatsShortAllele": "true", "RepeatPurityShortAllele": "purity"})
@@ -486,17 +538,16 @@ def _load_truth_from_genotypes_tsv(tsv_path):
     for c in ("true", "purity"):
         out[c] = pd.to_numeric(out[c], errors="coerce")
     out["is_negative_locus"] = False
-    return out[["LocusId", "allele_rank", "true", "purity", "is_negative_locus"]]
+    return out[["LocusId", "allele_rank", "true", "purity", "is_negative_locus"]], truth_locus_ids
 
 
-# Symmetric locus-catalog agreement check (see ``_assert_catalog_agreement``): after the truth is
-# filtered to EH's catalog rules (_load_truth_from_genotypes_tsv), the JSON download and that filtered
-# truth should cover close to the same loci. A global-only tolerance would miss a mismatch concentrated
-# in one allele-size range -- exactly the failure mode this exists to catch (found live: large-allele
-# truth loci silently absent from a "real_quick" JSON download that the truth still listed EH calls
-# for; global mismatch was small but the largest-allele bin was heavily affected).
-_CATALOG_MISMATCH_GLOBAL_MAX = 0.02   # refuse if >2% of the combined locus catalog disagrees overall
-_CATALOG_MISMATCH_PERBIN_MAX = 0.15   # refuse if any truth-allele-size bin disagrees by more than this
+# Locus-catalog agreement check (see ``_assert_catalog_agreement``): EH and the truth genotyped the
+# same catalog, so nearly every truth locus should have a JSON record. A global-only tolerance would
+# miss a gap concentrated in one allele-size range -- exactly the failure mode this exists to catch
+# (found live: large-allele truth loci silently absent from an older JSON download; the global gap was
+# small but the largest-allele bin was heavily affected).
+_CATALOG_MISMATCH_GLOBAL_MAX = 0.02   # flag if >2% of the sample's truth loci have no JSON record
+_CATALOG_MISMATCH_PERBIN_MAX = 0.15   # flag if any truth-allele-size bin is missing more than this
 _CATALOG_SIZE_BIN_EDGES = (20, 50, 100, 200)  # truth repeat-count bin edges (open-ended below/above)
 
 
@@ -509,32 +560,30 @@ def _size_bin_label(true_repeats):
     return "?"
 
 
-def _assert_catalog_agreement(json_df, tsv_df, source_desc, fatal=True):
-    """Raises (or, if ``fatal=False``, prints a WARNING and continues) when the JSON and truth-TSV
-    locus catalogs disagree beyond tolerance.
+def _assert_catalog_agreement(json_locus_ids, truth_locus_ids, truth_df, source_desc, fatal=True):
+    """Raises (or, if ``fatal=False``, prints a WARNING and continues) when too many of the sample's
+    truth loci have no record in the EH JSON.
 
-    Compares the two locus_id sets directly (symmetric -- independent of join direction), both overall
-    and within each truth-allele-size bucket (bucketed from the TSV's own ``true`` column, the only
-    side that carries a truth size). Call this BEFORE joining so a silent catalog mismatch is refused
-    at ingestion time instead of quietly dropping alleles downstream with no visible signal.
-    ``fatal=False`` downgrades a mismatch to a printed warning instead of raising (see ``_join_truth``,
-    the only current caller, for why).
+    One-directional on purpose: the JSON covers the whole catalog while the truth may omit loci it
+    could not genotype, so loci found only in the JSON are expected and not counted.
+    The gap is measured over ``truth_locus_ids`` (every truth locus, hom-ref included) overall, and
+    within each truth-allele-size bucket over ``truth_df`` (the variant loci that are trained on,
+    bucketed by their ``true`` allele sizes). Run it before the rows are joined so a silent catalog
+    mismatch is reported at ingestion time instead of quietly dropping alleles downstream.
     """
-    json_loci, tsv_loci = set(json_df["locus_id"]), set(tsv_df["LocusId"])
-    union = json_loci | tsv_loci
-    if not union:
+    if not truth_locus_ids:
         return
-    only_json, only_tsv = json_loci - tsv_loci, tsv_loci - json_loci
-    global_frac = len(only_json | only_tsv) / len(union)
+    missing_loci = truth_locus_ids - json_locus_ids
+    global_frac = len(missing_loci) / len(truth_locus_ids)
 
     bins = {}
-    for locus, true_val in tsv_df.set_index("LocusId")["true"].items():
+    for locus, true_val in truth_df.set_index("LocusId")["true"].items():
         if pd.isna(true_val):
             continue
         label = _size_bin_label(true_val)
-        missing, total = bins.setdefault(label, [0, 0])
+        bins.setdefault(label, [0, 0])
         bins[label][1] += 1
-        bins[label][0] += int(locus in only_tsv)
+        bins[label][0] += int(locus in missing_loci)
     worst_bin, worst_frac = None, 0.0
     for label, (missing, total) in bins.items():
         frac = missing / total if total else 0.0
@@ -544,94 +593,110 @@ def _assert_catalog_agreement(json_df, tsv_df, source_desc, fatal=True):
     violated = global_frac > _CATALOG_MISMATCH_GLOBAL_MAX or worst_frac > _CATALOG_MISMATCH_PERBIN_MAX
     if violated:
         msg = (
-            "%s: JSON and truth-TSV locus catalogs disagree -- global %.2f%% (%d only-in-JSON, "
-            "%d only-in-TSV out of %d total loci; limit %.2f%%), worst truth-size bin '%s' at "
-            "%.1f%% missing (limit %.1f%%). They likely come from different EH runs/catalog "
-            "versions -- re-download matching JSON/TSV sources before proceeding. Example "
-            "mismatched loci: %s" % (
-                source_desc, 100 * global_frac, len(only_json), len(only_tsv), len(union),
+            "%s: %d of the sample's %d truth loci (%.2f%%; limit %.2f%%) have no record in the EH "
+            "JSON, worst truth-size bin '%s' at %.1f%% missing (limit %.1f%%). The JSON and the truth "
+            "likely come from different catalogs -- re-download matching sources before proceeding. "
+            "Example missing loci: %s" % (
+                source_desc, len(missing_loci), len(truth_locus_ids), 100 * global_frac,
                 100 * _CATALOG_MISMATCH_GLOBAL_MAX, worst_bin, 100 * worst_frac,
-                100 * _CATALOG_MISMATCH_PERBIN_MAX, sorted(only_tsv or only_json)[:5]))
+                100 * _CATALOG_MISMATCH_PERBIN_MAX, sorted(missing_loci)[:5]))
         if fatal:
             raise RuntimeError(msg)
         print("  WARNING: %s" % msg, flush=True)
         return
-    print("  catalog agreement (%s): %.2f%% global mismatch, worst bin '%s' %.1f%% missing"
+    print("  catalog agreement (%s): %.2f%% of truth loci missing from the JSON, worst bin '%s' %.1f%% missing"
           % (source_desc, 100 * global_frac, worst_bin, 100 * worst_frac), flush=True)
 
 
-def _join_truth(json_df, tsv_df, source_desc):
-    """Left-joins truth onto the JSON rows by ``(locus_id, allele_rank)`` (keys asserted unique).
-
-    A leading ``chr`` is stripped from both locus ids before the join: some catalogs emit
-    ``chr1-..`` LocusIds in the JSON while the truth TSV uses ``1-..`` (or vice versa), and the
-    two must compare equal. ``source_desc`` (e.g. ``"HG002 31x"``) names this combo in the catalog-
-    agreement check's error message.
-    """
-    json_df["locus_id"] = json_df["locus_id"].astype(str).str.replace(r"^chr", "", regex=True)
-    tsv_df["LocusId"] = tsv_df["LocusId"].astype(str).str.replace(r"^chr", "", regex=True)
+def _join_truth(json_df, tsv_df):
+    """Left-joins truth onto the JSON rows by ``(locus_id, allele_rank)`` (keys asserted unique)."""
     assert not json_df.duplicated(["locus_id", "allele_rank"]).any(), \
         "JSON (locus_id, allele_rank) key is not unique"
     assert not tsv_df.duplicated(["LocusId", "allele_rank"]).any(), \
         "TSV (LocusId, allele_rank) key is not unique"
-    # fatal=False: the truth is now filtered to EH's catalog rules (primary contig + variant, see
-    # _load_truth_from_genotypes_tsv), which removes the bulk of the JSON-vs-truth catalog gap, but two
-    # residual, expected mismatches remain that are NOT staleness to abort on:
-    #   1. Training combos (real_quick): those JSON shards predate the current pipeline and were produced
-    #      with a tighter (~300bp) reference-interval cap than today's 500bp, so the truth still lists
-    #      some 300-500bp variant loci absent from the JSON. Regenerate real_quick to close this.
-    #   2. Held-out samples: their JSON genotypes the 1.6M-locus combined_catalog_43_samples catalog,
-    #      a SUPERSET of any one sample's variant truth, so the JSON legitimately has many loci the
-    #      per-sample truth doesn't (the mismatch is in the only-in-JSON direction).
-    # Left-joining on the JSON keeps only JSON-called alleles; unmatched ones drop downstream. Flip to
-    # fatal once real_quick is regenerated with the current pipeline and the held-out case is handled.
-    _assert_catalog_agreement(json_df, tsv_df, source_desc, fatal=False)
-    merged = json_df.merge(tsv_df, how="left", left_on=["locus_id", "allele_rank"],
-                           right_on=["LocusId", "allele_rank"], validate="one_to_one"
-                           ).drop(columns=["LocusId"])
-    return merged
+    return json_df.merge(tsv_df, how="left", left_on=["locus_id", "allele_rank"],
+                         right_on=["LocusId", "allele_rank"], validate="one_to_one"
+                         ).drop(columns=["LocusId"])
 
 
-def build_combo(variant, subdir, sample, cov_label, data_dir, force):
-    """Downloads + joins one combo and writes its per-combo parquet (all rows, both branches)."""
+def extract_rows_and_join_truth(json_paths, genotypes_tsv_path, high_confidence_bed_path, row_sample_id,
+                                source_desc):
+    """Extracts the EH rows at the sample's variant truth loci and joins their truth.
+
+    Shared by the training combos (``build_combo``) and the held-out samples
+    (``heldout.build_sample``). A JSON on the 5.65M-locus catalog yields ~11M allele rows, most at loci
+    that are hom-ref in this sample or absent from its truth, and every one of those
+    would end up dropped (``label_and_filter`` and the accuracy-by-size report both need ``true``).
+    Rows are therefore filtered while they are streamed out of ``eh_json.extract_rows`` rather than
+    after a DataFrame of all of them has been built.
+
+    (Peak memory is still dominated by ``eh_json.extract_rows``' ``json.load`` of the whole file.) A leading ``chr`` is stripped from the JSON's
+    LocusIds to match ``_load_truth_from_genotypes_tsv``.
+
+    ``source_desc`` (e.g. ``"HG002 31x"``) names the sample in the catalog-agreement check's message.
+    Raises if no JSON row falls on a variant truth locus, which would mean the two disagree on LocusIds.
+    """
+    truth_df, truth_locus_ids = _load_truth_from_genotypes_tsv(genotypes_tsv_path, high_confidence_bed_path)
+    variant_truth_locus_ids = set(truth_df["LocusId"])
+    rows, json_locus_ids = [], set()
+    for path in json_paths:
+        for row in eh_json.extract_rows(path, sample_id=row_sample_id):
+            locus_id = re.sub(r"^chr", "", str(row["locus_id"]))
+            json_locus_ids.add(locus_id)
+            if locus_id in variant_truth_locus_ids:
+                row["locus_id"] = locus_id
+                rows.append(row)
+    if not rows:
+        raise RuntimeError("%s: none of the %d JSON loci is one of the %d variant truth loci (example JSON "
+                           "locus %s, example truth locus %s)"
+                           % (source_desc, len(json_locus_ids), len(variant_truth_locus_ids),
+                              next(iter(json_locus_ids), None), next(iter(variant_truth_locus_ids), None)))
+    # fatal=False until the gap has been measured on real v2.1 output: the JSON is expected to lack
+    # the loci EH skips for 150 bp reads (43,792 of 5,652,901 in the HG01993 test run), which may be
+    # concentrated in one truth-size bin.
+    _assert_catalog_agreement(json_locus_ids, truth_locus_ids, truth_df, source_desc, fatal=False)
+    return _join_truth(pd.DataFrame(rows), truth_df)
+
+
+def build_combo(subdir, sample, cov_label, sample_label, data_dir, force):
+    """Downloads + joins one combo and writes its per-combo parquet (all rows, both branches).
+
+    ``sample_label`` names the combo's ``EH_RESULTS_ROOT`` folder (see ``COMBOS``).
+    """
     out_path = os.path.join(data_dir, subdir, "%s_%s.parquet" % (sample, cov_label))
     print("=== %s %s -> %s ===" % (sample, cov_label, out_path))
 
     dl_dir = os.path.join(data_dir, subdir, "_downloads", "%s_%s" % (sample, cov_label))
     # Sample-level (not sample+coverage-level) dir: HG002's 3 coverages share one download of the
-    # tool-independent truth catalog instead of re-fetching it 3x (truth doesn't depend on coverage).
+    # tool-independent truth catalog and its BED instead of re-fetching them 3x (truth doesn't depend
+    # on coverage).
     genotypes_dl_dir = os.path.join(data_dir, subdir, "_downloads", sample)
-    json_remote = _list_json_inputs(sample, variant, cov_label)
-    genotypes_tsv_remote = _truth_genotypes_tsv_remote(sample)
+    json_remote = _list_json_inputs(sample_label)
     json_locals = [os.path.join(dl_dir, os.path.basename(r)) for r in json_remote]
-    genotypes_tsv_local = os.path.join(genotypes_dl_dir, os.path.basename(genotypes_tsv_remote))
+    truth_sources = _truth_sources(sample, genotypes_dl_dir)
     # Checked even when the parquet cache below is about to be reused -- an --force-free run must
     # still detect that the inputs it would otherwise silently keep trusting have moved on. Deletes any
     # locally-stale (bucket-newer / content-changed) copy so _download re-fetches it below.
     _check_freshness("%s %s" % (sample, cov_label),
                      [("json shard %d" % i, r, l) for i, (r, l) in enumerate(zip(json_remote, json_locals))]
-                     + [("truth-genotypes TSV", genotypes_tsv_remote, genotypes_tsv_local)])
+                     + truth_sources)
 
-    if _parquet_reusable(out_path, json_locals + [genotypes_tsv_local], force):
+    if _parquet_reusable(out_path, json_locals + [l for _, _, l in truth_sources], force):
         n = len(pd.read_parquet(out_path, columns=["eh"]))
         print("    parquet up-to-date; skipping (use --force to rebuild)  [%d rows]" % n)
         return n
 
-    print("    %d JSON file(s) + 1 truth TSV" % len(json_remote))
+    print("    %d JSON file(s) + 1 truth TSV + 1 high-confidence BED" % len(json_remote))
     json_local = _download(json_remote, dl_dir)
-    genotypes_tsv_local = _download([genotypes_tsv_remote], genotypes_dl_dir)[0]
+    genotypes_tsv_local, high_confidence_bed_local = _download([r for _, r, _ in truth_sources], genotypes_dl_dir)
     # _check_freshness could only judge shards that already existed locally. Anything just fetched
     # (a first download, or a refreshed object) is judged here, before it is parsed into features.
     assert_eh_build_matches("%s %s" % (sample, cov_label),
                             [("json shard %d" % i, p) for i, p in enumerate(json_local)])
 
-    rows = []
-    for path in json_local:
-        rows.extend(eh_json.extract_rows(path, sample_id="%s_%s" % (sample, cov_label)))
-    json_df = pd.DataFrame(rows)
-    tsv_df = _load_truth_from_genotypes_tsv(genotypes_tsv_local)
-    merged = _join_truth(json_df, tsv_df, "%s %s" % (sample, cov_label))
-    merged = merged.drop(columns=["sample_id"])
+    merged = extract_rows_and_join_truth(json_local, genotypes_tsv_local, high_confidence_bed_local,
+                                         "%s_%s" % (sample, cov_label),
+                                         "%s %s" % (sample, cov_label)).drop(columns=["sample_id"])
     # Feature columns stay float64 all the way to fit(). Downcasting here used to halve the parquet
     # and frame size, but it permanently quantized every value: sklearn's HistGradientBoosting upcasts
     # back to float64 internally (X_DTYPE) and bins to uint8, so the downcast bought nothing at fit
@@ -684,6 +749,8 @@ def label_and_filter(df):
     # allele. Training and isotonic calibration must not see them. Parquets built before this column
     # existed have no such marker, so they are left alone rather than silently half-filtered -- the
     # freshness guards catch those separately.
+    # ANALYSIS_OK[imputation]: eh_json always writes a bool here, so a NaN can only come from concatenating
+    # a parquet that lacks the column; such rows are kept, matching the whole-column fallback below.
     no_own_metrics = (~df["has_own_quality_metrics"].fillna(True).astype(bool)
                       if "has_own_quality_metrics" in df.columns
                       else pd.Series(False, index=df.index))
@@ -800,7 +867,7 @@ def _upstream_source_files(data_dir):
     - the per-combo parquets themselves (``data_dir/<SOURCE_SUBDIR>/*.parquet``, promoted-sample
       symlinks included). Rebuilding one of these without re-running ``assemble_branch`` leaves the
       branch parquet older than its own direct input, which no JSON/TSV mtime reflects.
-    - the raw EH JSON shards and truth-genotypes TSVs for the training combos (under
+    - the raw EH JSON shards, truth-genotypes TSVs and high-confidence BEDs for the training combos (under
       ``data_dir/<SOURCE_SUBDIR>/_downloads``) and for the promoted held-out samples (under
       ``data_eval_43/real_43/_downloads/<sample>``). Only the promoted samples' download dirs are
       scanned there -- the other held-out samples never feed the training pool, so a newer download
@@ -810,10 +877,12 @@ def _upstream_source_files(data_dir):
     combo_dl = os.path.join(data_dir, SOURCE_SUBDIR, "_downloads")
     files += glob.glob(os.path.join(combo_dl, "**", "*.json.gz"), recursive=True)
     files += glob.glob(os.path.join(combo_dl, "**", "*.tandem_repeat_genotypes.tsv.gz"), recursive=True)
+    files += glob.glob(os.path.join(combo_dl, "**", "*.dip.bed.gz"), recursive=True)
     for sample in PROMOTED_HELDOUT_SAMPLES:
         sample_dl = os.path.join(HERE, "data_eval_43", "real_43", "_downloads", sample)
         files += glob.glob(os.path.join(sample_dl, "*.json.gz"))
         files += glob.glob(os.path.join(sample_dl, "*.tandem_repeat_genotypes.tsv.gz"))
+        files += glob.glob(os.path.join(sample_dl, "*.dip.bed.gz"))
     return files
 
 
@@ -862,8 +931,8 @@ def main():
     parser.add_argument("--force", action="store_true", help="rebuild even if parquets exist")
     args = parser.parse_args()
 
-    for sample, cov_label in COMBOS:
-        build_combo(SOURCE_VARIANT, SOURCE_SUBDIR, sample, cov_label, args.data_dir, args.force)
+    for sample, cov_label, sample_label in COMBOS:
+        build_combo(SOURCE_SUBDIR, sample, cov_label, sample_label, args.data_dir, args.force)
     _link_promoted_heldout_samples(args.data_dir, args.force)
     for branch in ("quick", "full"):
         assemble_branch(args.data_dir, branch, SOURCE_SUBDIR)

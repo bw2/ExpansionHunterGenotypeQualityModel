@@ -41,6 +41,20 @@ def _gz_tsv(path, rows):
     df.to_csv(path, sep="\t", index=False, compression="gzip")
 
 
+def _write_truth_tsv_and_bed(path, rows, bed_lines=("chr1\t0\t1000", "chrM\t0\t1000")):
+    """Writes a truth TSV whose Start0Based/End come from each LocusId ("1-3-4-A" -> 3, 4), plus a
+    high-confidence BED next to it, and returns the BED's path."""
+    for row in rows:
+        start, end = row["LocusId"].split("-")[1:3]
+        row.setdefault("Start0Based", int(start))
+        row.setdefault("End", int(end))
+    _gz_tsv(path, rows)
+    bed_path = path + ".bed"
+    with open(bed_path, "w") as f:
+        f.write("\n".join(bed_lines) + "\n")
+    return bed_path
+
+
 class SizeBinLabelTest(unittest.TestCase):
     def test_edges(self):
         self.assertEqual(dataset._size_bin_label(0), "0-20")
@@ -67,7 +81,7 @@ class LoadTruthFromGenotypesTsvTest(unittest.TestCase):
     def test_reshape_wide_to_long_and_dedup(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "truth.tsv.gz")
-            _gz_tsv(path, [
+            bed = _write_truth_tsv_and_bed(path, [
                 {"LocusId": "1-1-2-A", "Chrom": "chr1", "NumRepeatsInReference": 1,
                  "NumRepeatsShortAllele": 5, "NumRepeatsLongAllele": 9,
                  "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 0.9},
@@ -79,7 +93,7 @@ class LoadTruthFromGenotypesTsvTest(unittest.TestCase):
                  "NumRepeatsShortAllele": 2, "NumRepeatsLongAllele": 2,
                  "RepeatPurityShortAllele": 0.8, "RepeatPurityLongAllele": 0.8},
             ])
-            out = dataset._load_truth_from_genotypes_tsv(path)
+            out, _ = dataset._load_truth_from_genotypes_tsv(path, bed)
             self.assertEqual(len(out), 4)  # 2 unique loci x 2 alleles, not 3 x 2
             self.assertEqual(list(out.columns), ["LocusId", "allele_rank", "true", "purity", "is_negative_locus"])
             row = out[(out["LocusId"] == "1-1-2-A") & (out["allele_rank"] == 0)].iloc[0]
@@ -89,16 +103,16 @@ class LoadTruthFromGenotypesTsvTest(unittest.TestCase):
             row = out[(out["LocusId"] == "1-1-2-A") & (out["allele_rank"] == 1)].iloc[0]
             self.assertEqual(row["true"], 9)
 
-    def test_eh_catalog_filters_drop_hom_ref_nonprimary_and_unparseable(self):
-        # Mirrors convert_truth_set_to_variant_catalogs.py: keep only primary-contig, variant loci
-        # with parseable repeat counts. Only the one variant primary-contig locus survives.
+    def test_filters_drop_hom_ref_nonprimary_and_unparseable(self):
+        # Only the one variant primary-contig locus is trained on; the hom-ref one still counts as a
+        # truth locus for the catalog-agreement check. chr prefixes are stripped.
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "truth.tsv.gz")
-            _gz_tsv(path, [
+            bed = _write_truth_tsv_and_bed(path, [
                 {"LocusId": "1-1-2-A", "Chrom": "chr1", "NumRepeatsInReference": 5,  # hom-ref -> drop
                  "NumRepeatsShortAllele": 5, "NumRepeatsLongAllele": 5,
                  "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 1.0},
-                {"LocusId": "1-3-4-A", "Chrom": "chr1", "NumRepeatsInReference": 5,  # variant -> keep
+                {"LocusId": "chr1-3-4-A", "Chrom": "chr1", "NumRepeatsInReference": 5,  # variant -> keep
                  "NumRepeatsShortAllele": 5, "NumRepeatsLongAllele": 9,
                  "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 0.9},
                 {"LocusId": "M-1-2-A", "Chrom": "chrM", "NumRepeatsInReference": 1,  # non-primary -> drop
@@ -108,17 +122,35 @@ class LoadTruthFromGenotypesTsvTest(unittest.TestCase):
                  "NumRepeatsShortAllele": "NA", "NumRepeatsLongAllele": 4,
                  "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 1.0},
             ])
-            out = dataset._load_truth_from_genotypes_tsv(path)
+            out, truth_locus_ids = dataset._load_truth_from_genotypes_tsv(path, bed)
             self.assertEqual(set(out["LocusId"]), {"1-3-4-A"})
             self.assertEqual(len(out), 2)  # the one kept locus -> Short + Long allele rows
+            self.assertEqual(truth_locus_ids, {"1-1-2-A", "1-3-4-A"})
+
+    def test_drops_loci_not_wholly_inside_one_high_confidence_region(self):
+        row = {"Chrom": "chr1", "NumRepeatsInReference": 5, "NumRepeatsShortAllele": 5,
+               "NumRepeatsLongAllele": 9, "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 1.0}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "truth.tsv.gz")
+            bed = _write_truth_tsv_and_bed(path, [
+                dict(row, LocusId="1-10-20-A"),    # inside the first region -> keep
+                dict(row, LocusId="1-90-110-A"),   # straddles the first region's end -> drop
+                dict(row, LocusId="1-150-160-A"),  # in the gap between regions -> drop
+                dict(row, LocusId="1-200-300-A"),  # exactly the second region -> keep
+                dict(row, LocusId="1-95-205-A"),   # spans both regions and the gap -> drop
+                dict(row, LocusId="2-10-20-A", Chrom="chr2"),  # chromosome absent from the BED -> drop
+            ], bed_lines=("chr1\t200\t300", "chr1\t0\t100"))  # unsorted on purpose
+            out, truth_locus_ids = dataset._load_truth_from_genotypes_tsv(path, bed)
+            self.assertEqual(truth_locus_ids, {"1-10-20-A", "1-200-300-A"})
+            self.assertEqual(set(out["LocusId"]), {"1-10-20-A", "1-200-300-A"})
 
 
 class JoinTruthTest(unittest.TestCase):
-    def test_strips_chr_prefix_and_joins(self):
-        json_df = pd.DataFrame({"locus_id": ["chr1-1-2-A", "chr1-1-2-A"], "allele_rank": [0, 1], "eh": [10, 20]})
+    def test_joins_on_locus_and_rank(self):
+        json_df = pd.DataFrame({"locus_id": ["1-1-2-A", "1-1-2-A"], "allele_rank": [0, 1], "eh": [10, 20]})
         tsv_df = pd.DataFrame({"LocusId": ["1-1-2-A", "1-1-2-A"], "allele_rank": [0, 1], "true": [9, 21],
                               "purity": [1.0, 1.0], "is_negative_locus": [False, False]})
-        merged = dataset._join_truth(json_df, tsv_df, "unit")
+        merged = dataset._join_truth(json_df, tsv_df)
         self.assertEqual(list(merged["true"]), [9, 21])
         self.assertNotIn("LocusId", merged.columns)
 
@@ -126,7 +158,7 @@ class JoinTruthTest(unittest.TestCase):
         json_df = pd.DataFrame({"locus_id": ["1-1-2-A"], "allele_rank": [0], "eh": [10]})
         tsv_df = pd.DataFrame({"LocusId": [], "allele_rank": [], "true": [], "purity": [],
                               "is_negative_locus": []})
-        merged = dataset._join_truth(json_df, tsv_df, "unit")
+        merged = dataset._join_truth(json_df, tsv_df)
         self.assertTrue(pd.isna(merged["true"].iloc[0]))
 
     def test_duplicate_json_key_raises(self):
@@ -134,28 +166,66 @@ class JoinTruthTest(unittest.TestCase):
         tsv_df = pd.DataFrame({"LocusId": ["1-1-2-A"], "allele_rank": [0], "true": [9], "purity": [1.0],
                               "is_negative_locus": [False]})
         with self.assertRaises(AssertionError):
-            dataset._join_truth(json_df, tsv_df, "unit")
+            dataset._join_truth(json_df, tsv_df)
+
+
+class ExtractRowsAndJoinTruthTest(unittest.TestCase):
+    TRUTH_DF = pd.DataFrame({"LocusId": ["1-1-2-A", "1-1-2-A"], "allele_rank": [0, 1], "true": [9.0, 21.0],
+                             "purity": [1.0, 1.0], "is_negative_locus": [False, False]})
+
+    def _run(self, rows):
+        with mock.patch.object(dataset.eh_json, "extract_rows", return_value=rows), \
+             mock.patch.object(dataset, "_load_truth_from_genotypes_tsv",
+                               return_value=(self.TRUTH_DF.copy(), {"1-1-2-A", "1-5-6-A"})), \
+             mock.patch.object(dataset, "_assert_catalog_agreement") as check:
+            return dataset.extract_rows_and_join_truth(["a.json.gz"], "t.tsv.gz", "t.bed.gz", "S", "unit"), check
+
+    def test_keeps_only_rows_at_variant_truth_loci_and_strips_chr(self):
+        rows = [{"locus_id": "chr1-1-2-A", "allele_rank": 0, "eh": 10.0},
+                {"locus_id": "chr1-1-2-A", "allele_rank": 1, "eh": 20.0},
+                {"locus_id": "chr1-5-6-A", "allele_rank": 0, "eh": 5.0},   # hom-ref in truth -> dropped
+                {"locus_id": "chr1-9-9-A", "allele_rank": 0, "eh": 5.0}]   # no truth -> dropped
+        merged, check = self._run(rows)
+        self.assertEqual(list(merged["locus_id"]), ["1-1-2-A", "1-1-2-A"])
+        self.assertEqual(list(merged["true"]), [9.0, 21.0])
+        # The agreement check sees every JSON locus, not just the kept ones.
+        self.assertEqual(check.call_args[0][0], {"1-1-2-A", "1-5-6-A", "1-9-9-A"})
+
+    def test_no_row_at_a_variant_truth_locus_raises(self):
+        with self.assertRaises(RuntimeError):
+            self._run([{"locus_id": "X-1-2-A", "allele_rank": 0, "eh": 10.0}])
 
 
 class AssertCatalogAgreementTest(unittest.TestCase):
     def test_agreement_within_tolerance_does_not_raise(self):
-        json_df = pd.DataFrame({"locus_id": ["1-%d-2-A" % i for i in range(100)]})
-        tsv_df = pd.DataFrame({"LocusId": ["1-%d-2-A" % i for i in range(100)], "true": [10] * 100})
-        dataset._assert_catalog_agreement(json_df, tsv_df, "unit", fatal=True)  # must not raise
+        loci = {"1-%d-2-A" % i for i in range(100)}
+        truth_df = pd.DataFrame({"LocusId": sorted(loci), "true": [10] * 100})
+        dataset._assert_catalog_agreement(loci, loci, truth_df, "unit", fatal=True)  # must not raise
+
+    def test_loci_only_in_json_are_not_counted(self):
+        truth_df = pd.DataFrame({"LocusId": ["1-0-2-A"], "true": [10]})
+        json_loci = {"1-0-2-A"} | {"1-%d-9-A" % i for i in range(100)}
+        dataset._assert_catalog_agreement(json_loci, {"1-0-2-A"}, truth_df, "unit", fatal=True)  # must not raise
 
     def test_mismatch_beyond_tolerance_raises_when_fatal(self):
-        json_df = pd.DataFrame({"locus_id": ["1-0-2-A"]})
-        tsv_df = pd.DataFrame({"LocusId": ["1-0-2-A", "1-1-2-A", "1-2-2-A"], "true": [10, 300, 300]})
+        truth_df = pd.DataFrame({"LocusId": ["1-0-2-A", "1-1-2-A", "1-2-2-A"], "true": [10, 300, 300]})
         with self.assertRaises(RuntimeError):
-            dataset._assert_catalog_agreement(json_df, tsv_df, "unit", fatal=True)
+            dataset._assert_catalog_agreement({"1-0-2-A"}, set(truth_df["LocusId"]), truth_df, "unit", fatal=True)
+
+    def test_missing_hom_ref_truth_loci_count_toward_the_global_gap(self):
+        # Every variant locus is present, but most hom-ref truth loci are missing from the JSON.
+        truth_df = pd.DataFrame({"LocusId": ["1-0-2-A"], "true": [10]})
+        truth_loci = {"1-0-2-A"} | {"1-%d-5-A" % i for i in range(10)}
+        with self.assertRaises(RuntimeError):
+            dataset._assert_catalog_agreement({"1-0-2-A"}, truth_loci, truth_df, "unit", fatal=True)
 
     def test_mismatch_beyond_tolerance_only_warns_when_not_fatal(self):
-        json_df = pd.DataFrame({"locus_id": ["1-0-2-A"]})
-        tsv_df = pd.DataFrame({"LocusId": ["1-0-2-A", "1-1-2-A", "1-2-2-A"], "true": [10, 300, 300]})
-        dataset._assert_catalog_agreement(json_df, tsv_df, "unit", fatal=False)  # must not raise
+        truth_df = pd.DataFrame({"LocusId": ["1-0-2-A", "1-1-2-A", "1-2-2-A"], "true": [10, 300, 300]})
+        dataset._assert_catalog_agreement({"1-0-2-A"}, set(truth_df["LocusId"]), truth_df, "unit",
+                                          fatal=False)  # must not raise
 
-    def test_empty_union_is_a_no_op(self):
-        dataset._assert_catalog_agreement(pd.DataFrame({"locus_id": []}), pd.DataFrame({"LocusId": [], "true": []}),
+    def test_no_truth_loci_is_a_no_op(self):
+        dataset._assert_catalog_agreement({"1-0-2-A"}, set(), pd.DataFrame({"LocusId": [], "true": []}),
                                           "unit", fatal=True)
 
 
@@ -313,12 +383,12 @@ class ListJsonInputsTest(unittest.TestCase):
         stdout = ("gs://x/json/a.shard000_of_002.json.gz gs://x/json/a.shard001_of_002.json.gz "
                   "gs://x/json/a.json.gz")
         with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout, returncode=0, stderr="")):
-            self.assertEqual(dataset._list_json_inputs("S", "V", "10x"), ["gs://x/json/a.json.gz"])
+            self.assertEqual(dataset._list_json_inputs("S"), ["gs://x/json/a.json.gz"])
 
     def test_falls_back_to_shards(self):
         stdout = "gs://x/json/a.shard000_of_002.json.gz gs://x/json/a.shard001_of_002.json.gz"
         with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout, returncode=0, stderr="")):
-            self.assertEqual(dataset._list_json_inputs("S", "V", "10x"),
+            self.assertEqual(dataset._list_json_inputs("S"),
                              ["gs://x/json/a.shard000_of_002.json.gz", "gs://x/json/a.shard001_of_002.json.gz"])
 
 
@@ -419,13 +489,14 @@ class BuildComboTest(unittest.TestCase):
             tsv_local = os.path.join(gt_dir, "HG002.tandem_repeat_genotypes.tsv.gz")
             open(json_local, "w").close()
             open(tsv_local, "w").close()
+            open(os.path.join(gt_dir, "HG002.dip.bed.gz"), "w").close()  # basename from high_confidence_beds.tsv
             write_contract_parquet(out_path, n_rows=3)
             newer = max(os.path.getmtime(json_local), os.path.getmtime(tsv_local)) + 100
             os.utime(out_path, (newer, newer))
             with mock.patch.object(dataset, "_list_json_inputs", return_value=["gs://x/a.json.gz"]), \
                  mock.patch.object(dataset, "_check_freshness", return_value=0), \
                  mock.patch.object(dataset, "_download", side_effect=AssertionError("should not download")):
-                n = dataset.build_combo("V", "sub", "HG002", "10x", d, force=False)
+                n = dataset.build_combo("sub", "HG002", "10x", "HG002_10x", d, force=False)
             self.assertEqual(n, 3)
 
     def test_fresh_build_joins_and_writes_parquet(self):
@@ -447,8 +518,9 @@ class BuildComboTest(unittest.TestCase):
                                                                      for p in remote]), \
                  mock.patch.object(dataset, "assert_eh_build_matches"), \
                  mock.patch.object(dataset.eh_json, "extract_rows", return_value=fake_rows), \
-                 mock.patch.object(dataset, "_load_truth_from_genotypes_tsv", return_value=fake_tsv_df):
-                n = dataset.build_combo("V", "sub", "HG002", "10x", d, force=True)
+                 mock.patch.object(dataset, "_load_truth_from_genotypes_tsv",
+                                   return_value=(fake_tsv_df, {"1-1-2-A", "2-1-2-A"})):
+                n = dataset.build_combo("sub", "HG002", "10x", "HG002_10x", d, force=True)
             self.assertEqual(n, 3)
             out_path = os.path.join(d, "sub", "HG002_10x.parquet")
             merged = pd.read_parquet(out_path)
@@ -637,7 +709,8 @@ class AssertEhBuildMatchesTest(unittest.TestCase):
 
     def test_mismatched_build_sha_exits(self):
         with tempfile.TemporaryDirectory() as d, \
-             mock.patch.object(dataset, "_bw2_head_sha", return_value="7ee80de"):
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="7ee80de"), \
+             mock.patch.object(dataset, "_bw2_files_changed_since", return_value=["ehunter/app/Main.cpp"]):
             p = self._json(os.path.join(d, "a.json.gz"), "3789ba4")
             with self.assertRaises(SystemExit):
                 dataset.assert_eh_build_matches("combo", [("json shard 0", p)])
@@ -647,6 +720,30 @@ class AssertEhBuildMatchesTest(unittest.TestCase):
              mock.patch.object(dataset, "_bw2_head_sha", return_value="7ee80de"):
             p = self._json(os.path.join(d, "a.json.gz"), "7ee80de")
             dataset.assert_eh_build_matches("combo", [("json shard 0", p)])  # must not raise
+
+    def test_older_build_with_only_doc_and_digest_changes_since_passes(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="7ee80de"), \
+             mock.patch.object(dataset, "_bw2_files_changed_since",
+                               return_value=["README.md", "docker/sha256.txt", ".github/workflows/docker.yml"]):
+            p = self._json(os.path.join(d, "a.json.gz"), "3789ba4")
+            dataset.assert_eh_build_matches("combo", [("json shard 0", p)])  # must not raise
+
+    def test_older_build_with_source_changes_since_exits(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="7ee80de"), \
+             mock.patch.object(dataset, "_bw2_files_changed_since", return_value=["README.md", "ehunter/app/Main.cpp"]):
+            p = self._json(os.path.join(d, "a.json.gz"), "3789ba4")
+            with self.assertRaises(SystemExit):
+                dataset.assert_eh_build_matches("combo", [("json shard 0", p)])
+
+    def test_build_unknown_to_the_local_checkout_exits(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="7ee80de"), \
+             mock.patch.object(dataset, "_bw2_files_changed_since", return_value=None):
+            p = self._json(os.path.join(d, "a.json.gz"), "unknown")
+            with self.assertRaises(SystemExit):
+                dataset.assert_eh_build_matches("combo", [("json shard 0", p)])
 
     def test_no_local_checkout_skips_the_check(self):
         # Without the checkout there is no HEAD to compare against, so the JSON is never even opened.
