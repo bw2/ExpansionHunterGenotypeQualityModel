@@ -42,12 +42,13 @@ def _gz_tsv(path, rows):
 
 
 def _write_truth_tsv_and_bed(path, rows, bed_lines=("chr1\t0\t1000", "chrM\t0\t1000")):
-    """Writes a truth TSV whose Start0Based/End come from each LocusId ("1-3-4-A" -> 3, 4), plus a
-    high-confidence BED next to it, and returns the BED's path."""
+    """Writes a truth TSV whose Start0Based/End/Motif come from each LocusId ("1-3-4-A" -> 3, 4, A), plus
+    a high-confidence BED next to it, and returns the BED's path."""
     for row in rows:
-        start, end = row["LocusId"].split("-")[1:3]
+        start, end, motif = row["LocusId"].split("-")[1:4]
         row.setdefault("Start0Based", int(start))
         row.setdefault("End", int(end))
+        row.setdefault("Motif", motif)
     _gz_tsv(path, rows)
     bed_path = path + ".bed"
     with open(bed_path, "w") as f:
@@ -144,6 +145,21 @@ class LoadTruthFromGenotypesTsvTest(unittest.TestCase):
             self.assertEqual(truth_locus_ids, {"1-10-20-A", "1-200-300-A"})
             self.assertEqual(set(out["LocusId"]), {"1-10-20-A", "1-200-300-A"})
 
+    def test_loci_eh_skips_for_the_read_length_are_not_truth_loci(self):
+        # With 40 bp reads EH skips a reference region wider than 80 bp or a motif longer than 20 bp.
+        row = {"Chrom": "chr1", "NumRepeatsInReference": 5, "NumRepeatsShortAllele": 5,
+               "NumRepeatsLongAllele": 9, "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 1.0}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "truth.tsv.gz")
+            bed = _write_truth_tsv_and_bed(path, [
+                dict(row, LocusId="1-10-90-A"),                       # 80 bp wide -> genotyped
+                dict(row, LocusId="1-100-181-A"),                     # 81 bp wide -> skipped
+                dict(row, LocusId="1-200-242-%s" % ("C" * 21)),       # 21 bp motif -> skipped
+            ])
+            out, truth_locus_ids = dataset._load_truth_from_genotypes_tsv(path, bed, eh_read_length=40)
+            self.assertEqual(truth_locus_ids, {"1-10-90-A"})
+            self.assertEqual(len(set(out["LocusId"])), 3)  # still in the truth used for the join
+
 
 class JoinTruthTest(unittest.TestCase):
     def test_joins_on_locus_and_rank(self):
@@ -175,10 +191,19 @@ class ExtractRowsAndJoinTruthTest(unittest.TestCase):
 
     def _run(self, rows):
         with mock.patch.object(dataset.eh_json, "extract_rows", return_value=rows), \
+             mock.patch.object(dataset.eh_json, "typical_read_length_in_file", return_value=150), \
              mock.patch.object(dataset, "_load_truth_from_genotypes_tsv",
-                               return_value=(self.TRUTH_DF.copy(), {"1-1-2-A", "1-5-6-A"})), \
+                               return_value=(self.TRUTH_DF.copy(), {"1-1-2-A", "1-5-6-A"})) as load, \
              mock.patch.object(dataset, "_assert_catalog_agreement") as check:
-            return dataset.extract_rows_and_join_truth(["a.json.gz"], "t.tsv.gz", "t.bed.gz", "S", "unit"), check
+            merged = dataset.extract_rows_and_join_truth(["a.json.gz"], "t.tsv.gz", "t.bed.gz", "S", "unit")
+            self.assertEqual(load.call_args[0][2], 150)  # the JSON's read length reaches the truth loader
+            return merged, check
+
+    def test_rows_spanning_several_chunks_are_all_kept(self):
+        rows = [{"locus_id": "1-1-2-A", "allele_rank": i % 2, "eh": 10.0 + i} for i in range(2)]
+        with mock.patch.object(dataset, "_ROWS_PER_CHUNK", 1):
+            merged, _ = self._run(rows)
+        self.assertEqual(list(merged["eh"]), [10.0, 11.0])
 
     def test_keeps_only_rows_at_variant_truth_loci_and_strips_chr(self):
         rows = [{"locus_id": "chr1-1-2-A", "allele_rank": 0, "eh": 10.0},
@@ -200,33 +225,37 @@ class AssertCatalogAgreementTest(unittest.TestCase):
     def test_agreement_within_tolerance_does_not_raise(self):
         loci = {"1-%d-2-A" % i for i in range(100)}
         truth_df = pd.DataFrame({"LocusId": sorted(loci), "true": [10] * 100})
-        dataset._assert_catalog_agreement(loci, loci, truth_df, "unit", fatal=True)  # must not raise
+        dataset._assert_catalog_agreement(loci, loci, truth_df, "unit")  # must not raise
+
+    def test_size_bins_only_count_truth_loci(self):
+        # 10 large-allele variant loci, 9 of them left out of truth_locus_ids (EH skipped them); the one
+        # truth locus is missing from the JSON, so its bin is 100% missing, not 1 in 10.
+        truth_df = pd.DataFrame({"LocusId": ["1-%d-2-A" % i for i in range(10)], "true": [300] * 10})
+        json_loci = {"1-%d-9-A" % i for i in range(1000)}
+        truth_loci = {"1-0-2-A"} | {"1-%d-9-A" % i for i in range(1000)}
+        with self.assertRaisesRegex(RuntimeError, "100.0% missing"):
+            dataset._assert_catalog_agreement(json_loci, truth_loci, truth_df, "unit")
 
     def test_loci_only_in_json_are_not_counted(self):
         truth_df = pd.DataFrame({"LocusId": ["1-0-2-A"], "true": [10]})
         json_loci = {"1-0-2-A"} | {"1-%d-9-A" % i for i in range(100)}
-        dataset._assert_catalog_agreement(json_loci, {"1-0-2-A"}, truth_df, "unit", fatal=True)  # must not raise
+        dataset._assert_catalog_agreement(json_loci, {"1-0-2-A"}, truth_df, "unit")  # must not raise
 
-    def test_mismatch_beyond_tolerance_raises_when_fatal(self):
+    def test_mismatch_beyond_tolerance_raises(self):
         truth_df = pd.DataFrame({"LocusId": ["1-0-2-A", "1-1-2-A", "1-2-2-A"], "true": [10, 300, 300]})
         with self.assertRaises(RuntimeError):
-            dataset._assert_catalog_agreement({"1-0-2-A"}, set(truth_df["LocusId"]), truth_df, "unit", fatal=True)
+            dataset._assert_catalog_agreement({"1-0-2-A"}, set(truth_df["LocusId"]), truth_df, "unit")
 
     def test_missing_hom_ref_truth_loci_count_toward_the_global_gap(self):
         # Every variant locus is present, but most hom-ref truth loci are missing from the JSON.
         truth_df = pd.DataFrame({"LocusId": ["1-0-2-A"], "true": [10]})
         truth_loci = {"1-0-2-A"} | {"1-%d-5-A" % i for i in range(10)}
         with self.assertRaises(RuntimeError):
-            dataset._assert_catalog_agreement({"1-0-2-A"}, truth_loci, truth_df, "unit", fatal=True)
-
-    def test_mismatch_beyond_tolerance_only_warns_when_not_fatal(self):
-        truth_df = pd.DataFrame({"LocusId": ["1-0-2-A", "1-1-2-A", "1-2-2-A"], "true": [10, 300, 300]})
-        dataset._assert_catalog_agreement({"1-0-2-A"}, set(truth_df["LocusId"]), truth_df, "unit",
-                                          fatal=False)  # must not raise
+            dataset._assert_catalog_agreement({"1-0-2-A"}, truth_loci, truth_df, "unit")
 
     def test_no_truth_loci_is_a_no_op(self):
         dataset._assert_catalog_agreement({"1-0-2-A"}, set(), pd.DataFrame({"LocusId": [], "true": []}),
-                                          "unit", fatal=True)
+                                          "unit")
 
 
 class LabelAndFilterTest(unittest.TestCase):
@@ -517,6 +546,9 @@ class BuildComboTest(unittest.TestCase):
                                    side_effect=lambda remote, dest: [os.path.join(dest, os.path.basename(p))
                                                                      for p in remote]), \
                  mock.patch.object(dataset, "assert_eh_build_matches"), \
+                 mock.patch.object(dataset, "_gcs_stat", return_value=("md5", 1.0)), \
+                 mock.patch.object(dataset, "_json_eh_version", return_value="b1fbc23"), \
+                 mock.patch.object(dataset.eh_json, "typical_read_length_in_file", return_value=150), \
                  mock.patch.object(dataset.eh_json, "extract_rows", return_value=fake_rows), \
                  mock.patch.object(dataset, "_load_truth_from_genotypes_tsv",
                                    return_value=(fake_tsv_df, {"1-1-2-A", "2-1-2-A"})):
@@ -530,6 +562,74 @@ class BuildComboTest(unittest.TestCase):
             self.assertEqual(merged["true"].dtype, np.float64)
             row = merged[(merged["locus_id"] == "1-1-2-A") & (merged["allele_rank"] == 1)].iloc[0]
             self.assertEqual(row["true"], 21.0)
+
+
+class SourcesRecordTest(unittest.TestCase):
+    """A parquet whose downloads were deleted after the build is reused only while the cloud sources
+    still match the versions recorded when it was built, and its EH build still counts as current."""
+
+    def _built_parquet_without_downloads(self, d, cloud_version=("md5", 1.0)):
+        out_path = os.path.join(d, "S.parquet")
+        local = os.path.join(d, "_downloads", "a.json.gz")
+        os.makedirs(os.path.dirname(local))
+        open(local, "w").close()
+        write_contract_parquet(out_path, n_rows=2)
+        sources = [("json shard 0", "gs://x/a.json.gz", local)]
+        with mock.patch.object(dataset, "_json_eh_version", return_value="b1fbc23"):
+            dataset._record_sources_and_remove_downloads(
+                out_path, sources, {"gs://x/a.json.gz": list(cloud_version)})
+        return out_path, local, sources
+
+    def test_record_written_and_downloads_removed(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_path, local, _ = self._built_parquet_without_downloads(d)
+            self.assertFalse(os.path.exists(local))
+            with open(dataset._sources_record_path(out_path)) as f:
+                self.assertEqual(json.load(f), {"cloud_versions": {"gs://x/a.json.gz": ["md5", 1.0]},
+                                                "eh_build_by_json": {"gs://x/a.json.gz": "b1fbc23"}})
+
+    def test_unknown_cloud_version_keeps_the_downloads_and_writes_no_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_path, local, _ = self._built_parquet_without_downloads(d, cloud_version=(None, None))
+            self.assertTrue(os.path.exists(local))
+            self.assertFalse(os.path.exists(dataset._sources_record_path(out_path)))
+
+    def test_reused_while_cloud_versions_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_path, _, sources = self._built_parquet_without_downloads(d)
+            with mock.patch.object(dataset, "_gcs_stat", return_value=("md5", 1.0)), \
+                 mock.patch.object(dataset, "_bw2_head_sha", return_value="b1fbc23"):
+                self.assertTrue(dataset._parquet_reusable(out_path, sources, force=False))
+
+    def test_rebuilt_when_the_recorded_eh_build_is_no_longer_current(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_path, _, sources = self._built_parquet_without_downloads(d)
+            with mock.patch.object(dataset, "_gcs_stat", return_value=("md5", 1.0)), \
+                 mock.patch.object(dataset, "_bw2_head_sha", return_value="c0ffee1"), \
+                 mock.patch.object(dataset, "_bw2_files_changed_since", return_value=["ehunter/app/Main.cpp"]):
+                self.assertFalse(dataset._parquet_reusable(out_path, sources, force=False))
+
+    def test_rebuilt_from_a_record_in_the_older_format(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_path, _, sources = self._built_parquet_without_downloads(d)
+            with open(dataset._sources_record_path(out_path), "w") as f:
+                json.dump({"gs://x/a.json.gz": ["md5", 1.0]}, f)
+            with mock.patch.object(dataset, "_gcs_stat", return_value=("md5", 1.0)):
+                self.assertFalse(dataset._parquet_reusable(out_path, sources, force=False))
+
+    def test_rebuilt_when_cloud_version_changed_or_unknown(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_path, _, sources = self._built_parquet_without_downloads(d)
+            for changed in (("other", 1.0), ("md5", 2.0), (None, None)):
+                with mock.patch.object(dataset, "_gcs_stat", return_value=changed):
+                    self.assertFalse(dataset._parquet_reusable(out_path, sources, force=False))
+
+    def test_rebuilt_without_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_path, _, sources = self._built_parquet_without_downloads(d)
+            os.remove(dataset._sources_record_path(out_path))
+            with mock.patch.object(dataset, "_gcs_stat", return_value=("md5", 1.0)):
+                self.assertFalse(dataset._parquet_reusable(out_path, sources, force=False))
 
 
 class AssembleBranchTest(unittest.TestCase):
@@ -562,6 +662,24 @@ class AssembleBranchTest(unittest.TestCase):
             full = pd.read_parquet(os.path.join(d, "parquet", "full.parquet"))
             self.assertEqual(len(full), 1)
             self.assertEqual(full.iloc[0]["genotyping_regime"], "full_nonspanning")
+
+    def test_each_source_keeps_at_most_the_cap_per_genotyping_regime(self):
+        with tempfile.TemporaryDirectory() as d:
+            src_dir = os.path.join(d, "src")
+            os.makedirs(src_dir)
+            base = {c: 1.0 for c in features.FULL_FEATURES if c not in ("ci_asymmetry", "ci_over_eh")}
+            base.update({"has_own_quality_metrics": True, "is_negative_locus": False, "true": 10.0,
+                         "motif_size": 3, "genotyping_branch": "quick", "spanning_at_called": 5})
+            for name in ("a", "b"):
+                pd.DataFrame([dict(base, locus_id="1-%d-%d-A" % (i, i + 1), eh=10.0 + i) for i in range(5)]
+                             ).to_parquet(os.path.join(src_dir, "%s.parquet" % name))
+            with mock.patch.object(dataset, "MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME", 3):
+                dataset.assemble_branch(d, "quick", "src")
+                first = pd.read_parquet(os.path.join(d, "parquet", "quick.parquet"))
+                dataset.assemble_branch(d, "quick", "src")
+                second = pd.read_parquet(os.path.join(d, "parquet", "quick.parquet"))
+            self.assertEqual(len(first), 6)  # 3 from each of the 2 sources
+            pd.testing.assert_frame_equal(first, second)  # the subsample is deterministic
 
     def test_no_parquets_is_a_no_op(self):
         with tempfile.TemporaryDirectory() as d:
@@ -728,6 +846,42 @@ class AssertEhBuildMatchesTest(unittest.TestCase):
                                return_value=["README.md", "docker/sha256.txt", ".github/workflows/docker.yml"]):
             p = self._json(os.path.join(d, "a.json.gz"), "3789ba4")
             dataset.assert_eh_build_matches("combo", [("json shard 0", p)])  # must not raise
+
+    def test_older_build_with_only_vcf_writer_changes_since_passes(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="b5ef91d"), \
+             mock.patch.object(dataset, "_bw2_files_changed_since",
+                               return_value=["ehunter/io/VcfWriter.cpp", "example/output/repeats.vcf"]):
+            p = self._json(os.path.join(d, "a.json.gz"), "b1fbc23")
+            dataset.assert_eh_build_matches("combo", [("json shard 0", p)])  # must not raise
+
+    def test_older_build_with_only_an_embedded_model_swap_since_passes(self):
+        changed = ["ehunter/data/genotype_quality_model_from_HG002_and_CHM1_CHM13.20261004.json.gz",
+                   "ehunter/data/README.md", "ehunter/CMakeLists.txt"]
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="feed123"), \
+             mock.patch.object(dataset, "_bw2_files_changed_since", return_value=changed), \
+             mock.patch.object(dataset, "_cmake_change_only_swaps_the_embedded_model", return_value=True):
+            p = self._json(os.path.join(d, "a.json.gz"), "b1fbc23")
+            dataset.assert_eh_build_matches("combo", [("json shard 0", p)])  # must not raise
+
+    def test_older_build_with_other_cmake_changes_since_exits(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="feed123"), \
+             mock.patch.object(dataset, "_bw2_files_changed_since", return_value=["ehunter/CMakeLists.txt"]), \
+             mock.patch.object(dataset, "_cmake_change_only_swaps_the_embedded_model", return_value=False):
+            p = self._json(os.path.join(d, "a.json.gz"), "b1fbc23")
+            with self.assertRaises(SystemExit):
+                dataset.assert_eh_build_matches("combo", [("json shard 0", p)])
+
+    def test_cmake_change_is_judged_by_its_changed_lines(self):
+        diff = ("--- a/ehunter/CMakeLists.txt\n+++ b/ehunter/CMakeLists.txt\n@@ -74 +74 @@\n"
+                "-set(GQ_MODEL_FILE ${CMAKE_CURRENT_SOURCE_DIR}/data/genotype_quality_model_a.json.gz)\n"
+                "+set(GQ_MODEL_FILE ${CMAKE_CURRENT_SOURCE_DIR}/data/genotype_quality_model_b.json.gz)\n")
+        for extra, expected in (("", True), ("+add_compile_options(-O3)\n", False)):
+            result = mock.Mock(returncode=0, stdout=diff + extra)
+            with mock.patch.object(dataset.subprocess, "run", return_value=result):
+                self.assertEqual(dataset._cmake_change_only_swaps_the_embedded_model("b1fbc23"), expected)
 
     def test_older_build_with_source_changes_since_exits(self):
         with tempfile.TemporaryDirectory() as d, \

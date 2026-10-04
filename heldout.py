@@ -69,14 +69,14 @@ def build_sample(sample, data_dir, force):
     truth_sources = dataset._truth_sources(sample, dl_dir)
     # Checked even when the parquet cache below is about to be reused -- see dataset.build_combo.
     # Deletes any bucket-newer / content-changed local copy so _download re-fetches it below.
-    dataset._check_freshness(sample,
-                             [("json shard %d" % i, r, l) for i, (r, l) in enumerate(zip(json_remote, json_locals))]
-                             + truth_sources)
+    json_sources = [("json shard %d" % i, r, l) for i, (r, l) in enumerate(zip(json_remote, json_locals))]
+    dataset._check_freshness(sample, json_sources + truth_sources)
 
-    if dataset._parquet_reusable(out_path, json_locals + [l for _, _, l in truth_sources], force):
+    if dataset._parquet_reusable(out_path, json_sources + truth_sources, force):
         return out_path
     print("=== %s: %d json file(s) ===" % (sample, len(json_remote)), flush=True)
 
+    cloud_versions = dataset._cloud_versions(json_sources + truth_sources)
     json_local = dataset._download(json_remote, dl_dir)
     genotypes_tsv_local, high_confidence_bed_local = dataset._download([r for _, r, _ in truth_sources], dl_dir)
     # _check_freshness could only judge shards that already existed locally -- see dataset.build_combo.
@@ -91,6 +91,7 @@ def build_sample(sample, data_dir, force):
     # time while forcing the C++ scorer to reproduce it exactly. See features.build_matrix.
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     merged.to_parquet(out_path, index=False)
+    dataset._record_sources_and_remove_downloads(out_path, json_sources + truth_sources, cloud_versions)
     print("    %d rows (%d matched truth)" % (len(merged), int(merged["true"].notna().sum())), flush=True)
     return out_path
 

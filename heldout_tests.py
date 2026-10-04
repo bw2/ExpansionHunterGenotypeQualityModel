@@ -180,6 +180,9 @@ class BuildSampleTest(unittest.TestCase):
                                    side_effect=lambda remote, dest: [os.path.join(dest, os.path.basename(p))
                                                                      for p in remote]), \
                  mock.patch.object(dataset, "assert_eh_build_matches"), \
+                 mock.patch.object(dataset, "_gcs_stat", return_value=("md5", 1.0)), \
+                 mock.patch.object(dataset, "_json_eh_version", return_value="b1fbc23"), \
+                 mock.patch.object(dataset.eh_json, "typical_read_length_in_file", return_value=150), \
                  mock.patch.object(dataset.eh_json, "extract_rows", return_value=fake_rows), \
                  mock.patch.object(dataset, "_load_truth_from_genotypes_tsv",
                                    return_value=(fake_tsv_df, {"1-1-2-A"})):

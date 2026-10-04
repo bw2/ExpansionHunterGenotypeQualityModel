@@ -141,6 +141,16 @@ class ExtractTest(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[0]["sample_id"], "S")
 
+    def test_typical_read_length_is_the_largest_per_locus_mean(self):
+        # Per-locus ReadLength is a mean, so the largest one is the best estimate of EH's typical length.
+        eh = {"LocusResults": {"x": {"Variants": {}}, "y": dict(_locus(), ReadLength=148),
+                               "z": dict(_locus(), ReadLength=151)}}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.json.gz")
+            with gzip.open(path, "wt") as f:
+                json.dump(eh, f)
+            self.assertEqual(eh_json.typical_read_length_in_file(path), 151)
+
     def test_path_rows_match_parsed_dict_rows(self):
         # A path is streamed with ijson; its rows (floats included) must equal those from the parsed dict.
         eh = {"SampleParameters": {"SampleId": "FromFile", "Sex": "Female"},

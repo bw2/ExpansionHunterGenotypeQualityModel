@@ -56,6 +56,29 @@ def _open_binary(path):
     return gzip.open(path, "rb") if path.endswith(".gz") else open(path, "rb")
 
 
+LOCI_SCANNED_FOR_TYPICAL_READ_LENGTH = 10_000
+
+
+def typical_read_length_in_file(path):
+    """Estimates the read length EH skipped loci by: the largest per-locus ``ReadLength`` among the
+    first ``LOCI_SCANNED_FOR_TYPICAL_READ_LENGTH`` loci, or None if none of them reports one.
+
+    EH skips loci too wide for the sample's typical read length, which it takes as the longest of the
+    first 1000 reads (probeTypicalReadLength in ExpansionHunter-bw2), but each locus's ``ReadLength`` in
+    the JSON is the MEAN length of that locus's reads. A mean can only be at or below the longest read,
+    and across thousands of loci some see only full-length reads, so the largest per-locus mean is the
+    closest estimate the JSON offers. It can still fall a few bp short on samples with trimmed reads.
+    """
+    largest = None
+    with _open_binary(path) as f:
+        for i, (_, locus_result) in enumerate(ijson.kvitems(f, "LocusResults", use_float=True)):
+            if i == LOCI_SCANNED_FOR_TYPICAL_READ_LENGTH:
+                break
+            if locus_result.get("ReadLength"):
+                largest = max(largest or 0, int(locus_result["ReadLength"]))
+    return largest
+
+
 def _sample_id_in_file(path):
     """Returns ``SampleParameters.SampleId`` from an EH JSON file, or None.
 

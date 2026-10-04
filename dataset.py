@@ -50,6 +50,7 @@ import os
 import re
 import subprocess
 import sys
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -81,10 +82,17 @@ HIGH_CONFIDENCE_BEDS_TSV = os.path.join(HERE, "high_confidence_beds.tsv")
 # Local checkout used only to compare a downloaded EH JSON's stamped build version against the
 # current ExpansionHunter-bw2 HEAD (see ``_check_freshness``). Skipped if not present.
 EXPANSIONHUNTER_BW2_REPO = os.path.expanduser("~/code/ExpansionHunter-bw2")
-# Files whose changes cannot alter the ExpansionHunter binary: docs, CI workflows, and the image
-# digest the Docker workflow commits back after each build. A JSON stamped with an older commit still
-# counts as current-build if only these changed since (see ``assert_eh_build_matches``).
-_FILES_THAT_DO_NOT_AFFECT_THE_EH_BUILD_RE = re.compile(r"(\.md$|^\.github/|^docker/sha256\.txt$)")
+# Files whose changes cannot alter the JSON fields this repo reads: docs, CI workflows, the image digest
+# the Docker workflow commits back after each build, the VCF writer (the VCF is a separate output file),
+# the example outputs, and the embedded genotype-quality model, which only sets the pOk / pTooShort /
+# pTooLong / length-correction annotations that eh_json never reads (shipping a model trained here
+# would otherwise make every JSON look stale). A JSON stamped with an older commit still counts as
+# current if only these changed since, plus ehunter/CMakeLists.txt when its only changed line names the
+# embedded model (see ``_eh_build_is_current``).
+_FILES_THAT_DO_NOT_AFFECT_THE_EH_JSON_RE = re.compile(
+    r"(\.md$|^\.github/|^docker/sha256\.txt$|^ehunter/io/VcfWriter\.(cpp|hh)$|^example/"
+    r"|^ehunter/data/genotype_quality_model[^/]*\.json\.gz$)")
+_EH_CMAKE_FILE = "ehunter/CMakeLists.txt"
 
 # Single source: the optimized-streaming run deployed in production. Its QuickGenotype rows feed the
 # `quick` branch and its full-genotyper fallback rows feed the `full` branch (the split happens in
@@ -128,7 +136,7 @@ COMBOS = [
 #     retraining. Also excluded, from training and held-out alike (updated 2026-09-28), are the
 #     samples in str-truth-set-v2's filter_vcfs_v2/samples_excluded_from_downstream_analyses.tsv:
 #     HGSVC2 males whose DipCall truth lost almost all of chrX/chrY because their h1/h2 assemblies
-#     are not split into X- and Y-carrying haplotypes (7 of them are among the 138: HG00512, HG01505,
+#     are not split into X- and Y-carrying haplotypes (8 of them are among the 138: HG00512, HG01505,
 #     HG02011, HG02492, HG03065, HG03371, HG03732, NA19650). Result: 15 populations are represented
 #     (1 to 5 samples each; IBS, ITU and MXL had only excluded samples), 25 female / 26 male
 #     including HG002.
@@ -144,6 +152,10 @@ PROMOTED_HELDOUT_SAMPLES = (
 )
 
 VALID_CHROMS = set(str(i) for i in range(1, 23)) | {"X", "Y"}
+
+# Per-source, per-genotyping-regime row cap applied by ``assemble_branch`` (see there). 54 sources x
+# 100,000 keeps the largest regime at ~5.4M rows, 5x train.py's default --train-cap.
+MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME = 100_000
 
 # The EH-build stamp, read straight out of the decompressed JSON bytes (see _json_eh_version).
 _VERSION_RE = re.compile(rb'"Version"\s*:\s*"([^"]*)"')
@@ -269,13 +281,29 @@ def _bw2_files_changed_since(sha):
 
 def _eh_build_is_current(version, head):
     """Returns True iff a JSON stamped with ``version`` came from a build equivalent to ``head``: the
-    same commit, or one from which only files that cannot affect the binary have changed since."""
+    same commit, or one from which only files that cannot affect the JSON have changed since."""
     if version == head:
         return True
     if not version:
         return False
     changed = _bw2_files_changed_since(version)
-    return changed is not None and all(_FILES_THAT_DO_NOT_AFFECT_THE_EH_BUILD_RE.search(f) for f in changed)
+    if changed is None:
+        return False
+    return all(_FILES_THAT_DO_NOT_AFFECT_THE_EH_JSON_RE.search(f)
+               or (f == _EH_CMAKE_FILE and _cmake_change_only_swaps_the_embedded_model(version))
+               for f in changed)
+
+
+def _cmake_change_only_swaps_the_embedded_model(sha):
+    """Returns True iff every line of ehunter/CMakeLists.txt changed between ExpansionHunter-bw2 commit
+    ``sha`` and HEAD is the ``set(GQ_MODEL_FILE ...)`` line that names the embedded model."""
+    result = subprocess.run(["git", "-C", EXPANSIONHUNTER_BW2_REPO, "diff", "-U0", sha, "HEAD", "--",
+                             _EH_CMAKE_FILE], capture_output=True, text=True)
+    if result.returncode != 0:
+        return False
+    changed_lines = [line[1:] for line in result.stdout.splitlines()
+                     if line[:1] in ("+", "-") and not line.startswith(("+++", "---"))]
+    return all(line.strip().startswith("set(GQ_MODEL_FILE ") for line in changed_lines)
 
 
 def _json_eh_version(path):
@@ -310,9 +338,9 @@ def assert_eh_build_matches(desc, labelled_json_paths):
     """Exits nonzero if any EH output JSON was produced by a build other than ExpansionHunter-bw2 HEAD.
 
     A JSON stamped with an older commit still passes when every file changed between that commit and
-    HEAD is a doc, CI workflow or image-digest file (``_FILES_THAT_DO_NOT_AFFECT_THE_EH_BUILD_RE``):
-    README edits and the digest commit the Docker workflow pushes after each build land on top of the
-    commit the image was built from, and would otherwise make every current JSON look stale.
+    HEAD is one that cannot change the JSON (``_FILES_THAT_DO_NOT_AFFECT_THE_EH_JSON_RE``): README
+    edits, the digest commit the Docker workflow pushes after each build, and VCF-only changes land on
+    top of the commit the image was built from, and would otherwise make every current JSON look stale.
 
     ``labelled_json_paths`` is a list of ``(label, path)``. A mismatch means the calls in that JSON came
     from a different EH build, which matters beyond provenance: a build can change what an existing
@@ -362,9 +390,9 @@ def _check_freshness(desc, sources):
        build as a cached one can.
 
     Returns the number of stale local files removed for re-download (0 if none). No caller needs it
-    to trigger a rebuild -- deleting the local file already makes ``_parquet_reusable`` fail its
-    "every upstream still exists" test -- so it is reported for logging and for the tests that assert
-    on the refresh decision.
+    to trigger a rebuild -- with the local file gone, ``_parquet_reusable`` falls back to comparing the
+    cloud versions against the ones recorded at build time, and the changed object fails that -- so it
+    is reported for logging and for the tests that assert on the refresh decision.
     """
     redownload, keep_json = [], []
     for label, remote, local in sources:
@@ -434,21 +462,88 @@ def parquet_contract_complaint(path):
     return None
 
 
-def _parquet_reusable(out_path, upstream_locals, force):
+def _sources_record_path(out_path):
+    """Returns the path of the record of which cloud objects ``out_path`` was built from."""
+    return out_path + ".sources.json"
+
+
+def _cloud_versions(sources):
+    """Returns ``{remote: [md5, mtime]}`` (from ``_gcs_stat``) for each ``(label, remote, local)`` source."""
+    return {remote: list(_gcs_stat(remote)) for _, remote, _ in sources}
+
+
+def _record_sources_and_remove_downloads(out_path, sources, cloud_versions):
+    """Records what the just-written ``out_path`` was built from, then deletes the downloaded copies.
+
+    One sample's EH JSON on the v2.1 catalog is ~0.7GB gzipped, so keeping all 135 would need ~95GB of
+    local disk. Once the parquet exists the downloads are only needed to tell whether it is still
+    current, which the record answers (see ``_parquet_reusable``). It holds ``cloud_versions``, the
+    ``_cloud_versions`` taken BEFORE the download (so an object replaced mid-build is not recorded as
+    the one the parquet was built from), and the EH build stamp of every JSON shard, which
+    ``_parquet_reusable`` re-checks against ExpansionHunter-bw2 HEAD once the JSONs are gone.
+
+    If any cloud version is unknown (``[None, None]``, a failed ``gsutil stat``), nothing is recorded
+    and the downloads are kept, so the parquet's reuse is judged from the local copies instead.
+    """
+    if [None, None] in cloud_versions.values():
+        print("    WARNING: could not stat every source in the cloud; keeping the downloads for %s"
+              % os.path.basename(out_path), flush=True)
+        return
+    record = {"cloud_versions": cloud_versions,
+              "eh_build_by_json": {remote: _json_eh_version(local) for label, remote, local in sources
+                                   if label.startswith("json")}}
+    with open(_sources_record_path(out_path), "w") as f:
+        json.dump(record, f, indent=1, sort_keys=True)
+    for _, _, local in sources:
+        if os.path.exists(local):
+            os.remove(local)
+
+
+def _parquet_reusable(out_path, sources, force):
     """Returns True iff the cached per-combo/per-sample parquet can be reused as-is.
 
-    Reuse requires: not ``force``, the parquet exists, every upstream local source (EH JSON shards +
-    truth TSV) still exists, the parquet is at least as new as all of them, AND it still satisfies the
-    current feature contract (``parquet_contract_complaint``). If ``_check_freshness`` just deleted a
-    stale upstream (so it is missing / about to be re-downloaded with a newer mtime), or an upstream is
-    otherwise newer, the parquet is rebuilt rather than silently reused.
+    ``sources`` is the list of ``(label, remote, local)`` the parquet is built from (EH JSON shards,
+    truth TSV, high-confidence BED). Reuse requires: not ``force``, the parquet exists, it still
+    satisfies the current feature contract (``parquet_contract_complaint``), and its sources are
+    unchanged, judged one of two ways:
+
+    - every local copy still exists and none is newer than the parquet. If ``_check_freshness`` just
+      deleted a stale local copy, it is missing and the parquet is rebuilt.
+    - otherwise (the builders delete the downloads once the parquet is written, see
+      ``_record_sources_and_remove_downloads``), the cloud version of every source still equals the
+      one recorded when the parquet was built, and every recorded EH build stamp still counts as
+      current against ExpansionHunter-bw2 HEAD (``_eh_build_is_current``; skipped, as in
+      ``assert_eh_build_matches``, when that checkout is not present). A missing or older-format
+      record, a different set of sources, a failed ``gsutil stat`` (``[None, None]``) or a stale EH
+      build all mean rebuild; the rebuild re-downloads the JSON, where ``assert_eh_build_matches``
+      refuses a stale one.
     """
     if force or not os.path.exists(out_path):
         return False
-    if not all(os.path.exists(u) for u in upstream_locals):
-        return False
-    if os.path.getmtime(out_path) < max((os.path.getmtime(u) for u in upstream_locals), default=0):
-        return False
+    locals_ = [local for _, _, local in sources]
+    if all(os.path.exists(local) for local in locals_):
+        if os.path.getmtime(out_path) < max((os.path.getmtime(local) for local in locals_), default=0):
+            return False
+    else:
+        record_path = _sources_record_path(out_path)
+        if not os.path.exists(record_path):
+            return False
+        with open(record_path) as f:
+            recorded = json.load(f)
+        current = _cloud_versions(sources)
+        if [None, None] in current.values() or recorded.get("cloud_versions") != current:
+            print("    rebuilding %s: its sources changed in the cloud since it was built, or could not "
+                  "be checked" % os.path.basename(out_path))
+            return False
+        if "eh_build_by_json" not in recorded:
+            return False
+        head = _bw2_head_sha()
+        stale = [version for version in recorded["eh_build_by_json"].values()
+                 if head and not _eh_build_is_current(version, head)]
+        if stale:
+            print("    rebuilding %s: built from EH build(s) %s, which no longer count as current "
+                  "against ExpansionHunter-bw2 HEAD %s" % (os.path.basename(out_path), stale, head))
+            return False
     complaint = parquet_contract_complaint(out_path)
     if complaint:
         print("    rebuilding %s: %s" % (os.path.basename(out_path), complaint))
@@ -475,7 +570,17 @@ def _inside_high_confidence_regions(chrom, start_0based, end, bed_path):
     return inside
 
 
-def _load_truth_from_genotypes_tsv(tsv_path, high_confidence_bed_path):
+def _loci_eh_skips_for_read_length(start_0based, end, motif, read_length):
+    """Returns a boolean mask of the loci ExpansionHunter drops for reads of ``read_length`` bp.
+
+    Mirrors filterLociByReadLength in ExpansionHunter-bw2's ehunter/app/ExpansionHunter.cpp: a locus is
+    skipped when its reference region is wider than 2x the read length, or its motif is longer than
+    half the read length.
+    """
+    return ((end - start_0based) > 2 * read_length) | (motif.str.len() > read_length / 2)
+
+
+def _load_truth_from_genotypes_tsv(tsv_path, high_confidence_bed_path, eh_read_length=None):
     """Loads the tool-independent truth-genotypes TSV (see ``TRUTH_GENOTYPES_ROOT``), keeps the loci
     the model trains on, and reshapes them from wide (Short/Long allele columns) to long.
 
@@ -489,6 +594,10 @@ def _load_truth_from_genotypes_tsv(tsv_path, high_confidence_bed_path):
     only -- a locus whose Short AND Long alleles both equal the reference is hom-ref and is dropped,
     so training covers the same kind of loci as with the earlier variant-only catalogs.
 
+    ``eh_read_length``, when given, also leaves out of ``truth_locus_ids`` the loci EH skips for reads
+    of that length (``_loci_eh_skips_for_read_length``): they never get a JSON record, so counting them
+    would make every sample look like a catalog mismatch.
+
     ``is_negative_locus`` is always False (no negative-control rows). HOM/HEMI rows have
     ``NumRepeatsShortAllele == NumRepeatsLongAllele``, so every kept locus yields exactly two allele
     rows: ``allele_rank=0`` from the Short columns, ``allele_rank=1`` from the Long columns
@@ -500,7 +609,7 @@ def _load_truth_from_genotypes_tsv(tsv_path, high_confidence_bed_path):
         ``{LocusId, allele_rank, true, purity, is_negative_locus}`` contract ``_join_truth`` expects;
         ``truth_locus_ids`` is the set of LocusIds passing filter (a), hom-ref loci included.
     """
-    cols = ["LocusId", "Chrom", "Start0Based", "End", "NumRepeatsInReference",
+    cols = ["LocusId", "Chrom", "Start0Based", "End", "Motif", "NumRepeatsInReference",
            "NumRepeatsShortAllele", "NumRepeatsLongAllele",
            "RepeatPurityShortAllele", "RepeatPurityLongAllele"]
     df = pd.read_csv(tsv_path, sep="\t", compression="gzip", usecols=cols,
@@ -521,10 +630,13 @@ def _load_truth_from_genotypes_tsv(tsv_path, high_confidence_bed_path):
     variant = ~((short_n == ref) & (long_n == ref))
     confident = _inside_high_confidence_regions(df["Chrom"], df["Start0Based"], df["End"],
                                                 high_confidence_bed_path)
-    truth_locus_ids = set(df.loc[primary & parseable & confident, "LocusId"])
+    genotyped_by_eh = (~_loci_eh_skips_for_read_length(df["Start0Based"], df["End"], df["Motif"], eh_read_length)
+                       if eh_read_length else pd.Series(True, index=df.index))
+    truth_locus_ids = set(df.loc[primary & parseable & confident & genotyped_by_eh, "LocusId"])
     df = df[primary & parseable & confident & variant]
     print("    truth catalog: %d loci -> %d on primary contigs with parseable counts inside the "
-          "high-confidence regions -> %d variant" % (n0, len(truth_locus_ids), len(df)))
+          "high-confidence regions and not skipped by EH for %s bp reads -> %d variant"
+          % (n0, len(truth_locus_ids), eh_read_length, len(df)))
 
     short = df[["LocusId", "NumRepeatsShortAllele", "RepeatPurityShortAllele"]].rename(
         columns={"NumRepeatsShortAllele": "true", "RepeatPurityShortAllele": "purity"})
@@ -549,6 +661,8 @@ def _load_truth_from_genotypes_tsv(tsv_path, high_confidence_bed_path):
 _CATALOG_MISMATCH_GLOBAL_MAX = 0.02   # flag if >2% of the sample's truth loci have no JSON record
 _CATALOG_MISMATCH_PERBIN_MAX = 0.15   # flag if any truth-allele-size bin is missing more than this
 _CATALOG_SIZE_BIN_EDGES = (20, 50, 100, 200)  # truth repeat-count bin edges (open-ended below/above)
+# extract_rows_and_join_truth turns kept rows into a DataFrame every this many rows.
+_ROWS_PER_CHUNK = 200_000
 
 
 def _size_bin_label(true_repeats):
@@ -560,9 +674,8 @@ def _size_bin_label(true_repeats):
     return "?"
 
 
-def _assert_catalog_agreement(json_locus_ids, truth_locus_ids, truth_df, source_desc, fatal=True):
-    """Raises (or, if ``fatal=False``, prints a WARNING and continues) when too many of the sample's
-    truth loci have no record in the EH JSON.
+def _assert_catalog_agreement(json_locus_ids, truth_locus_ids, truth_df, source_desc):
+    """Raises when too many of the sample's truth loci have no record in the EH JSON.
 
     One-directional on purpose: the JSON covers the whole catalog while the truth may omit loci it
     could not genotype, so loci found only in the JSON are expected and not counted.
@@ -576,8 +689,12 @@ def _assert_catalog_agreement(json_locus_ids, truth_locus_ids, truth_df, source_
     missing_loci = truth_locus_ids - json_locus_ids
     global_frac = len(missing_loci) / len(truth_locus_ids)
 
+    # Bin only the variant loci that are truth loci: truth_df also holds loci left out of
+    # truth_locus_ids (e.g. the ones EH skips for the read length), which would otherwise count toward
+    # a bin's total but never as missing, diluting its gap.
     bins = {}
-    for locus, true_val in truth_df.set_index("LocusId")["true"].items():
+    in_truth = truth_df[truth_df["LocusId"].isin(truth_locus_ids)]
+    for locus, true_val in in_truth.set_index("LocusId")["true"].items():
         if pd.isna(true_val):
             continue
         label = _size_bin_label(true_val)
@@ -590,9 +707,8 @@ def _assert_catalog_agreement(json_locus_ids, truth_locus_ids, truth_df, source_
         if frac > worst_frac:
             worst_bin, worst_frac = label, frac
 
-    violated = global_frac > _CATALOG_MISMATCH_GLOBAL_MAX or worst_frac > _CATALOG_MISMATCH_PERBIN_MAX
-    if violated:
-        msg = (
+    if global_frac > _CATALOG_MISMATCH_GLOBAL_MAX or worst_frac > _CATALOG_MISMATCH_PERBIN_MAX:
+        raise RuntimeError(
             "%s: %d of the sample's %d truth loci (%.2f%%; limit %.2f%%) have no record in the EH "
             "JSON, worst truth-size bin '%s' at %.1f%% missing (limit %.1f%%). The JSON and the truth "
             "likely come from different catalogs -- re-download matching sources before proceeding. "
@@ -600,10 +716,6 @@ def _assert_catalog_agreement(json_locus_ids, truth_locus_ids, truth_df, source_
                 source_desc, len(missing_loci), len(truth_locus_ids), 100 * global_frac,
                 100 * _CATALOG_MISMATCH_GLOBAL_MAX, worst_bin, 100 * worst_frac,
                 100 * _CATALOG_MISMATCH_PERBIN_MAX, sorted(missing_loci)[:5]))
-        if fatal:
-            raise RuntimeError(msg)
-        print("  WARNING: %s" % msg, flush=True)
-        return
     print("  catalog agreement (%s): %.2f%% of truth loci missing from the JSON, worst bin '%s' %.1f%% missing"
           % (source_desc, 100 * global_frac, worst_bin, 100 * worst_frac), flush=True)
 
@@ -627,18 +739,20 @@ def extract_rows_and_join_truth(json_paths, genotypes_tsv_path, high_confidence_
     (``heldout.build_sample``). A JSON on the 5.65M-locus catalog yields ~11M allele rows, most at loci
     that are hom-ref in this sample or absent from its truth, and every one of those
     would end up dropped (``label_and_filter`` and the accuracy-by-size report both need ``true``).
-    Rows are therefore filtered while they are streamed out of ``eh_json.extract_rows`` rather than
-    after a DataFrame of all of them has been built.
-
-    (Peak memory is still dominated by ``eh_json.extract_rows``' ``json.load`` of the whole file.) A leading ``chr`` is stripped from the JSON's
-    LocusIds to match ``_load_truth_from_genotypes_tsv``.
+    Rows are therefore filtered while they are streamed out of ``eh_json.extract_rows`` (which reads
+    one locus at a time) rather than after a DataFrame of all of them has been built, and the kept rows
+    are turned into a DataFrame every ``_ROWS_PER_CHUNK`` rows so they are never all held as dicts.
+    Peak memory is the kept rows plus the two ~5.5M-entry LocusId sets. A leading ``chr`` is stripped
+    from the JSON's LocusIds to match ``_load_truth_from_genotypes_tsv``.
 
     ``source_desc`` (e.g. ``"HG002 31x"``) names the sample in the catalog-agreement check's message.
-    Raises if no JSON row falls on a variant truth locus, which would mean the two disagree on LocusIds.
+    Raises if no JSON row falls on a variant truth locus, which would mean the two disagree on LocusIds,
+    or if too many truth loci have no JSON record (``_assert_catalog_agreement``).
     """
-    truth_df, truth_locus_ids = _load_truth_from_genotypes_tsv(genotypes_tsv_path, high_confidence_bed_path)
+    truth_df, truth_locus_ids = _load_truth_from_genotypes_tsv(
+        genotypes_tsv_path, high_confidence_bed_path, eh_json.typical_read_length_in_file(json_paths[0]))
     variant_truth_locus_ids = set(truth_df["LocusId"])
-    rows, json_locus_ids = [], set()
+    chunks, rows, json_locus_ids = [], [], set()
     for path in json_paths:
         for row in eh_json.extract_rows(path, sample_id=row_sample_id):
             locus_id = re.sub(r"^chr", "", str(row["locus_id"]))
@@ -646,16 +760,21 @@ def extract_rows_and_join_truth(json_paths, genotypes_tsv_path, high_confidence_
             if locus_id in variant_truth_locus_ids:
                 row["locus_id"] = locus_id
                 rows.append(row)
-    if not rows:
+                if len(rows) == _ROWS_PER_CHUNK:
+                    chunks.append(pd.DataFrame(rows))
+                    rows = []
+    if rows:
+        chunks.append(pd.DataFrame(rows))
+    if not chunks:
         raise RuntimeError("%s: none of the %d JSON loci is one of the %d variant truth loci (example JSON "
                            "locus %s, example truth locus %s)"
                            % (source_desc, len(json_locus_ids), len(variant_truth_locus_ids),
                               next(iter(json_locus_ids), None), next(iter(variant_truth_locus_ids), None)))
-    # fatal=False until the gap has been measured on real v2.1 output: the JSON is expected to lack
-    # the loci EH skips for 150 bp reads (43,792 of 5,652,901 in the HG01993 test run), which may be
-    # concentrated in one truth-size bin.
-    _assert_catalog_agreement(json_locus_ids, truth_locus_ids, truth_df, source_desc, fatal=False)
-    return _join_truth(pd.DataFrame(rows), truth_df)
+    # The loci EH skips for the read length are already left out of truth_locus_ids. Measured on
+    # HG03688's v2.1 output, that brings the gap from 0.65% overall and 66% in the largest truth-size
+    # bin down to 0.02% overall and 0.1% in the worst bin, so a real catalog mismatch now stands out.
+    _assert_catalog_agreement(json_locus_ids, truth_locus_ids, truth_df, source_desc)
+    return _join_truth(pd.concat(chunks, ignore_index=True), truth_df)
 
 
 def build_combo(subdir, sample, cov_label, sample_label, data_dir, force):
@@ -667,9 +786,9 @@ def build_combo(subdir, sample, cov_label, sample_label, data_dir, force):
     print("=== %s %s -> %s ===" % (sample, cov_label, out_path))
 
     dl_dir = os.path.join(data_dir, subdir, "_downloads", "%s_%s" % (sample, cov_label))
-    # Sample-level (not sample+coverage-level) dir: HG002's 3 coverages share one download of the
-    # tool-independent truth catalog and its BED instead of re-fetching them 3x (truth doesn't depend
-    # on coverage).
+    # Sample-level (not sample+coverage-level) dir for the truth TSV and BED, which don't depend on
+    # coverage. _record_sources_and_remove_downloads deletes them after each build, so each of HG002's
+    # 3 coverages downloads them again (~150MB), the price of not keeping every sample's downloads.
     genotypes_dl_dir = os.path.join(data_dir, subdir, "_downloads", sample)
     json_remote = _list_json_inputs(sample_label)
     json_locals = [os.path.join(dl_dir, os.path.basename(r)) for r in json_remote]
@@ -677,16 +796,16 @@ def build_combo(subdir, sample, cov_label, sample_label, data_dir, force):
     # Checked even when the parquet cache below is about to be reused -- an --force-free run must
     # still detect that the inputs it would otherwise silently keep trusting have moved on. Deletes any
     # locally-stale (bucket-newer / content-changed) copy so _download re-fetches it below.
-    _check_freshness("%s %s" % (sample, cov_label),
-                     [("json shard %d" % i, r, l) for i, (r, l) in enumerate(zip(json_remote, json_locals))]
-                     + truth_sources)
+    json_sources = [("json shard %d" % i, r, l) for i, (r, l) in enumerate(zip(json_remote, json_locals))]
+    _check_freshness("%s %s" % (sample, cov_label), json_sources + truth_sources)
 
-    if _parquet_reusable(out_path, json_locals + [l for _, _, l in truth_sources], force):
+    if _parquet_reusable(out_path, json_sources + truth_sources, force):
         n = len(pd.read_parquet(out_path, columns=["eh"]))
         print("    parquet up-to-date; skipping (use --force to rebuild)  [%d rows]" % n)
         return n
 
     print("    %d JSON file(s) + 1 truth TSV + 1 high-confidence BED" % len(json_remote))
+    cloud_versions = _cloud_versions(json_sources + truth_sources)
     json_local = _download(json_remote, dl_dir)
     genotypes_tsv_local, high_confidence_bed_local = _download([r for _, r, _ in truth_sources], genotypes_dl_dir)
     # _check_freshness could only judge shards that already existed locally. Anything just fetched
@@ -704,6 +823,7 @@ def build_combo(subdir, sample, cov_label, sample_label, data_dir, force):
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     merged.to_parquet(out_path, index=False)
+    _record_sources_and_remove_downloads(out_path, json_sources + truth_sources, cloud_versions)
     matched = int(merged["true"].notna().sum())
     print("    %d rows, %d matched truth (%.4f), %d quick / %d full"
           % (len(merged), matched, matched / max(len(merged), 1),
@@ -795,21 +915,43 @@ def _assert_parts_share_feature_contract(parts):
                                      for p, c in sorted(stale.items()))))
 
 
+def _cap_rows_per_genotyping_regime(df, cap, seed):
+    """Keeps at most ``cap`` rows of each ``genotyping_regime`` (a seeded random subset of the larger ones)."""
+    kept = [group if len(group) <= cap else group.sample(n=cap, random_state=seed)
+            for _, group in df.groupby("genotyping_regime", sort=True)]
+    return pd.concat(kept).sort_index().reset_index(drop=True) if kept else df
+
+
 def assemble_branch(data_dir, branch, subdir):
-    """Assembles one branch's per-combo parquets, labels + filters, writes data/parquet/<branch>."""
+    """Assembles one branch's per-combo parquets, labels + filters, writes data/parquet/<branch>.
+
+    Parts are read, filtered and labeled one at a time, and each keeps at most
+    ``MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME`` rows per genotyping regime: on the 5.65M-locus v2.1
+    catalog one source has ~1.5M allele rows (~590MB in memory), so concatenating all 54 sources would
+    need ~32GB. ``train.py`` subsamples each regime to ``--train-cap`` rows anyway, so this only bounds
+    the pool it draws from; the rare regimes stay whole because they rarely reach the cap.
+    """
     parts = sorted(glob.glob(os.path.join(data_dir, subdir, "*.parquet")))
     if not parts:
         print("\n%s branch: no per-combo parquets in %s/ -- skipping" % (branch, subdir))
         return
     _assert_parts_share_feature_contract(parts)
-    df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
-    # Both branches are carved from the same optimized-streaming run by genotyping_branch:
-    # quick = fast-path QuickGenotype rows; full = full-genotyper fallback rows (the deploy-matched
-    # subpopulation the full experts are served).
-    df = df[df["genotyping_branch"] == ("quick" if branch == "quick" else "full")].reset_index(drop=True)
-
-    n0 = len(df)
-    df, drops = label_and_filter(df)
+    kept_parts, drops, n0 = [], {}, 0
+    for part in parts:
+        part_df = pd.read_parquet(part)
+        # Both branches are carved from the same optimized-streaming run by genotyping_branch:
+        # quick = fast-path QuickGenotype rows; full = full-genotyper fallback rows (the deploy-matched
+        # subpopulation the full experts are served).
+        part_df = part_df[part_df["genotyping_branch"] == ("quick" if branch == "quick" else "full")].reset_index(drop=True)
+        n0 += len(part_df)
+        part_df, part_drops = label_and_filter(part_df)
+        for name, count in part_drops.items():
+            drops[name] = drops.get(name, 0) + count
+        kept_parts.append(_cap_rows_per_genotyping_regime(
+            part_df, MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME, zlib.crc32(os.path.basename(part).encode())))
+        del part_df
+    df = pd.concat(kept_parts, ignore_index=True)
+    del kept_parts
 
     out_path = os.path.join(data_dir, "parquet", "%s.parquet" % branch)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -817,7 +959,8 @@ def assemble_branch(data_dir, branch, subdir):
     df.to_parquet(tmp, index=False)
     os.replace(tmp, out_path)
     print("\n==================== %s branch ====================" % branch.upper())
-    print("  input %d -> kept %d" % (n0, len(df)))
+    print("  input %d -> kept %d (at most %d per source per genotyping regime)"
+          % (n0, len(df), MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME))
     for k, v in drops.items():
         print("    dropped %-26s %d" % (k, v))
     print("  genotyping_regimes:", df["genotyping_regime"].value_counts().to_dict())
