@@ -956,6 +956,36 @@ class AssertEhBuildMatchesTest(unittest.TestCase):
         with mock.patch.object(dataset.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=diff)):
             self.assertFalse(dataset._json_writer_change_only_feeds_the_model("b1fbc23"))
 
+    def _check_top_level_cmake_changed_by(self, commits):
+        rev_list = mock.Mock(returncode=0, stdout="".join(c + "\n" for c in commits))
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="feed123"), \
+             mock.patch.object(dataset, "_bw2_files_changed_since", return_value=["CMakeLists.txt"]), \
+             mock.patch.object(dataset.subprocess, "run", return_value=rev_list):
+            dataset.assert_eh_build_matches("combo", [("json shard 0", self._json(os.path.join(d, "a.json.gz"),
+                                                                                    "b1fbc23"))])
+
+    def test_file_changed_only_by_build_only_commits_since_passes(self):
+        self._check_top_level_cmake_changed_by(["ba9ad21" + "0" * 33, "45c7c07" + "0" * 33])  # must not raise
+
+    def test_file_also_changed_by_another_commit_since_exits(self):
+        with self.assertRaises(SystemExit):
+            self._check_top_level_cmake_changed_by(["ba9ad21" + "0" * 33, "abc1234" + "0" * 33])
+
+    def test_cmake_lines_of_build_only_commits_are_excused(self):
+        model_swap = ["-set(GQ_MODEL_FILE data/genotype_quality_model_a.json.gz)",
+                      "+set(GQ_MODEL_FILE data/genotype_quality_model_b.json.gz)"]
+        build_option = ["+option(USE_SYSTEM_HTSLIB \"Use an installed htslib\" OFF)"]
+        for extra, expected in (([], True), (["+add_compile_options(-O3)"], False)):
+            def run(cmd, **kwargs):
+                if "rev-list" in cmd:
+                    return mock.Mock(returncode=0, stdout="45c7c07%s\nfeed123%s\n" % ("0" * 33, "0" * 33))
+                if "show" in cmd:  # only the build-only commit is shown
+                    return mock.Mock(returncode=0, stdout="\n".join(build_option) + "\n")
+                return mock.Mock(returncode=0, stdout="\n".join(model_swap + build_option + extra) + "\n")
+            with mock.patch.object(dataset.subprocess, "run", side_effect=run):
+                self.assertEqual(dataset._cmake_change_only_swaps_the_embedded_model("b1fbc23"), expected)
+
     def test_older_build_with_source_changes_since_exits(self):
         with tempfile.TemporaryDirectory() as d, \
              mock.patch.object(dataset, "_bw2_head_sha", return_value="7ee80de"), \

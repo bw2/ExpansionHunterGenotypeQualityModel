@@ -41,6 +41,7 @@ Coding rules: no type hints, Google docstrings, ``print()``, ``gcloud`` (macOS).
 
 import argparse
 import base64
+import collections
 import email.utils
 import glob
 import gzip
@@ -88,7 +89,7 @@ EXPANSIONHUNTER_BW2_REPO = os.path.expanduser("~/code/ExpansionHunter-bw2")
 # pTooLong / length-correction annotations that eh_json never reads (shipping a model trained here
 # would otherwise make every JSON look stale). A JSON stamped with an older commit still counts as
 # current if only these changed since, plus ehunter/CMakeLists.txt when its only changed line names the
-# embedded model (see ``_eh_build_is_current``).
+# embedded model, and any change made by the ``_BUILD_ONLY_EH_COMMITS`` (see ``_eh_build_is_current``).
 # The genotype-quality sources (ehunter/genotype_quality/) and the unit tests are excused for the same
 # reason as the embedded model: the former only compute the annotations eh_json never reads, the latter
 # are not in the binary.
@@ -96,6 +97,12 @@ _FILES_THAT_DO_NOT_AFFECT_THE_EH_JSON_RE = re.compile(
     r"(\.md$|^\.github/|^docker/sha256\.txt$|^ehunter/io/VcfWriter\.(cpp|hh)$|^example/"
     r"|^ehunter/data/genotype_quality_model[^/]*\.json\.gz$|^ehunter/genotype_quality/|^ehunter/tests/)")
 _EH_CMAKE_FILE = "ehunter/CMakeLists.txt"
+# ExpansionHunter-bw2 commits that only add ways to build the binary (options that all default to OFF),
+# so the JSON a default build writes is unchanged. Every line they changed is excused.
+_BUILD_ONLY_EH_COMMITS = (
+    "45c7c07",  # options to build with an installed htslib / Boost or from local source archives
+    "ba9ad21",  # static htslib dependencies; option changes in an existing build directory
+)
 # JsonWriter.cpp also writes the JSON, so it is excused only when every changed line is one of these,
 # which hand the model its inputs (the in-repeat read count, 2026-10-05) and change no emitted field.
 _EH_JSON_WRITER_FILE = "ehunter/io/JsonWriter.cpp"
@@ -305,18 +312,50 @@ def _eh_build_is_current(version, head):
     return all(_FILES_THAT_DO_NOT_AFFECT_THE_EH_JSON_RE.search(f)
                or (f == _EH_CMAKE_FILE and _cmake_change_only_swaps_the_embedded_model(version))
                or (f == _EH_JSON_WRITER_FILE and _json_writer_change_only_feeds_the_model(version))
+               or _only_build_only_commits_changed(version, f)
                for f in changed)
 
 
-def _changed_lines_since(sha, path):
-    """Returns the lines of ``path`` added or removed between ExpansionHunter-bw2 ``sha`` and HEAD, or
-    None if git fails."""
-    result = subprocess.run(["git", "-C", EXPANSIONHUNTER_BW2_REPO, "diff", "-U0", sha, "HEAD", "--",
+def _commits_that_changed_since(sha, path):
+    """Returns the full shas of the ExpansionHunter-bw2 commits in ``sha..HEAD`` that changed ``path``,
+    or None if git fails."""
+    result = subprocess.run(["git", "-C", EXPANSIONHUNTER_BW2_REPO, "rev-list", "%s..HEAD" % sha, "--",
                              path], capture_output=True, text=True)
+    return result.stdout.split() if result.returncode == 0 else None
+
+
+def _only_build_only_commits_changed(sha, path):
+    """Returns True iff ``path`` was changed since ExpansionHunter-bw2 ``sha`` only by
+    ``_BUILD_ONLY_EH_COMMITS``."""
+    commits = _commits_that_changed_since(sha, path)
+    return bool(commits) and all(c.startswith(_BUILD_ONLY_EH_COMMITS) for c in commits)
+
+
+def _diff_lines(git_args):
+    """Returns the added (``+``) and removed (``-``) lines, sign included, of an ExpansionHunter-bw2
+    ``git diff`` / ``git show`` run with ``git_args``, or None if git fails."""
+    result = subprocess.run(["git", "-C", EXPANSIONHUNTER_BW2_REPO] + git_args, capture_output=True, text=True)
     if result.returncode != 0:
         return None
-    return [line[1:] for line in result.stdout.splitlines()
+    return [line for line in result.stdout.splitlines()
             if line[:1] in ("+", "-") and not line.startswith(("+++", "---"))]
+
+
+def _changed_lines_since(sha, path):
+    """Returns the lines of ``path`` added or removed between ExpansionHunter-bw2 ``sha`` and HEAD, less
+    the ones the ``_BUILD_ONLY_EH_COMMITS`` among those commits added or removed, or None if git fails."""
+    changed = _diff_lines(["diff", "-U0", sha, "HEAD", "--", path])
+    commits = _commits_that_changed_since(sha, path)
+    if changed is None or commits is None:
+        return None
+    excused = collections.Counter()
+    for commit in commits:
+        if commit.startswith(_BUILD_ONLY_EH_COMMITS):
+            lines = _diff_lines(["show", "-U0", "--format=", commit, "--", path])
+            if lines is None:
+                return None
+            excused.update(lines)
+    return [line[1:] for line in (collections.Counter(changed) - excused).elements()]
 
 
 def _cmake_change_only_swaps_the_embedded_model(sha):
