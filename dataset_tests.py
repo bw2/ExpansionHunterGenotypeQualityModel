@@ -654,6 +654,7 @@ class SourcesRecordTest(unittest.TestCase):
             out_path, _, sources = self._built_parquet_without_downloads(d)
             with mock.patch.object(dataset, "_gcs_stat", return_value=("md5", 1.0)), \
                  mock.patch.object(dataset, "_bw2_head_sha", return_value="c0ffee1"), \
+                 mock.patch.object(dataset, "_past_build_only_commits", side_effect=lambda sha: sha), \
                  mock.patch.object(dataset, "_bw2_files_changed_since", return_value=["ehunter/app/Main.cpp"]):
                 self.assertFalse(dataset._parquet_reusable(out_path, sources, force=False))
 
@@ -872,6 +873,12 @@ class DePromotedSymlinkCleanupTest(unittest.TestCase):
 
 
 class AssertEhBuildMatchesTest(unittest.TestCase):
+    def setUp(self):
+        # Keep these tests off the local ExpansionHunter-bw2 checkout (PastBuildOnlyCommitsTest covers it).
+        patcher = mock.patch.object(dataset, "_past_build_only_commits", side_effect=lambda sha: sha)
+        self.past_build_only_commits = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _json(self, path, version):
         with gzip.open(path, "wt") as f:
             json.dump({"RunInfo": {"Version": version}}, f)
@@ -956,35 +963,19 @@ class AssertEhBuildMatchesTest(unittest.TestCase):
         with mock.patch.object(dataset.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=diff)):
             self.assertFalse(dataset._json_writer_change_only_feeds_the_model("b1fbc23"))
 
-    def _check_top_level_cmake_changed_by(self, commits):
-        rev_list = mock.Mock(returncode=0, stdout="".join(c + "\n" for c in commits))
+    def test_changed_lines_keep_source_lines_that_look_like_file_headers(self):
+        stdout = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -3 +3 @@\n---i;\n+++i;\n"
+        with mock.patch.object(dataset.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=stdout)):
+            self.assertEqual(dataset._changed_lines_since("b1fbc23", "ehunter/io/JsonWriter.cpp"), ["--i;", "++i;"])
+
+    def test_build_is_judged_from_past_the_build_only_commits(self):
+        self.past_build_only_commits.side_effect = lambda sha: "ba9ad21" if sha == "b1fbc23" else sha
         with tempfile.TemporaryDirectory() as d, \
              mock.patch.object(dataset, "_bw2_head_sha", return_value="feed123"), \
-             mock.patch.object(dataset, "_bw2_files_changed_since", return_value=["CMakeLists.txt"]), \
-             mock.patch.object(dataset.subprocess, "run", return_value=rev_list):
+             mock.patch.object(dataset, "_bw2_files_changed_since", return_value=["docker/sha256.txt"]) as changed:
             dataset.assert_eh_build_matches("combo", [("json shard 0", self._json(os.path.join(d, "a.json.gz"),
-                                                                                    "b1fbc23"))])
-
-    def test_file_changed_only_by_build_only_commits_since_passes(self):
-        self._check_top_level_cmake_changed_by(["ba9ad21" + "0" * 33, "45c7c07" + "0" * 33])  # must not raise
-
-    def test_file_also_changed_by_another_commit_since_exits(self):
-        with self.assertRaises(SystemExit):
-            self._check_top_level_cmake_changed_by(["ba9ad21" + "0" * 33, "abc1234" + "0" * 33])
-
-    def test_cmake_lines_of_build_only_commits_are_excused(self):
-        model_swap = ["-set(GQ_MODEL_FILE data/genotype_quality_model_a.json.gz)",
-                      "+set(GQ_MODEL_FILE data/genotype_quality_model_b.json.gz)"]
-        build_option = ["+option(USE_SYSTEM_HTSLIB \"Use an installed htslib\" OFF)"]
-        for extra, expected in (([], True), (["+add_compile_options(-O3)"], False)):
-            def run(cmd, **kwargs):
-                if "rev-list" in cmd:
-                    return mock.Mock(returncode=0, stdout="45c7c07%s\nfeed123%s\n" % ("0" * 33, "0" * 33))
-                if "show" in cmd:  # only the build-only commit is shown
-                    return mock.Mock(returncode=0, stdout="\n".join(build_option) + "\n")
-                return mock.Mock(returncode=0, stdout="\n".join(model_swap + build_option + extra) + "\n")
-            with mock.patch.object(dataset.subprocess, "run", side_effect=run):
-                self.assertEqual(dataset._cmake_change_only_swaps_the_embedded_model("b1fbc23"), expected)
+                                                                                    "b1fbc23"))])  # must not raise
+        changed.assert_called_once_with("ba9ad21")
 
     def test_older_build_with_source_changes_since_exits(self):
         with tempfile.TemporaryDirectory() as d, \
@@ -1006,6 +997,32 @@ class AssertEhBuildMatchesTest(unittest.TestCase):
         # Without the checkout there is no HEAD to compare against, so the JSON is never even opened.
         with mock.patch.object(dataset, "_bw2_head_sha", return_value=None):
             dataset.assert_eh_build_matches("combo", [("json shard 0", "/nonexistent.json.gz")])
+
+
+class PastBuildOnlyCommitsTest(unittest.TestCase):
+    FIRST, SECOND = "45c7c07" + "1" * 33, "ba9ad21" + "2" * 33  # a chain: parent -> FIRST -> SECOND
+    PARENT, OTHER = "b1fbc23" + "3" * 33, "c0ffee1" + "4" * 33
+
+    def _past(self, stamped_commit, git_ok=True):
+        def run(cmd, **kwargs):
+            if "log" in cmd:  # each build-only commit with its parents
+                return mock.Mock(returncode=0, stdout="%s %s\n%s %s\n" % (self.FIRST, self.PARENT,
+                                                                         self.SECOND, self.FIRST))
+            return mock.Mock(returncode=0 if git_ok else 128, stdout=stamped_commit + "\n")  # rev-parse
+        with mock.patch.object(dataset.subprocess, "run", side_effect=run):
+            return dataset._past_build_only_commits(stamped_commit[:7])
+
+    def test_follows_the_chain_from_its_parent(self):
+        self.assertEqual(self._past(self.PARENT), self.SECOND)
+
+    def test_follows_the_rest_of_the_chain_from_inside_it(self):
+        self.assertEqual(self._past(self.FIRST), self.SECOND)
+
+    def test_does_not_move_a_commit_the_chain_does_not_start_from(self):
+        self.assertEqual(self._past(self.OTHER), self.OTHER)
+
+    def test_unknown_commit_is_returned_unchanged(self):
+        self.assertEqual(self._past(self.OTHER, git_ok=False), self.OTHER[:7])
 
 
 class AssertPartsShareFeatureContractTest(unittest.TestCase):
