@@ -89,10 +89,21 @@ EXPANSIONHUNTER_BW2_REPO = os.path.expanduser("~/code/ExpansionHunter-bw2")
 # would otherwise make every JSON look stale). A JSON stamped with an older commit still counts as
 # current if only these changed since, plus ehunter/CMakeLists.txt when its only changed line names the
 # embedded model (see ``_eh_build_is_current``).
+# The genotype-quality sources (ehunter/genotype_quality/) and the unit tests are excused for the same
+# reason as the embedded model: the former only compute the annotations eh_json never reads, the latter
+# are not in the binary.
 _FILES_THAT_DO_NOT_AFFECT_THE_EH_JSON_RE = re.compile(
     r"(\.md$|^\.github/|^docker/sha256\.txt$|^ehunter/io/VcfWriter\.(cpp|hh)$|^example/"
-    r"|^ehunter/data/genotype_quality_model[^/]*\.json\.gz$)")
+    r"|^ehunter/data/genotype_quality_model[^/]*\.json\.gz$|^ehunter/genotype_quality/|^ehunter/tests/)")
 _EH_CMAKE_FILE = "ehunter/CMakeLists.txt"
+# JsonWriter.cpp also writes the JSON, so it is excused only when every changed line is one of these,
+# which hand the model its inputs (the in-repeat read count, 2026-10-05) and change no emitted field.
+_EH_JSON_WRITER_FILE = "ehunter/io/JsonWriter.cpp"
+_JSON_WRITER_LINES_THAT_ONLY_FEED_THE_MODEL = {
+    ".numDistinctAlleles = numDistinctAlleles};",
+    ".numDistinctAlleles = numDistinctAlleles,",
+    ".inrepeatReads = &repeatFindings.countsOfInrepeatReads()};",
+}
 
 # Single source: the optimized-streaming run deployed in production. Its QuickGenotype rows feed the
 # `quick` branch and its full-genotyper fallback rows feed the `full` branch (the split happens in
@@ -153,8 +164,10 @@ PROMOTED_HELDOUT_SAMPLES = (
 
 VALID_CHROMS = set(str(i) for i in range(1, 23)) | {"X", "Y"}
 
-# Per-source, per-genotyping-regime row cap applied by ``assemble_branch`` (see there). 54 sources x
-# 100,000 keeps the largest regime at ~5.4M rows, 5x train.py's default --train-cap.
+# Per-source, per-genotyping-regime cap on REPRESENTATIVE rows applied by ``assemble_branch`` (see
+# _cap_rows_per_genotyping_regime): 54 sources x 100,000 bounds them at ~5.4M per regime. The
+# training-only quota top-up adds up to another 100,000 rows per source (about 30% more in practice,
+# e.g. ~7.1M quick rows), which is what train.py loads into memory.
 MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME = 100_000
 
 # The EH-build stamp, read straight out of the decompressed JSON bytes (see _json_eh_version).
@@ -291,19 +304,35 @@ def _eh_build_is_current(version, head):
         return False
     return all(_FILES_THAT_DO_NOT_AFFECT_THE_EH_JSON_RE.search(f)
                or (f == _EH_CMAKE_FILE and _cmake_change_only_swaps_the_embedded_model(version))
+               or (f == _EH_JSON_WRITER_FILE and _json_writer_change_only_feeds_the_model(version))
                for f in changed)
+
+
+def _changed_lines_since(sha, path):
+    """Returns the lines of ``path`` added or removed between ExpansionHunter-bw2 ``sha`` and HEAD, or
+    None if git fails."""
+    result = subprocess.run(["git", "-C", EXPANSIONHUNTER_BW2_REPO, "diff", "-U0", sha, "HEAD", "--",
+                             path], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    return [line[1:] for line in result.stdout.splitlines()
+            if line[:1] in ("+", "-") and not line.startswith(("+++", "---"))]
 
 
 def _cmake_change_only_swaps_the_embedded_model(sha):
     """Returns True iff every line of ehunter/CMakeLists.txt changed between ExpansionHunter-bw2 commit
     ``sha`` and HEAD is the ``set(GQ_MODEL_FILE ...)`` line that names the embedded model."""
-    result = subprocess.run(["git", "-C", EXPANSIONHUNTER_BW2_REPO, "diff", "-U0", sha, "HEAD", "--",
-                             _EH_CMAKE_FILE], capture_output=True, text=True)
-    if result.returncode != 0:
-        return False
-    changed_lines = [line[1:] for line in result.stdout.splitlines()
-                     if line[:1] in ("+", "-") and not line.startswith(("+++", "---"))]
-    return all(line.strip().startswith("set(GQ_MODEL_FILE ") for line in changed_lines)
+    changed_lines = _changed_lines_since(sha, _EH_CMAKE_FILE)
+    return changed_lines is not None and all(
+        line.strip().startswith("set(GQ_MODEL_FILE ") for line in changed_lines)
+
+
+def _json_writer_change_only_feeds_the_model(sha):
+    """Returns True iff every line of ehunter/io/JsonWriter.cpp changed between ExpansionHunter-bw2
+    commit ``sha`` and HEAD is in ``_JSON_WRITER_LINES_THAT_ONLY_FEED_THE_MODEL``."""
+    changed_lines = _changed_lines_since(sha, _EH_JSON_WRITER_FILE)
+    return changed_lines is not None and all(
+        line.strip() in _JSON_WRITER_LINES_THAT_ONLY_FEED_THE_MODEL for line in changed_lines)
 
 
 def _json_eh_version(path):
@@ -915,21 +944,123 @@ def _assert_parts_share_feature_contract(parts):
                                      for p, c in sorted(stale.items()))))
 
 
+# Called allele size bins (bp) for the training-row quotas.
+QUOTA_SIZE_BINS_BP = [0, 20, 40, 60, 100, 150, 300, np.inf]
+
+
+def quota_sample(motif_size, eh, idx, cap, seed):
+    """Seeded subsample of ``idx`` down to ``cap`` rows, spread evenly over quota cells.
+
+    A cell is (homopolymer or not) x (called allele size in bp, ``QUOTA_SIZE_BINS_BP``). Every cell
+    gets the same quota, and a cell smaller than the quota keeps all its rows, with the unused share
+    going to the other cells. Without this, a uniform subsample is ~60% homopolymers and leaves few
+    large non-homopolymer alleles. The cells are built from features (motif size and the CALLED size),
+    never from the truth, so the conditional distribution of the targets given the features is
+    unchanged; only how many examples each region of feature space gets moves. That makes a quota
+    sample fine for TRAINING rows but not for rows that estimate frequencies (early stopping,
+    calibration, evaluation), which must stay representative (see ``_cap_rows_per_genotyping_regime``).
+
+    Args:
+        motif_size: Per-row motif size for the whole frame.
+        eh: Per-row called allele size (repeat units) for the whole frame.
+        idx: Row indices to sample from.
+        cap: Number of rows to keep (None or 0 = keep all).
+        seed: RNG seed.
+    """
+    if not cap or idx.size <= cap:
+        return idx
+    cell, cells, counts, level = _quota_cells_and_level(motif_size, eh, idx, cap)
+    rng = np.random.default_rng(seed)
+    return np.sort(np.concatenate([rng.choice(idx[cell == c], min(n, level), replace=False)
+                                   for c, n in zip(cells, counts)]))
+
+
+def quota_cells(motif_size, eh, idx):
+    """Returns the quota cell (homopolymer or not x called size bin) of each row in ``idx``."""
+    called_bp = eh[idx] * motif_size[idx]
+    return (motif_size[idx] == 1).astype(int) * len(QUOTA_SIZE_BINS_BP) + np.digitize(called_bp, QUOTA_SIZE_BINS_BP)
+
+
+def _quota_cells_and_level(motif_size, eh, idx, cap):
+    """Returns ``(per-row cell of idx, cells, cell counts, per-cell quota)`` for a cap of ``cap`` rows."""
+    cell = quota_cells(motif_size, eh, idx)
+    cells, counts = np.unique(cell, return_counts=True)
+    # Largest per-cell quota whose total stays within cap.
+    lo, hi = 0, int(counts.max())
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if np.minimum(counts, mid).sum() <= cap:
+            lo = mid
+        else:
+            hi = mid - 1
+    return cell, cells, counts, lo
+
+
+def _quota_top_up(motif_size, eh, idx, chosen, cap, seed):
+    """Returns extra rows of ``idx`` (not in ``chosen``) that bring each quota cell up to its quota.
+
+    The quota is ``quota_sample``'s for ``cap`` rows of ``idx``; rows already in ``chosen`` count toward
+    it, so only cells ``chosen`` under-fills (the rare ones) get extra rows.
+    """
+    if not cap or idx.size <= cap:
+        return idx[:0]
+    cell, cells, counts, level = _quota_cells_and_level(motif_size, eh, idx, cap)
+    already = np.isin(idx, chosen)
+    rng = np.random.default_rng(seed)
+    extra = []
+    for c, n in zip(cells, counts):
+        in_cell = cell == c
+        need = min(n, level) - int((in_cell & already).sum())
+        if need > 0:
+            extra.append(rng.choice(idx[in_cell & ~already], need, replace=False))
+    return np.sort(np.concatenate(extra)) if extra else idx[:0]
+
+
 def _cap_rows_per_genotyping_regime(df, cap, seed):
-    """Keeps at most ``cap`` rows of each ``genotyping_regime`` (a seeded random subset of the larger ones)."""
-    kept = [group if len(group) <= cap else group.sample(n=cap, random_state=seed)
-            for _, group in df.groupby("genotyping_regime", sort=True)]
-    return pd.concat(kept).sort_index().reset_index(drop=True) if kept else df
+    """Caps each ``genotyping_regime`` at ``cap`` representative rows plus a training-only quota top-up.
+
+    Keeps a seeded uniform sample of at most ``cap`` rows per regime, marked ``representative`` True:
+    early stopping, isotonic calibration and the report's CV test rows draw only from these, so the
+    frequencies they estimate match what ExpansionHunter scores. It then adds the rows ``quota_sample``
+    would have kept but the uniform sample missed (``_quota_top_up``, mostly rare large alleles),
+    marked ``representative`` False, which only ever join training rows.
+    """
+    motif, eh = df["motif_size"].to_numpy(float), df["eh"].to_numpy(float)
+    kept, representative = [], []
+    for regime in sorted(df["genotyping_regime"].unique()):
+        idx = np.where((df["genotyping_regime"] == regime).to_numpy())[0]
+        uniform = (idx if idx.size <= cap
+                   else np.sort(np.random.default_rng(seed).choice(idx, cap, replace=False)))
+        extra = _quota_top_up(motif, eh, idx, uniform, cap, seed + 1)
+        kept += [uniform, extra]
+        representative += [np.ones(uniform.size, bool), np.zeros(extra.size, bool)]
+    if not kept:
+        return df.assign(representative=True)
+    rows = np.concatenate(kept)
+    order = np.argsort(rows, kind="stable")
+    return df.iloc[rows[order]].assign(representative=np.concatenate(representative)[order]).reset_index(drop=True)
+
+
+_COVERAGE_SUFFIX_RE = re.compile(r"_\d+x$")
+
+
+def individual_of_part(path):
+    """Returns the person a per-combo parquet comes from: its basename minus any ``_<N>x`` coverage suffix.
+
+    ``HG002_10x`` / ``HG002_20x`` / ``HG002_31x`` are the same person at three coverages, so a split that
+    holds out whole people (``train._calib_mask``) must group them.
+    """
+    return _COVERAGE_SUFFIX_RE.sub("", os.path.splitext(os.path.basename(path))[0])
 
 
 def assemble_branch(data_dir, branch, subdir):
     """Assembles one branch's per-combo parquets, labels + filters, writes data/parquet/<branch>.
 
-    Parts are read, filtered and labeled one at a time, and each keeps at most
-    ``MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME`` rows per genotyping regime: on the 5.65M-locus v2.1
-    catalog one source has ~1.5M allele rows (~590MB in memory), so concatenating all 54 sources would
-    need ~32GB. ``train.py`` subsamples each regime to ``--train-cap`` rows anyway, so this only bounds
-    the pool it draws from; the rare regimes stay whole because they rarely reach the cap.
+    Parts are read, filtered and labeled one at a time, and each keeps a uniform sample of at most
+    ``MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME`` representative rows per genotyping regime plus a
+    training-only quota top-up of rare cells (``_cap_rows_per_genotyping_regime``): on the 5.65M-locus
+    v2.1 catalog one source has ~1.5M allele rows (~590MB in memory), so concatenating all 54 sources
+    whole would need ~32GB. The rare regimes stay whole because they rarely reach the cap.
     """
     parts = sorted(glob.glob(os.path.join(data_dir, subdir, "*.parquet")))
     if not parts:
@@ -947,6 +1078,7 @@ def assemble_branch(data_dir, branch, subdir):
         part_df, part_drops = label_and_filter(part_df)
         for name, count in part_drops.items():
             drops[name] = drops.get(name, 0) + count
+        part_df["individual"] = individual_of_part(part)
         kept_parts.append(_cap_rows_per_genotyping_regime(
             part_df, MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME, zlib.crc32(os.path.basename(part).encode())))
         del part_df
@@ -959,8 +1091,10 @@ def assemble_branch(data_dir, branch, subdir):
     df.to_parquet(tmp, index=False)
     os.replace(tmp, out_path)
     print("\n==================== %s branch ====================" % branch.upper())
-    print("  input %d -> kept %d (at most %d per source per genotyping regime)"
-          % (n0, len(df), MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME))
+    print("  input %d -> kept %d (%d representative, at most %d per source per genotyping regime; "
+          "%d training-only quota top-up)"
+          % (n0, len(df), int(df["representative"].sum()), MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME,
+             int((~df["representative"]).sum())))
     for k, v in drops.items():
         print("    dropped %-26s %d" % (k, v))
     print("  genotyping_regimes:", df["genotyping_regime"].value_counts().to_dict())

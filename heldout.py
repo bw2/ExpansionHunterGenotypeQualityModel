@@ -9,7 +9,7 @@ TRExplorer v2.1 catalog, ``dataset.EH_RESULTS_ROOT``) supplies all three genotyp
 ``QuickGenotype`` rows are the ``quick`` regime and its full-genotyper-fallback rows split into
 ``full_spanning`` / ``full_nonspanning``.
 
-corrected call = ``eh / LCF`` (q-median head); the gate applies it only where ``pOk < 0.5``
+corrected call = ``round(eh / LCF)`` (q-median head); the gate applies it only where ``pOk < 0.5``
 (direction head), else keeps raw EH. The MAE is a running sum, but the exact pooled median retains
 every kept allele's ``|error|`` in RAM (bounded by ``--max-alleles-per-sample``), so peak memory grows
 with the total kept alleles. ``main()`` writes a standalone ``report/heldout.json`` benchmark dump.
@@ -54,6 +54,14 @@ SAMPLES = [
     "HG03704", "HG03834", "HG03942", "HG04157", "HG04160", "HG04184", "HG04187", "HG04199",
     "NA19240",
 ]
+
+# The ten pOk fast-path diagnosis samples among SAMPLES. They were never trained on, but they were used
+# during model development to diagnose defects and compare candidate features, so compare_models also
+# reports its result without them.
+FASTPATH_DIAGNOSIS_SAMPLES = (
+    "HG00738", "HG01940", "HG01975", "HG01993", "HG02004", "HG02015", "HG02074", "HG02293", "HG03654",
+    "HG03942",
+)
 
 
 def build_sample(sample, data_dir, force):
@@ -114,23 +122,31 @@ def _new_acc():
     # homopolymer MAE bar chart (everything else above is non-homopolymer).
     # pdiff_all / h_pdiff_all = per-allele direction-head lean (pTooLong - pTooShort), strided +
     # per-sample capped exactly like red/pok/lcf, for the by-lean error-reduction violins.
-    return dict(n=0, sum_db=0.0, sum_da=0.0, ex_eh=0, ex_gated=0, pok_correct=0, err_raw=[], err_gated=[],
+    # pok_correct = 3-class argmax accuracy over OK / TOO_LONG / TOO_SHORT; gate_correct = accuracy of
+    # the decision the gate actually makes (pOk < 0.5 vs "the call is not OK"). per_sample holds, per
+    # sample, [n, sum of gated |error|, homopolymer n, homopolymer sum of gated |error|] so
+    # compare_models can pair the two models sample by sample and drop sample subsets exactly.
+    return dict(n=0, sum_db=0.0, sum_da=0.0, ex_eh=0, ex_gated=0, pok_correct=0, gate_correct=0,
+                err_raw=[], err_gated=[],
                 n_lt=0, helped_lt=0, hurt_lt=0, n_ge=0, helped_ge=0, hurt_ge=0,
                 red_all=[], pok_all=[], lcf_all=[], pdiff_all=[], mred_all=[], mpok_all=[], motif_all=[],
                 h_n=0, h_sum_db=0.0, h_sum_da=0.0, h_err_raw=[], h_err_gated=[],
+                h_pok_correct=0, h_gate_correct=0,
                 h_n_lt=0, h_helped_lt=0, h_hurt_lt=0, h_n_ge=0, h_helped_ge=0, h_hurt_ge=0,
-                h_red_all=[], h_pok_all=[], h_lcf_all=[], h_pdiff_all=[])
+                h_red_all=[], h_pok_all=[], h_lcf_all=[], h_pdiff_all=[], per_sample={})
 
 
 def _strided(a, idx):
-    return a[idx][:VIOLIN_PER_SAMPLE].astype(np.float32)
+    # float64, not float32: the report bins these by strict pOk/LCF thresholds, and an emitted 0.900
+    # stored as float32 reads back as 0.8999999761581421, landing in the "< 0.9" violin.
+    return a[idx][:VIOLIN_PER_SAMPLE].astype(np.float64)
 
 
-def _accumulate(acc, sub, comp, branch, names):
+def _accumulate(acc, sub, comp, branch, names, sample_name):
     """Folds one sample's rows (one genotyping regime) into the running accumulator (gated correction).
 
     ``names`` is the feature list the model being applied declares (see ``run_eval``); the compiled
-    trees index it positionally.
+    trees index it positionally. ``sample_name`` keys this sample's totals in ``acc["per_sample"]``.
 
     Homopolymer (1 bp motif) loci are dropped from every scalar metric and the red/pok/lcf violin
     sample; only the by-motif-size sample (mred/mpok/motif) retains them.
@@ -142,7 +158,10 @@ def _accumulate(acc, sub, comp, branch, names):
     # Rounded to the 3 decimals ExpansionHunter emits: this benchmark exists to describe what the
     # deployed binary does, and 3 decimals is all its JSON carries (model.round_like_emitted).
     lcf = M.round_like_emitted(M.predict_lcf_json(comp, X))
-    true_pred = eh / lcf
+    # The corrected call is the whole-repeat size round(eh/LCF), as the report defines it and as
+    # accuracy_by_size scores it; a continuous eh/LCF would count an LCF of 1.003 on an integer call
+    # as helping or hurting although the call does not change.
+    true_pred = np.round(eh / lcf)
     proba = M.round_like_emitted(M.predict_proba_json(comp, X))
     p_ok = proba[:, 0]
     corrected = np.where(p_ok < 0.5, true_pred, eh)        # gate: correct only low-confidence calls
@@ -150,6 +169,13 @@ def _accumulate(acc, sub, comp, branch, names):
     d_gated = np.abs(true - corrected)
     d_corr = np.abs(true - true_pred)                      # ungated correction (helped/hurt + reduction)
     red = d_raw - d_corr                                   # signed error reduction (>0 = corrected closer)
+    dir_code_all = sub["dir_code"].to_numpy(int)
+    homo = motif == 1
+    totals = acc["per_sample"].setdefault(sample_name, [0, 0.0, 0, 0.0])
+    totals[0] += int((~homo).sum())
+    totals[1] += float(d_gated[~homo].sum())
+    totals[2] += int(homo.sum())
+    totals[3] += float(d_gated[homo].sum())
 
     # By-motif-size violin sample: keep ALL loci (incl. homopolymers). Strided => bounded, deterministic.
     midx = slice(None) if red.size <= VIOLIN_PER_SAMPLE else slice(None, None, red.size // VIOLIN_PER_SAMPLE)
@@ -158,11 +184,12 @@ def _accumulate(acc, sub, comp, branch, names):
     acc["motif_all"].append(_strided(motif, midx))
 
     # Homopolymer-only (1 bp motif) MAE accumulation (for the separate homopolymer bar chart).
-    homo = motif == 1
     if homo.any():
         acc["h_n"] += int(homo.sum())
         acc["h_sum_db"] += float(d_raw[homo].sum())
         acc["h_sum_da"] += float(d_gated[homo].sum())
+        acc["h_pok_correct"] += int((np.argmax(proba[homo], axis=1) == dir_code_all[homo]).sum())
+        acc["h_gate_correct"] += int(((p_ok[homo] < 0.5) == (dir_code_all[homo] != features.OK)).sum())
         acc["h_err_raw"].append(d_raw[homo].astype(np.float32))
         acc["h_err_gated"].append(d_gated[homo].astype(np.float32))
         # Homopolymer helped/hurt by pOk stratum (ungated d_corr vs raw EH, mirrors the non-homo block).
@@ -187,7 +214,7 @@ def _accumulate(acc, sub, comp, branch, names):
     eh, true, corrected = eh[keep], true[keep], corrected[keep]
     d_raw, d_gated, d_corr, red = d_raw[keep], d_gated[keep], d_corr[keep], red[keep]
     proba, p_ok, lcf = proba[keep], p_ok[keep], lcf[keep]
-    dir_code = sub["dir_code"].to_numpy(int)[keep]
+    dir_code = dir_code_all[keep]
     acc["n"] += int(eh.size)
     acc["sum_db"] += float(d_raw.sum())
     acc["sum_da"] += float(d_gated.sum())
@@ -196,6 +223,7 @@ def _accumulate(acc, sub, comp, branch, names):
     acc["ex_eh"] += int((np.round(eh) == np.round(true)).sum())
     acc["ex_gated"] += int((np.round(corrected) == np.round(true)).sum())
     acc["pok_correct"] += int((np.argmax(proba, axis=1) == dir_code).sum())
+    acc["gate_correct"] += int(((p_ok < 0.5) == (dir_code != features.OK)).sum())
     # Would the LCF-corrected call (eh/LCF) be closer (helped) or further (hurt) than raw EH?
     # Computed on every (non-homopolymer) allele, then split by pOk stratum: pOk<0.5 is where the gate
     # APPLIES the correction; pOk>=0.5 is where it KEEPS raw EH (so its hurt count is the regret avoided).
@@ -222,14 +250,17 @@ def _homopolymer_summary(acc):
             "mae_raw": acc["h_sum_db"] / hn, "mae_gated": acc["h_sum_da"] / hn,
             "median_raw": float(np.median(np.concatenate(acc["h_err_raw"]))),
             "median_gated": float(np.median(np.concatenate(acc["h_err_gated"]))),
+            "p_ok_accuracy": acc["h_pok_correct"] / hn, "gate_decision_accuracy": acc["h_gate_correct"] / hn,
             "n_pok_lt": acc["h_n_lt"], "helped_lt": acc["h_helped_lt"], "hurt_lt": acc["h_hurt_lt"],
             "n_pok_ge": acc["h_n_ge"], "helped_ge": acc["h_helped_ge"], "hurt_ge": acc["h_hurt_ge"]}
 
 
 def _finalize(acc, n_samples):
     n = acc["n"]
+    per_sample = {s: dict(zip(("n", "sum_gated_abs_error", "homopolymer_n", "homopolymer_sum_gated_abs_error"),
+                              totals)) for s, totals in sorted(acc["per_sample"].items())}
     if n == 0:
-        return {"n": 0, "homopolymer": _homopolymer_summary(acc)}
+        return {"n": 0, "homopolymer": _homopolymer_summary(acc), "per_sample": per_sample}
     mae_raw, mae_gated = acc["sum_db"] / n, acc["sum_da"] / n
     return {
         "n": n, "n_samples": n_samples,
@@ -238,10 +269,11 @@ def _finalize(acc, n_samples):
         "median_gated": float(np.median(np.concatenate(acc["err_gated"]))),
         "dist_reduction": (1.0 - mae_gated / mae_raw) if mae_raw > 0 else float("nan"),
         "exact_eh": acc["ex_eh"] / n, "exact_gated": acc["ex_gated"] / n,
-        "p_ok_accuracy": acc["pok_correct"] / n,
+        "p_ok_accuracy": acc["pok_correct"] / n, "gate_decision_accuracy": acc["gate_correct"] / n,
         "n_pok_lt": acc["n_lt"], "helped_lt": acc["helped_lt"], "hurt_lt": acc["hurt_lt"],
         "n_pok_ge": acc["n_ge"], "helped_ge": acc["helped_ge"], "hurt_ge": acc["hurt_ge"],
         "homopolymer": _homopolymer_summary(acc),
+        "per_sample": per_sample,
     }
 
 
@@ -329,10 +361,12 @@ def run_eval(paths, model_path, out_json, max_alleles):
         for regime in features.GENOTYPING_REGIMES:
             sub = df[df["genotyping_regime"] == regime]
             if not sub.empty:
-                _accumulate(acc[regime], sub, *compiled[regime])
+                _accumulate(acc[regime], sub, *compiled[regime],
+                            sample_name=os.path.splitext(os.path.basename(p))[0])
         print("  %s done" % os.path.basename(p), flush=True)
 
-    out = {"n_samples": len(paths), "max_alleles_per_sample": cap,
+    # "model" (a content fingerprint) lets report.py refuse to show these numbers under another model.
+    out = {"model": M.fingerprint(model_path), "n_samples": len(paths), "max_alleles_per_sample": cap,
            "genotyping_regimes": {r: _finalize(acc[r], len(paths)) for r in features.GENOTYPING_REGIMES}}
     os.makedirs(os.path.dirname(out_json), exist_ok=True)
     with open(out_json, "w") as f:

@@ -39,6 +39,7 @@ _REGION_RE = re.compile(r"^([^:]+):(\d+)-(\d+)$")
 # names are leaf names. Source of truth for the field names is ``extract_variant_rows`` below.
 EH_OUTPUT_FIELDS = [
     ("Coverage", "Per-locus read depth over the locus's two reference flanks."),
+    ("CountsOfInrepeatReads", "Per-variant: reads lying entirely inside the repeat, by size (full genotyper only)."),
     ("ReferenceRepeatPurity", "Per-variant: fraction of the reference repeat region matching a perfect motif tiling."),
     ("Depth", "Per-allele read depth."),
     ("HighQualityUnambiguousReads", "Per-allele high-quality unambiguous read count."),
@@ -201,6 +202,7 @@ def _no_call_rows(locus_result, sample_id, branch, motif_size, reference_repeat_
             "genotyping_branch": branch,
             "left_flank_norm_depth": None,
             "right_flank_norm_depth": None,
+            "inrepeat_total": None,
         }
 
 
@@ -295,9 +297,13 @@ def extract_variant_rows(variant, locus_result, sample_id):
         if branch == BRANCH_FULL:
             row["left_flank_norm_depth"] = aqm.get("LeftFlankNormalizedDepth")
             row["right_flank_norm_depth"] = aqm.get("RightFlankNormalizedDepth")
+            # The fast path (processLocusFast) never counts in-repeat reads and always writes an empty
+            # table, so only the full genotyper's count carries information.
+            row["inrepeat_total"] = sum(c for _, c in parse_counts(variant.get("CountsOfInrepeatReads")))
         else:
             row["left_flank_norm_depth"] = None
             row["right_flank_norm_depth"] = None
+            row["inrepeat_total"] = None
         yield row
 
 

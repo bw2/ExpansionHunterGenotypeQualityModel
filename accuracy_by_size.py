@@ -10,7 +10,9 @@ Two panels share the x-axis ``True Allele Size - Number of Repeats in Reference`
 Each allele is colored by how the genotyped call compares to truth (``DiffRepeats = call - truth``):
 No Call / Called Hom Ref / Called Het Ref / Wrong Direction, then the signed magnitude bands
 (-21 or more ... -2, Same, 2 ... 21 or more). "Same" = within +/-1 repeat (widening for long
-alleles), so the green "exactly right" count matches str-truth-set's published numbers.
+alleles), as in str-truth-set. With a corrected cap (gen_datasets' --corrected-cap, 400,000 called
+alleles by default) every panel, raw included, covers only a seeded whole-locus sample of each parquet,
+so the counts match str-truth-set's published numbers only with --corrected-cap 0.
 
 The category boundaries, colors, x-bins, override precedence, and "exactly right" numerator are
 transcribed verbatim from the v1 script (verified byte-for-byte against the example SVG). Pure
@@ -138,19 +140,42 @@ def _gate_mask(lcf, pok, non_spanning, gate):
     return g
 
 
+def _truth_order_source(calls, true, locus):
+    """Returns ``src`` such that ``calls[src]`` pairs each locus's calls with its truth alleles by size.
+
+    Raw calls and truth alleles are both size-sorted per locus, so they pair in row order. A
+    correction can reverse a locus's two calls (10/18 corrected to 10/6), and then row order would
+    compare the 6 with the larger truth allele and the 10 with the smaller one, counting two errors
+    where the corrected unphased genotype matches both truth alleles. ``calls[src]`` puts the smallest
+    call on the smallest truth allele's row, and so on; NaN calls (no-calls) sort last. Anything
+    attached to a call (its pOk) must be moved with ``src`` too.
+    """
+    codes = pd.factorize(locus)[0]
+    pos = np.arange(len(calls))
+    src = np.empty(len(calls), dtype=np.intp)
+    src[np.lexsort((pos, true, codes))] = np.lexsort((pos, calls, codes))
+    return src
+
+
 def _corrected_category(raw_call, corrected_call, gated, ref, true_round, drr_truth, locus):
     """Recomputes the category for the LCF-corrected scenario of one gate.
 
-    The effective call is the corrected call where the gate applies, else the raw call. Crucially
+    The effective call is the corrected call where the gate applies, else the raw call, re-paired with
+    the truth alleles by size (``_truth_order_source``). Crucially
     ``is_hom_ref`` is recomputed per-locus from those effective calls -- so an allele whose corrected
     call leaves the reference no longer counts as a reference call (and its locus is no longer
-    homozygous-reference), instead of being frozen in the raw "Called Hom Ref" band. Returns the
-    category for every row; callers keep it only for the gated rows.
+    homozygous-reference), instead of being frozen in the raw "Called Hom Ref" band. Returns
+    ``(category, src)``: the category for every row (callers use it for every row the model was
+    applied to, since a gated allele's correction can change its ungated partner's
+    homozygous-reference status) and the re-pairing source index, which callers apply to anything
+    attached to the calls, such as pOk.
     """
     eff = np.where(gated, corrected_call, raw_call)
+    src = _truth_order_source(eff, true_round, locus)
+    eff = eff[src]
     is_ref = np.round(eff - ref) == 0
     is_hom_ref = pd.Series(is_ref).groupby(locus).transform("all").to_numpy(dtype=bool)
-    return classify(np.round(eff - true_round), eff, drr_truth, np.round(eff - ref), is_ref, is_hom_ref)
+    return classify(np.round(eff - true_round), eff, drr_truth, np.round(eff - ref), is_ref, is_hom_ref), src
 
 
 def _share_predictions_within_locus(df, scoreable, called, lcf, pok, non_spanning):
@@ -196,14 +221,14 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     categorization path for every report dataset.
 
     Rows whose ``eh`` is null are the no-call alleles ``eh_json`` emits for loci EH left uncalled:
-    ``classify`` scores them "No Call" (they appear in the raw panel), and because the deployed model
-    is applied only to the finite-``eh`` (called) rows below, their ``pok`` stays NaN so they are
-    excluded from the LCF-corrected panels (a no-call can't be corrected) -- matching the old TSV path.
+    ``classify`` scores them "No Call", in the raw and the corrected panels alike (a no-call can't be
+    corrected, so it stays a no-call).
 
-    Applies the deployed model inline (row-aligned, so no join) -- capped at ``corrected_cap`` called
-    alleles per parquet for the corrected variants -- and returns a frame with ``category``, one
-    ``category__<key>`` per ``CORRECTION_VARIANTS`` gate, ``xbin``, ``motif``, ``locus``, ``purity``,
-    ``pok``.
+    Applies the deployed model inline (row-aligned, so no join) to a seeded sample of whole loci
+    holding at most ``corrected_cap`` called alleles (``_loci_cohort``), and returns a frame with
+    ``category``, one ``category__<key>`` per ``CORRECTION_VARIANTS`` gate, ``xbin``, ``motif``,
+    ``locus``, ``purity``, ``pok``. Every category column covers exactly the cohort rows (None
+    elsewhere), so the raw and corrected panels describe the same alleles.
     """
     import model as M
     import features
@@ -239,8 +264,8 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
                 features.GENOTYPING_REGIME_BRANCH[r],
                 declared[features.GENOTYPING_REGIME_BRANCH[r]])
             for r in features.GENOTYPING_REGIMES}
-    # Only called alleles (finite eh) can be LCF-corrected; no-call rows keep lcf/pok NaN so they drop
-    # out of the corrected panels (see docstring). Cap the called-allele apply for speed.
+    # Only called alleles (finite eh) can be LCF-corrected; no-call rows keep lcf/pok NaN, so they stay
+    # "No Call" in the corrected panels too (see docstring). The apply is capped, by whole loci, for speed.
     #
     # ExpansionHunter emits one AlleleQualityMetrics entry -- and therefore ONE prediction -- per
     # allele it scores, and only one for a homozygous call. eh_json still emits both genotype copies
@@ -252,9 +277,8 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     scoreable = (df["has_own_quality_metrics"].fillna(True).astype(bool).to_numpy()
                  if "has_own_quality_metrics" in df.columns
                  else np.ones(len(df), dtype=bool))
-    sel = np.where(np.isfinite(eh) & scoreable)[0]
-    if corrected_cap and sel.size > corrected_cap:
-        sel = np.sort(np.random.default_rng(20260616).choice(sel, corrected_cap, replace=False))
+    in_cohort = _loci_cohort(locus, np.isfinite(eh) & scoreable, corrected_cap)
+    sel = np.where(np.isfinite(eh) & scoreable & in_cohort)[0]
     # ANALYSIS_OK[imputation]: NaN spanning_at_called -> 0 is genotyping_regime_of's documented
     # default (features.py), routing such alleles to full_nonspanning.
     sub = df.iloc[sel].assign(_row=sel, _regime=features.genotyping_regime_of(
@@ -276,23 +300,45 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     lcf, pok, non_spanning = _share_predictions_within_locus(
         df, scoreable, np.isfinite(eh), lcf, pok, non_spanning)
     corrected = np.round(np.where(lcf > 0, eh / np.where(lcf > 0, lcf, np.nan), eh))
-    out = {"category": cat, "xbin": xbin(drr_truth), "motif": motif, "locus": locus, "purity": purity,
+    # Raw and corrected panels count the SAME alleles: every row of the cohort loci (_loci_cohort),
+    # including no-calls, which stay "No Call" in the corrected panels because a no-call cannot be
+    # corrected. Rows outside the cohort are None in every column (bin_counts drops them), so switching
+    # the correction pill changes the calls and nothing else.
+    raw = cat.astype(object)
+    raw[~in_cohort] = None
+    out = {"category": raw, "xbin": xbin(drr_truth), "motif": motif, "locus": locus, "purity": purity,
            "pok": pok}
-    # When corrected_cap < len(df) the model is applied only to the sampled rows; pok stays NaN for the
-    # rest. Marking those None (so bin_counts drops them from the corrected panels) keeps the
-    # LCF-corrected accuracy on the alleles actually scored, instead of diluting it with raw rows that
-    # could never have been corrected. The raw "category" column keeps every allele.
-    applied = ~np.isnan(pok)
     for key, _, _, gate in CORRECTION_VARIANTS:
         if gate is None:
             continue
         g = _gate_mask(lcf, pok, non_spanning, gate)
-        cat_g = _corrected_category(eh, corrected, g, nref, true, drr_truth, locus)
-        c = cat.copy()
-        c[~applied] = None
-        c[g] = cat_g[g]
+        # Every applied row takes the recomputed category, not just the gated ones: correcting one
+        # allele can change whether its UNGATED partner's locus is homozygous-reference, so keeping the
+        # partner's raw category would leave the two alleles of one locus in contradictory bands.
+        c, src = _corrected_category(eh, corrected, g, nref, true, drr_truth, locus)
+        c = c.astype(object)
+        c[~in_cohort] = None
         out["category__" + key] = c
+        # The re-paired calls carry their own pOk, so the pOk strata of this variant follow the calls.
+        out["pok__" + key] = pok[src]
     return pd.DataFrame(out)
+
+
+def _loci_cohort(locus, scoreable_called, cap, seed=20260616):
+    """Returns the rows of a seeded sample of whole loci holding at most ``cap`` scoreable called alleles.
+
+    Sampling loci rather than alleles keeps both alleles of a locus together, so a correction that
+    makes one allele reference-sized is judged against its partner's corrected call, not its raw one
+    (the homozygous-reference category depends on both). Every row of a chosen locus is in the cohort,
+    including no-call rows. With no cap, or few enough alleles, every row is in the cohort.
+    """
+    if not cap or int(scoreable_called.sum()) <= cap:
+        return np.ones(len(locus), dtype=bool)
+    loci, inverse = np.unique(locus, return_inverse=True)
+    per_locus = np.bincount(inverse, weights=scoreable_called.astype(float), minlength=loci.size)
+    order = np.random.default_rng(seed).permutation(loci.size)
+    chosen = order[np.cumsum(per_locus[order]) <= cap]
+    return np.isin(inverse, chosen)
 
 
 def bin_counts(cat, category_col, homopolymer, purity_min=None, pok_stratum=None):
@@ -301,10 +347,9 @@ def bin_counts(cat, category_col, homopolymer, purity_min=None, pok_stratum=None
     ``purity_min`` (when not None) additionally keeps only alleles whose truth repeat purity strictly
     exceeds it (NaN purity is dropped). ``pok_stratum`` (when not None) additionally keeps only alleles
     whose predicted ``pok`` is ``< 0.5`` (``"lt"``) or ``>= 0.5`` (``"ge"``); NaN pok (model not applied
-    to that allele) is dropped. Rows whose ``category_col`` is None are dropped too: a corrected variant
-    marks the alleles the model was NOT applied to (capped out / unmatched) as None, so they are
-    excluded from the corrected panel's numerator AND denominator rather than silently counted as raw
-    (the raw ``category`` column is never None, so the raw panel keeps every allele).
+    to that allele) is dropped. Rows whose ``category_col`` is None are dropped too: every category
+    column, raw and corrected alike, is None outside the capped whole-locus cohort
+    (``categorize_parquet``), so the raw and corrected panels count the same alleles.
     Returns a dict with ``counts`` (category -> list of ``len(X_LABELS)`` ints), ``alleles_per_bin``
     (total alleles per x-bin), ``same`` / ``total`` scalars and ``loci`` (the set of distinct locus
     ids kept) for the title.
@@ -314,7 +359,10 @@ def bin_counts(cat, category_col, homopolymer, purity_min=None, pok_stratum=None
     if purity_min is not None:
         sel = sel[pd.to_numeric(sel["purity"], errors="coerce") > purity_min]
     if pok_stratum is not None:
-        pok = pd.to_numeric(sel["pok"], errors="coerce")
+        # A corrected variant's calls may have been re-paired with the truth alleles, so its pOk lives
+        # in its own column (categorize_parquet); the raw panel uses the plain one.
+        pok_col = "pok__" + category_col[len("category__"):] if category_col.startswith("category__") else "pok"
+        pok = pd.to_numeric(sel[pok_col if pok_col in sel.columns else "pok"], errors="coerce")
         sel = sel[(pok < 0.5) if pok_stratum == "lt" else (pok >= 0.5)]
     sel = sel[sel[category_col].notna()]  # drop alleles the model wasn't applied to (corrected variants)
     nb = len(X_LABELS)

@@ -18,10 +18,12 @@ pip install -r requirements.txt
 ./train_model.sh
 ```
 
-`train_model.sh` runs three idempotent stages and writes the dated model + an HTML report:
+`train_model.sh` runs four idempotent stages and writes the dated model + an HTML report:
 
-1. **`dataset.py`** — downloads the EH JSON shards + truth TSVs from the `str-truth-set-v2` GCS
-   buckets (skipping anything already local) and assembles `data/parquet/{quick,full}.parquet`.
+1. **`dataset.py`** — downloads the EH JSON shards + truth TSVs from
+   `gs://tandem-repeat-explorer/tool_genotype_quality/` and the DipCall high-confidence BEDs from
+   `gs://str-truth-set-v2` (skipping anything already local) and assembles
+   `data/parquet/{quick,full}.parquet`.
 2. **`train.py`** — fits the three genotyping_regime experts and exports
    `model/genotype_quality_model_from_HG002_and_CHM1_CHM13.<date>.json.gz`, round-trip-verifying that
    the serialized trees/softmax/isotonic reproduce sklearn's predictions.
@@ -29,8 +31,11 @@ pip install -r requirements.txt
    raw-EH-vs-gated-LCF MAE chart, per-genotyping_regime held-out accuracy, and — separately for each of
    the two heads — a relative-feature-importance panel and an add-one-feature ablation curve (see
    [Feature importance and ablation](#feature-importance-and-ablation)).
+4. **`compare_models.py`** — applies the new model and the deployed one to the held-out samples and
+   prints a per-sample paired comparison (skipped when the held-out parquets are not built).
 
-Requires `gcloud`/`gsutil` authenticated for `gs://str-truth-set-v2` (read access).
+Requires `gcloud`/`gsutil` authenticated with read access to `gs://tandem-repeat-explorer` and
+`gs://str-truth-set-v2`.
 
 ## Model structure
 
@@ -46,8 +51,30 @@ Each expert = two scikit-learn `HistGradientBoosting` heads (`model.py`):
 - **q-median** — quantile regressor on `t = log(eh) − log(true)`; `LCF = exp(t)`.
 - **direction** — 3-class classifier + per-class isotonic calibration.
 
-Both use a manual `warm_start` early-stopping loop scored on a held-out **chromosome-clean**
-calibration set (never sklearn's internal random-split early stopping, which would leak loci).
+In `train.py` each head is fit to a **fixed** number of boosting iterations per regime
+(`train.ITERATIONS_BY_REGIME`: direction 150 / 3,000 / 3,000 and q-median 300 / 6,000 / 6,000 for
+quick / full_spanning / full_nonspanning, about 17.9 MB gzipped in all). With people held out, early stopping
+never stops: more trees keep learning catalog loci that new people share, so the sizes were chosen on
+2026-10-06 from learning curves whose checkpoints pair d direction iterations with 2d q-median
+iterations: each full-genotyper size is the smallest checkpoint within 2% of the (4,000, 8,000) fit on
+new people at known loci (on unseen loci the error was flat by then). Quick was then cut by hand to 150
+for runtime: its calls are ~93% of the alleles ExpansionHunter scores (HG002 chr22, every catalog
+locus), at 500 it was ~69% of all tree evaluations, and its curve is nearly flat (150 lies between the
+100 and 250 checkpoints, which are 1.9% / 4.7% and 1.2% / 2.9% above the 4,000 fit for
+non-homopolymers / homopolymers). On HG002 chr22 (optimized-streaming, 1 thread), the model adds 4.5%
+user CPU time over a 1-tree model; the previously embedded 2026-07-08 model adds 5.4%, the quick-500 version
+6.3%, and 4,000 / 8,000 iterations in every regime 29%.
+Re-derive the full-genotyper sizes after the training pool changes with `model_size_curves.py` (one run
+per regime, then `--plot` / `--pick --tolerance 0.02`); `--pick` does not reproduce quick's hand-set
+150. The isotonic calibration is fit on 5 held-out
+**people**, so the trees train on every chromosome. HG002 and CHM1_CHM13 are never held out whole:
+each gives one autosome to the calibration set, so it also sees 10x, 20x and 46x data, and those loci
+are still learned from everyone else. Calibration uses only the pool's representative rows
+(`dataset.py` adds training-only rows of rare called sizes on top of a uniform per-source sample). The
+report's cross-validation (`report.py`) instead holds out chromosomes, to measure accuracy on loci the
+model never saw; its ablations use a manual `warm_start` early-stopping loop. `train.py` draws the
+training rows with quotas over motif type and called allele size, and fits the q-median head only on
+rows the `pOk < 0.5` gate fires on (judged out of fold), because the LCF is applied only to those.
 
 ## Feature importance and ablation
 
@@ -106,7 +133,7 @@ every parquet (`dataset.py --force`, and `heldout.build_sample(..., force=True)`
 panel), since the new columns come out of `eh_json.py` at extract time.
 
 `features_tests.py` checks the two lists against each other three ways: `FULL_FEATURES` is
-`QUICK_FEATURES` plus the two flank depths, the list matches a spelled-out literal in the test (so a
+`QUICK_FEATURES` plus the two flank depths and `inrepeat_total`, the list matches a spelled-out literal in the test (so a
 one-sided edit is deliberate), and — whenever a local `~/code/ExpansionHunter-bw2` checkout is present
 — the list parsed straight out of `GenotypeQualityFeatures.cpp` matches too.
 
@@ -147,8 +174,9 @@ from the training pool (see Training data above), scoring against their truth. `
 `report/heldout.json` benchmark dump; the report's held-out HPRC section is fed by the
 `report/eval_heldout_hprc.json` / `report/stacked_heldout_hprc.json` artifacts, which `report.py`
 **regenerates by default** from the locally-built held-out parquets (via `gen_datasets.generate`, no
-download) — pass `--skip-heldout-samples` to opt out. Building those parquets (a ~7-8 GB download for
-the original 30 samples; roughly 3x that for all 81) is off by default; enable it with
+download) — pass `--skip-heldout-samples` to opt out. Building those parquets (about 0.7 GB of gzipped
+JSON per sample on the v2.1 catalog, so about 57 GB for all 81, downloaded one sample at a time and
+deleted after use) is off by default; enable it with
 `RUN_HELDOUT_SAMPLES=1 ./train_model.sh`, which builds them before the report step so the render picks
 them up.
 

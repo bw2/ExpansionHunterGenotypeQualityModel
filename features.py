@@ -4,7 +4,8 @@ Two disjoint feature contracts (the JSON carries ``feature_names`` so the C++
 consumer assembles features in the exact same order):
 
 - ``quick`` -- the optimized-streaming ``processLocusFast`` (QuickGenotype) rows.
-- ``full``  -- everything else; ``QUICK_FEATURES`` plus the two flank-normalized depths.
+- ``full``  -- everything else; ``QUICK_FEATURES`` plus the two flank-normalized depths and
+  ``inrepeat_total``.
 
 ``ci_asymmetry`` and ``ci_over_eh`` are engineered here (next to the feature list)
 from the raw CI columns. ``build_matrix`` returns a float DataFrame with exactly
@@ -41,8 +42,9 @@ QUICK_FEATURES = [
     "reference_repeat_purity", "read_repeat_purity",
 ]
 
-# Full branch adds the two full-only flank-normalized depth columns.
-FULL_FEATURES = QUICK_FEATURES + ["left_flank_norm_depth", "right_flank_norm_depth"]
+# Full branch adds the two full-only flank-normalized depth columns and the in-repeat read count (the
+# fast path never counts in-repeat reads).
+FULL_FEATURES = QUICK_FEATURES + ["left_flank_norm_depth", "right_flank_norm_depth", "inrepeat_total"]
 
 # Raw CI/eh columns the engineered features derive from (NOT present in the parquet
 # as features; the engineered ci_asymmetry/ci_over_eh are rebuilt by ``add_engineered``).
@@ -79,6 +81,7 @@ FEATURE_DEFINITIONS = {
     "read_repeat_purity": "Pooled base-weighted fraction of this allele's in-repeat read bases matching the motif (0-1).",
     "left_flank_norm_depth": "Left-flank-normalized depth (full branch only).",
     "right_flank_norm_depth": "Right-flank-normalized depth (full branch only).",
+    "inrepeat_total": "Reads lying entirely inside the repeat at the locus, summed over CountsOfInrepeatReads (full branch only).",
 }
 
 # Direction class coding -- also the output column order of every probability vector.

@@ -70,6 +70,54 @@ class SizeBinLabelTest(unittest.TestCase):
         self.assertEqual(dataset._size_bin_label(-1), "?")
 
 
+class QuotaSampleTest(unittest.TestCase):
+    def test_small_cells_are_kept_whole_and_large_cells_share_the_rest(self):
+        # 900 homopolymer rows called at 20 bp, 100 non-homopolymer rows called at 70 x 3 = 210 bp.
+        motif = np.array([1] * 900 + [3] * 100, dtype=float)
+        eh = np.array([20] * 900 + [70] * 100, dtype=float)
+        idx = np.arange(1000)
+        out = dataset.quota_sample(motif, eh, idx, 300, 1)
+        self.assertEqual((out >= 900).sum(), 100)    # the rare cell keeps all of its rows
+        self.assertEqual((out < 900).sum(), 200)     # the common cell gets the remaining quota
+        self.assertTrue(np.all(np.diff(out) > 0))   # sorted, no duplicates
+        np.testing.assert_array_equal(out, dataset.quota_sample(motif, eh, idx, 300, 1))
+
+    def test_no_cap_or_small_pool_returns_the_pool(self):
+        motif, eh, idx = np.ones(10), np.full(10, 5.0), np.arange(10)
+        np.testing.assert_array_equal(dataset.quota_sample(motif, eh, idx, None, 1), idx)
+        np.testing.assert_array_equal(dataset.quota_sample(motif, eh, idx, 50, 1), idx)
+
+    def test_per_source_cap_keeps_a_uniform_sample_plus_a_training_only_top_up(self):
+        df = pd.DataFrame({"genotyping_regime": ["quick"] * 1000 + ["full_spanning"] * 5,
+                           "motif_size": [1] * 950 + [3] * 50 + [1] * 5,
+                           "eh": [20] * 950 + [70] * 50 + [20] * 5,
+                           "row": range(1005)})
+        out = dataset._cap_rows_per_genotyping_regime(df, 200, 1)
+        quick, rep = out["genotyping_regime"] == "quick", out["representative"]
+        self.assertEqual((quick & rep).sum(), 200)                      # uniform sample, the cap
+        self.assertEqual((quick & (out["motif_size"] == 3)).sum(), 50)  # the rare cell is whole ...
+        self.assertEqual((quick & (out["motif_size"] == 3) & rep).sum() + (quick & ~rep).sum(), 50)  # ... via the top-up
+        self.assertFalse(out["row"].duplicated().any())
+        self.assertTrue(out["row"].is_monotonic_increasing)
+        self.assertEqual(((~quick) & rep).sum(), 5)                     # a small regime stays whole
+
+    def test_top_up_counts_rows_already_chosen(self):
+        motif, eh = np.array([1.0] * 90 + [3.0] * 10), np.array([20.0] * 90 + [70.0] * 10)
+        idx = np.arange(100)
+        chosen = np.array([0, 1, 95])                                   # one rare row already chosen
+        extra = dataset._quota_top_up(motif, eh, idx, chosen, 20, 1)
+        self.assertFalse(np.isin(extra, chosen).any())
+        self.assertEqual(int((extra >= 90).sum()), 9)                   # the rare cell reaches all 10
+
+
+class IndividualOfPartTest(unittest.TestCase):
+    def test_coverage_variants_of_one_person_share_an_individual(self):
+        self.assertEqual({dataset.individual_of_part("/d/HG002_%s.parquet" % c) for c in ("10x", "20x", "31x")},
+                         {"HG002"})
+        self.assertEqual(dataset.individual_of_part("/d/CHM1_CHM13_46x.parquet"), "CHM1_CHM13")
+        self.assertEqual(dataset.individual_of_part("/d/NA12878.parquet"), "NA12878")
+
+
 class ChromFromLocusTest(unittest.TestCase):
     def test_valid_and_invalid(self):
         locus = pd.Series(["1-100-200-ATG", "chr2-5-10-A", "chrX-1-2-A", "chrM-1-2-A", "chrUn-1-2-A"])
@@ -663,7 +711,7 @@ class AssembleBranchTest(unittest.TestCase):
             self.assertEqual(len(full), 1)
             self.assertEqual(full.iloc[0]["genotyping_regime"], "full_nonspanning")
 
-    def test_each_source_keeps_at_most_the_cap_per_genotyping_regime(self):
+    def test_each_source_keeps_at_most_the_cap_of_representative_rows_per_genotyping_regime(self):
         with tempfile.TemporaryDirectory() as d:
             src_dir = os.path.join(d, "src")
             os.makedirs(src_dir)
@@ -678,7 +726,11 @@ class AssembleBranchTest(unittest.TestCase):
                 first = pd.read_parquet(os.path.join(d, "parquet", "quick.parquet"))
                 dataset.assemble_branch(d, "quick", "src")
                 second = pd.read_parquet(os.path.join(d, "parquet", "quick.parquet"))
-            self.assertEqual(len(first), 6)  # 3 from each of the 2 sources
+            # The cap bounds each source's REPRESENTATIVE rows; the training-only quota top-up comes on
+            # top and is tested in QuotaSampleTest.
+            self.assertEqual(first[first["representative"]].groupby("individual").size().to_dict(),
+                             {"a": 3, "b": 3})
+            self.assertTrue(first["individual"].isin(["a", "b"]).all())
             pd.testing.assert_frame_equal(first, second)  # the subsample is deterministic
 
     def test_no_parquets_is_a_no_op(self):
@@ -882,6 +934,27 @@ class AssertEhBuildMatchesTest(unittest.TestCase):
             result = mock.Mock(returncode=0, stdout=diff + extra)
             with mock.patch.object(dataset.subprocess, "run", return_value=result):
                 self.assertEqual(dataset._cmake_change_only_swaps_the_embedded_model("b1fbc23"), expected)
+
+    def test_older_build_with_only_the_inrepeat_feature_wiring_since_passes(self):
+        changed = ["ehunter/genotype_quality/GenotypeQualityFeatures.cpp",
+                   "ehunter/genotype_quality/GenotypeQualityFeatures.hh", "ehunter/io/JsonWriter.cpp",
+                   "ehunter/tests/GenotypeQualityFeaturesTest.cpp"]
+        diff = ("--- a/ehunter/io/JsonWriter.cpp\n+++ b/ehunter/io/JsonWriter.cpp\n@@ -324 +324,2 @@\n"
+                "-                    .numDistinctAlleles = numDistinctAlleles};\n"
+                "+                    .numDistinctAlleles = numDistinctAlleles,\n"
+                "+                    .inrepeatReads = &repeatFindings.countsOfInrepeatReads()};\n")
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="feed123"), \
+             mock.patch.object(dataset, "_bw2_files_changed_since", return_value=changed), \
+             mock.patch.object(dataset.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=diff)):
+            p = self._json(os.path.join(d, "a.json.gz"), "b1fbc23")
+            dataset.assert_eh_build_matches("combo", [("json shard 0", p)])  # must not raise
+
+    def test_json_writer_change_beyond_the_model_wiring_counts(self):
+        diff = ("--- a/ehunter/io/JsonWriter.cpp\n+++ b/ehunter/io/JsonWriter.cpp\n@@ -224 +224 @@\n"
+                '+    record_["NewField"] = 1;\n')
+        with mock.patch.object(dataset.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=diff)):
+            self.assertFalse(dataset._json_writer_change_only_feeds_the_model("b1fbc23"))
 
     def test_older_build_with_source_changes_since_exits(self):
         with tempfile.TemporaryDirectory() as d, \

@@ -30,10 +30,12 @@ class MakeFoldsTest(unittest.TestCase):
         self.assertEqual(len(folds), 5)
         seen_test = []
         for f in folds:
-            self.assertEqual(set(), set(f["train"]) & set(f["calib"]))
-            self.assertEqual(set(), set(f["train"]) & set(f["test"]))
-            self.assertEqual(set(), set(f["calib"]) & set(f["test"]))
-            self.assertEqual(len(f["train"]) + len(f["calib"]) + len(f["test"]), len(R.ALL_CHROMS))
+            groups = [set(f[k]) for k in ("train", "calib", "test")]
+            for a in range(len(groups)):
+                for b in range(a + 1, len(groups)):
+                    self.assertEqual(set(), groups[a] & groups[b])
+            self.assertEqual(len(f["calib"]), 2)
+            self.assertEqual(sum(len(g) for g in groups), len(R.ALL_CHROMS))
             seen_test += f["test"]
         self.assertEqual(sorted(seen_test), sorted(R.ALL_CHROMS))
 

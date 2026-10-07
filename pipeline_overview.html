@@ -89,29 +89,30 @@
     <span class="stage-head blue">Stage 1 &mdash; Data ingestion</span>
     <div class="stage-body">
       <h3><span class="file">dataset.py</span> (with <span class="file">eh_json.py</span>, <span class="file">features.py</span>)</h3>
-      <p>Downloads from GCS and assembles the labeled training tables. Only <b>two</b> remote sources per sample are fetched now — the EH JSON and the tool-independent truth-genotypes TSV; the old precomputed <span class="file">*.for_comparison.*.alleles.tsv.gz</span> table is no longer downloaded or read (its contents are reconstructed downstream from these two). Downloads are <b>idempotent and freshness-aware</b>: a local copy is re-used only while it is current — <span class="file">_check_freshness</span> re-downloads (overwrites) any file whose bucket object is newer by last-modified time or whose md5 has changed, and the per-combo parquet is rebuilt whenever a source it derives from is newer than it.</p>
+      <p>Downloads from GCS and assembles the labeled training tables. <b>Three</b> remote sources per sample are fetched — the EH JSON, the tool-independent truth-genotypes TSV and the DipCall high-confidence BED; the old precomputed <span class="file">*.for_comparison.*.alleles.tsv.gz</span> table is no longer downloaded or read (its contents are reconstructed downstream from these two). Downloads are <b>idempotent and freshness-aware</b>: a local copy is re-used only while it is current — <span class="file">_check_freshness</span> re-downloads (overwrites) any file whose bucket object is newer by last-modified time or whose md5 has changed, and the per-combo parquet is rebuilt whenever a source it derives from is newer than it.</p>
       <p class="kicker">Inputs</p>
       <ul>
-        <li><span class="file">gs://str-truth-set-v2/tool_results/&lt;sample&gt;/illumina/EHv5-bw2-optimized/&lt;cov&gt;_coverage/json/*.json.gz</span> &mdash; raw EH output (tool <code>EHv5-bw2-optimized</code> = the bw2 fork's optimized-streaming build), one set per <b>(sample, coverage)</b> training combo: <b>HG002 10x / 20x / 31x</b> and <b>CHM1_CHM13 46x</b>. (Held-out samples use the same layout with a <span class="file">combined_catalog_43_samples_1.6M_loci/</span> subdir before <span class="file">json/</span>.) Carries the genotype calls, confidence intervals, read-support counts, and per-allele quality metrics. These paths match the current <span class="file">~/code/str-truth-set-v2</span> pipeline output layout (<span class="file">run_genotyping_tools.py</span> <code>DEFAULT_OUTPUT_DIR</code> + <code>{sample}/{data_type}/{tool}/{cov}_coverage/[subdir/]</code>).
+        <li><span class="file">gs://tandem-repeat-explorer/tool_genotype_quality/expansion_hunter_v2.1/&lt;sample label&gt;/json/*.json.gz</span> (<span class="file">dataset.EH_RESULTS_ROOT</span>) &mdash; raw optimized-streaming EH output on the 5.65M-locus TRExplorer v2.1 catalog, one run per <b>sample label</b>: the training combos <b>HG002_10x / HG002_20x / HG002</b> (31x) and <b>CHM1_CHM13</b> (46x), the promoted samples and the held-out samples. Carries the genotype calls, confidence intervals, read-support counts, and per-allele quality metrics.
           <span class="why"><b>Why:</b> this is the sole source of the model's <em>input features</em> and the <code>eh</code> call being corrected — every feature the model reads comes from the JSON, never from a precomputed TSV, so features are computed identically across samples/coverages/branches.</span></li>
-        <li><span class="file">gs://str-truth-set-v2/filter_vcf_v2/&lt;sample&gt;/&lt;sample&gt;.tandem_repeat_genotypes.tsv.gz</span> &mdash; the tool-independent truth catalog (Short/Long allele repeat counts, <code>NumRepeatsInReference</code>, motif, per-allele purity) built from the dipcall/long-read-assembly pipeline; one file per sample (truth doesn't depend on short-read coverage). This is the <em>same</em> plain <span class="file">filter_vcf_v2</span> the genotyping pipeline reads its catalog from, so it stays consistent with the JSON (the dated <span class="file">filter_vcf_v2__…</span> variants would not).
+        <li><span class="file">gs://tandem-repeat-explorer/tool_genotype_quality/truth_genotypes_v2.1/</span> (<span class="file">dataset.TRUTH_GENOTYPES_ROOT</span>) &mdash; the tool-independent truth genotypes on the same catalog (Short/Long allele repeat counts, <code>NumRepeatsInReference</code>, motif, per-allele purity) built from the dipcall/long-read-assembly pipeline; one file per sample (truth doesn't depend on short-read coverage).
           <span class="why"><b>Why:</b> supplies the <em>training target</em> — the true allele size each call is scored against (<code>t = log(eh) − log(true)</code>) — and, being tied to no EH run, cannot go stale relative to one. It is filtered at load to EH's catalog loci (primary contigs + variant, non-hom-ref, per <span class="file">convert_truth_set_to_variant_catalogs.py</span>) so it lines up with the loci the JSON actually contains.</span></li>
-        <li>50 <span class="file">PROMOTED_HELDOUT_SAMPLES</span> per-sample parquets (54 training sources with the 4 combos), built on demand via <span class="file">heldout.build_sample</span> from the same two GCS sources and symlinked into the training pool.
+        <li>The sample's DipCall high-confidence BED (<span class="file">gs://str-truth-set-v2/dipcall_pipeline/…/&lt;sample&gt;.dip.bed.gz</span>, listed in <span class="file">high_confidence_beds.tsv</span>) &mdash; truth loci not wholly inside one confident region are dropped, so every truth allele the model trains or is scored on comes from a region the assembly resolved.</li>
+        <li>50 <span class="file">PROMOTED_HELDOUT_SAMPLES</span> per-sample parquets (54 training sources with the 4 combos), built on demand via <span class="file">heldout.build_sample</span> from the same three GCS sources and symlinked into the training pool.
           <span class="why"><b>Why:</b> HG002+CHM1_CHM13 alone leave the large-allele tail overfit to two genomes; these add ancestry/sex diversity at large sizes.</span></li>
       </ul>
       <p class="kicker">Role</p>
       <ul>
         <li><span class="file">eh_json.extract_rows</span> flattens each JSON into one row per allele. A no-call locus (EH emitted <code>./.</code>) now yields rows with a <b>null <code>eh</code></b> so the report can later count those truth alleles as "No Call"; these rows are dropped before training.</li>
-        <li><span class="file">_load_truth_from_genotypes_tsv</span> filters the truth catalog to EH's catalog loci (primary contigs + variant, non-hom-ref), then <span class="file">_join_truth</span> left-joins it on <span class="file">(locus_id, allele_rank)</span>; <span class="file">_assert_catalog_agreement</span> warns if the JSON and filtered-truth catalogs still disagree beyond tolerance (expected residual: stale training JSONs, and the held-out superset catalog).</li>
+        <li><span class="file">_load_truth_from_genotypes_tsv</span> filters the truth catalog to EH's catalog loci (primary contigs + variant, non-hom-ref), then <span class="file">_join_truth</span> left-joins it on <span class="file">(locus_id, allele_rank)</span>; <span class="file">_assert_catalog_agreement</span> refuses to build (raises) when more than 2% of the filtered truth loci are missing from the JSON overall, or more than 15% in any truth-size bin, and otherwise prints a summary of the gap.</li>
         <li><span class="file">label_and_filter</span> drops chrM/unknown-contig, negative-control, missing/non-positive-<code>eh</code>-or-<code>true</code> (including the no-call rows), and missing-motif rows, then <span class="file">features.add_labels</span> computes the targets and routes each allele to a genotyping regime.</li>
-        <li><span class="file">assemble_branch</span> splits rows by <span class="file">genotyping_branch</span> (QuickGenotype fast-path vs full-genotyper fallback) and concatenates all combos + promoted samples per branch.</li>
+        <li><span class="file">assemble_branch</span> splits rows by <span class="file">genotyping_branch</span> (QuickGenotype fast-path vs full-genotyper fallback) and concatenates all combos + promoted samples per branch, keeping a seeded uniform sample of up to 100,000 <b>representative</b> rows per source per genotyping regime (the only rows used for early stopping, calibration and the report's CV test rows) plus a training-only quota top-up of rare motif-type &times; called-size cells and recording each row's person in an <code>individual</code> column (HG002's three coverages are one person) for the person-level hold-out in Stage 2.</li>
       </ul>
       <p class="kicker">Outputs</p>
       <ul>
         <li><span class="file">data/parquet/quick.parquet</span>, <span class="file">data/parquet/full.parquet</span> &mdash; labeled per-allele rows (features + <code>t</code>, <code>dir_code</code>, <code>genotyping_regime</code>), split by genotyper branch.</li>
         <li>Per-combo parquets under <span class="file">data/real_quick/</span> (e.g. <span class="file">HG002_31x.parquet</span>) — the pre-filter join, kept with <code>locus_id</code>/<code>true</code>/no-call rows so Stage 3's accuracy-by-size can reconstruct the tool-vs-truth comparison table.</li>
       </ul>
-      <p style="font-size:0.85rem;color:var(--sub);margin-bottom:0;"><b>Note — what is <em>not</em> a Stage-1 (training) input:</b> <b>HG002 exome (3x)</b> is <em>not</em> ingested here and never trains the model; it is only a Stage-3 report evaluation dataset (a legacy hand-built parquet). CHM1_CHM13 <em>is</em> a training combo (46x). Neither the exome data nor the 30 fully-held-out HPRC samples enter the training pool.</p>
+      <p style="font-size:0.85rem;color:var(--sub);margin-bottom:0;"><b>Note — what is <em>not</em> a Stage-1 (training) input:</b> <b>HG002 exome (3x)</b> is <em>not</em> ingested here and never trains the model; it was a Stage-3 report evaluation dataset (a legacy hand-built parquet) and is currently disabled because that parquet is unavailable. CHM1_CHM13 <em>is</em> a training combo (46x). The 81 fully-held-out HPRC samples never enter the training pool.</p>
     </div>
   </li>
 
@@ -127,8 +128,8 @@
       <p style="font-size:0.85rem;color:var(--sub);margin:0 0 6px;"><b>Freshness guard:</b> both <span class="file">train.py</span> and <span class="file">report.py</span> call <span class="file">dataset.assert_parquets_up_to_date</span> before reading the pool, and exit with a rebuild message if a parquet is missing or older than any upstream JSON/TSV it derives from — so a stale parquet can never be silently trained/reported on.</p>
       <p class="kicker">Role</p>
       <ul>
-        <li>For each regime (<code>quick</code>, <code>full_spanning</code>, <code>full_nonspanning</code>): hold out ~10% of chromosomes (seeded) as a chromosome-clean calibration set, cap training rows (seeded subsample).</li>
-        <li><span class="file">train_q_median</span> fits a quantile (median) regressor on <code>t = log(eh) − log(true)</code>; <span class="file">train_direction</span> fits a 3-class classifier + per-class isotonic calibration. Both use manual warm-start early stopping scored on the calibration set.</li>
+        <li>For each regime (<code>quick</code>, <code>full_spanning</code>, <code>full_nonspanning</code>): hold out the isotonic-calibration rows (seeded): 5 whole people plus HG002's and CHM1_CHM13's rows on one autosome (so calibration sees 10x/20x/46x coverage; HG002 and CHM1_CHM13 train on all their other chromosomes), representative rows only; train on every chromosome, and cap training rows with a seeded quota sample spread evenly over (homopolymer or not) &times; called allele size.</li>
+        <li><span class="file">train_direction</span> fits a 3-class classifier + per-class isotonic calibration. <span class="file">train_q_median</span> fits a quantile (median) regressor on <code>t = log(eh) − log(true)</code> using only the rows the <code>pOk &lt; 0.5</code> gate fires on, judged out of fold by two 500-iteration direction heads fit on opposite halves of the training people, since the LCF is only ever applied to those calls. Both heads are fit to a fixed number of iterations per regime (<span class="file">train.ITERATIONS_BY_REGIME</span>: direction 150 / 3,000 / 3,000, q-median 300 / 6,000 / 6,000), chosen from learning curves: with people held out, early stopping never stops, because more trees keep learning catalog loci that new people share. Quick was cut by hand to 150 for runtime, since its calls are ~93% of the alleles scored (HG002 chr22, every catalog locus) and its curve is nearly flat.</li>
         <li><span class="file">serialize_genotyping_regime</span> exports trees/baseline/calibrators to the C++-compatible schema; <span class="file">verify_genotyping_regime</span> re-implements inference from that serialized dict and asserts it reproduces sklearn's predictions.</li>
       </ul>
       <p class="kicker">Outputs</p>
@@ -155,7 +156,7 @@
       <ol class="sub-steps">
         <li><strong>3a. Homopolymer CV pass</strong> (<span class="file">--homopolymer-cv</span>, run first): 5-fold chromosome-clean OOF on 1&nbsp;bp-motif loci only &rarr; <span class="file">results_homopolymer.json</span>, <span class="file">dir_oof_homopolymer.npz</span>.</li>
         <li><strong>3b. Main CV + render</strong>: identical OOF on non-homopolymer rows; <span class="file">metrics.py</span> scores q-head accuracy, direction log-loss/AUC/calibration, and the gated MAE (apply LCF only where <code>pOk &lt; 0.5</code>); permutation importance + add-one ablation; renders the PNGs and <span class="file">report/model_report.html</span>.
-          <br><b>Held-out regeneration (new, default-on):</b> before rendering the dataset sections, <span class="file">report.py</span> calls <span class="file">gen_datasets.generate("heldout_hprc", …)</span> to refresh the held-out HPRC eval/stacked artifacts from any locally-built held-out parquets (no download). Pass <span class="file">--skip-heldout-samples</span> to opt out; it is a no-op if those parquets haven't been built.</li>
+          <br><b>Dataset regeneration (default-on):</b> before rendering the dataset sections, <span class="file">report.py</span> calls <span class="file">gen_datasets.generate</span> for every dataset (held-out HPRC, HG002 genome) to refresh its eval/stacked artifacts from the locally-built parquets (no download), and drops any artifact recorded for a different model than <span class="file">--model</span>. Pass <span class="file">--skip-heldout-samples</span> to opt out; a dataset whose parquets haven't been built is skipped.</li>
       </ol>
       <p class="kicker">Outputs</p>
       <ul><li><span class="file">report/results.json</span>, <span class="file">report/dir_oof.npz</span>, the PNG charts, and the final <span class="file">report/model_report.html</span>.</li></ul>
@@ -165,12 +166,12 @@
   <li>
     <span class="stage-head orange">Stage 4 &mdash; External validation<span class="optional-tag">optional · RUN_HELDOUT_SAMPLES=1</span></span>
     <div class="stage-body">
-      <p>Builds the 81 truly held-out sample parquets so Stage 3 can score them (the model is applied unchanged — the realistic "train on some samples, deploy on new samples" test). A ~7&ndash;8&nbsp;GB download for the original 30 samples (roughly 3x that for all 81), off by default.</p>
+      <p>Builds the 81 truly held-out sample parquets so Stage 3 can score them (the model is applied unchanged — the realistic "train on some samples, deploy on new samples" test). About 0.7&nbsp;GB of gzipped JSON per sample (about 57&nbsp;GB for all 81), downloaded one sample at a time and deleted after its parquet is built; off by default.</p>
       <ol class="sub-steps">
         <li>
           <strong>4a. <span class="file">heldout.py --build-only</span></strong><br>
-          <span class="kicker">Input:</span> GCS EH JSON + truth-genotypes TSV for the 81 held-out samples.
-          <span class="why"><b>Why:</b> same two sources / same extract-join-label pipeline as Stage 1, so the held-out parquets carry identical features (and no-call rows) — a prerequisite for applying the frozen model to them.</span><br>
+          <span class="kicker">Input:</span> GCS EH JSON + truth-genotypes TSV + DipCall high-confidence BED for the 81 held-out samples.
+          <span class="why"><b>Why:</b> same three sources / same extract-join-label pipeline (including the confident-region filter) as Stage 1, so the held-out parquets carry identical features (and no-call rows) — a prerequisite for applying the frozen model to them.</span><br>
           <span class="kicker">Output:</span> <span class="file">data_eval_43/real_43/&lt;SAMPLE&gt;.parquet</span> &times; 81.
         </li>
         <li>
@@ -194,8 +195,9 @@
       </ul>
       <p class="kicker">Role</p>
       <ul>
-        <li>Reuses <span class="file">heldout.run_eval</span> for each model, then per regime compares gated MAE, distance reduction, pOk accuracy, median |err|, and net-helped (pOk&lt;0.5) count, tallying metric wins into a <b>NEW / PREVIOUS / MIXED</b> verdict.</li>
-        <li><b>Self-skips</b> (prints a note, exit 0) if the held-out parquets weren't built (no <span class="file">RUN_HELDOUT_SAMPLES=1</span>), if no previous model exists, or if the two models have a different <span class="file">feature_names</span> contract (comparison would be invalid).</li>
+        <li>Reuses <span class="file">heldout.run_eval</span> for each model on the same rows, then scores each genotyping regime separately for homopolymer and non-homopolymer alleles. A group is won only when the per-sample paired difference in gated MAE has a bootstrap 95% interval (2000 resamples over samples) that excludes 0; the verdict is <b>NEW / PREVIOUS / MIXED / NO CLEAR DIFFERENCE</b>. Gate-decision accuracy (pOk&lt;0.5), argmax direction accuracy, median |err| and the net-helped count are printed as context, not counted, and the gated MAE is also shown without the ten fast-path diagnosis samples.</li>
+        <li>Scope, printed with the result: only loci whose truth differs from the reference, and one row per emitted quality-metric entry (a missed heterozygous allele is not counted).</li>
+        <li>When the two models declare different <span class="file">feature_names</span> contracts it reports the difference and builds each model's own feature matrix. <b>Self-skips</b> (prints a note, exit 0) if the held-out parquets weren't built (no <span class="file">RUN_HELDOUT_SAMPLES=1</span>) or no previous model exists.</li>
       </ul>
       <p class="kicker">Output</p>
       <ul><li><b>Console only</b> &mdash; the per-regime delta table + verdict is printed to stdout / the pipeline log. Nothing is written to disk and nothing is folded into <span class="file">model_report.html</span>.</li></ul>
@@ -209,7 +211,7 @@
   <ul style="margin-top:0;">
     <li><b>The GQ model is applied post-hoc, in Python.</b> EH emits, per allele, the raw allele size (<code>eh</code>) <em>and every quality-metric feature</em> unconditionally — those fields do not depend on any GQ model. The model JSON only tells the deployed EH binary how to turn those already-emitted features into <code>PredictedLengthCorrectionFactor</code> / <code>pOk</code>. Stage 3 computes those same quantities itself (<span class="file">model.predict_lcf_json</span> / <span class="file">predict_proba_json</span>) from the cached features, so it never needs EH to produce them.</li>
     <li><b>The features are model-independent.</b> Re-running EH with a new model JSON would not change a single feature value the parquets already hold (it would only add the model's <em>outputs</em> into new JSON). Since the parquets already contain the model's inputs, the existing EH JSON serves any model version.</li>
-    <li><b>Determinism / no leakage.</b> The model uses no locus-id feature, and its <code>coverage</code> feature, like every other feature, is a value EH writes to its JSON whether or not a model is loaded, so the same cached JSON is valid regardless of which model was trained; re-running EH would only add cost (and a fresh several-hour EH run over ~1.6M loci &times; 4 combos) with no change to the evaluation inputs.</li>
+    <li><b>Determinism / no leakage.</b> The model uses no locus-id feature, and its <code>coverage</code> feature, like every other feature, is a value EH writes to its JSON whether or not a model is loaded, so the same cached JSON is valid regardless of which model was trained; re-running EH would only add cost (a fresh multi-hour cloud EH run over the 5.65M-locus catalog per sample) with no change to the evaluation inputs.</li>
   </ul>
   <p style="margin-bottom:0;">EH <em>would</em> need re-running only to regenerate the raw <code>*.json.gz</code> after an ExpansionHunter-bw2 code change that alters the calls or features themselves — which <span class="file">dataset._check_freshness</span> detects by comparing each JSON's stamped build commit against the local EH checkout.</p>
 </div>
@@ -219,8 +221,8 @@
 <div class="flow-wrap">
   <div class="col">
     <div class="box data">
-      <div class="t">GCS sources (2 per sample)</div>
-      <div class="f">tool_results/.../json/*.json.gz<br>filter_vcf_v2/*.tandem_repeat_genotypes.tsv.gz</div>
+      <div class="t">GCS sources (3 per sample)</div>
+      <div class="f">expansion_hunter_v2.1/&lt;sample&gt;/json/*.json.gz<br>truth_genotypes_v2.1/*.tsv.gz<br>DipCall high-confidence BED</div>
       EH calls + features (HG002 10x/20x/31x, CHM1_CHM13 46x) &amp; tool-independent truth genotypes
     </div>
     <div class="arrow">&#8595;</div>
@@ -258,7 +260,7 @@
   <div class="col" style="margin-top:250px;">
     <div class="branch-label">optional: RUN_HELDOUT_SAMPLES=1</div>
     <div class="box opt">
-      <div class="t">81 held-out samples (GCS, 2 sources each)</div>
+      <div class="t">81 held-out samples (GCS, 3 sources each)</div>
       Samples absent from training (50 others train alongside HG002 + CHM1_CHM13)
     </div>
     <div class="arrow">&#8595;</div>
@@ -279,7 +281,7 @@
     <div class="arrow">&#8595;</div>
     <div class="box opt">
       <div class="t">Stage 5 &mdash; compare_models.py (post-hoc)</div>
-      new vs previous/deployed model on the held-out parquets &rarr; per-regime deltas + NEW/PREVIOUS verdict, printed to stdout (not in the report)
+      new vs previous/deployed model on the held-out parquets &rarr; per-regime, per-motif-stratum paired gated-MAE differences with bootstrap intervals + verdict, printed to stdout (not in the report)
     </div>
   </div>
 </div>
@@ -296,8 +298,8 @@
   <span class="file">*.for_comparison.with_EHv5-bw2-optimized_vs_Truth_columns.alleles.tsv.gz</span> table (EH-vs-truth columns) to drive
   the accuracy-by-size figure. That download is gone; <span class="file">accuracy_by_size.categorize_parquet</span> rebuilds the same
   per-allele categorization (including "No Call") from the EH JSON (via the parquet's <code>eh</code>) plus the truth-genotypes TSV
-  (via the joined <code>true</code>). The one caveat: the legacy hand-built <b>HG002 exome</b> parquet predates the no-call rows, so its
-  "No Call" category is not shown (flagged in the report).
+  (via the joined <code>true</code>). The legacy hand-built <b>HG002 exome</b> parquet predates the no-call rows and has no
+  "No Call" category; that dataset is currently disabled in the report.
 </div>
 
 </body>

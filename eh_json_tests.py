@@ -23,6 +23,7 @@ def _locus(genotype="20/97", quick=False, with_aqm=True):
         "CountsOfSpanningReads": "(20, 8), (97, 1)",
         "CountsOfFlankingReads": "(98, 2)",
         "CountsOfHighQualityUnambiguousReads": "(20, 6)",
+        "CountsOfInrepeatReads": "()" if quick else "(33, 4), (34, 1)",
     }
     if quick:
         variant["QuickGenotype"] = True
@@ -75,6 +76,8 @@ class ExtractTest(unittest.TestCase):
         self.assertAlmostEqual(a["flanking_frac"], 2 / 11)  # 2 / (2 flanking + 9 spanning)
         self.assertEqual(a["n_alleles"], 2)
         self.assertEqual(a["n_distinct_alleles"], 2)      # 20/97 is het
+        self.assertEqual(a["inrepeat_total"], 5)          # (33, 4), (34, 1); per variant, so shared
+        self.assertEqual(b["inrepeat_total"], 5)
 
     def test_homozygous_genotype_has_one_distinct_allele(self):
         rows = list(eh_json.extract_rows(
@@ -116,6 +119,7 @@ class ExtractTest(unittest.TestCase):
             {"LocusResults": {"x": _locus(quick=True, with_aqm=False)}}, sample_id="S"))
         self.assertEqual(rows[0]["genotyping_branch"], "quick")
         self.assertIsNone(rows[0]["left_flank_norm_depth"])
+        self.assertIsNone(rows[0]["inrepeat_total"])  # the fast path never counts in-repeat reads
 
     def test_no_call_emits_rows_with_null_eh(self):
         rows = list(eh_json.extract_rows(

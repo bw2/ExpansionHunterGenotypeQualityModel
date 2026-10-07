@@ -16,6 +16,59 @@ import pandas as pd
 import accuracy_by_size as A
 
 
+class CorrectedCategoryTest(unittest.TestCase):
+    def test_correcting_one_allele_changes_its_ungated_partners_category(self):
+        # Reference 7 repeats, truth 9/9, raw call 5/7. Correcting only the 5 to 7 makes the locus
+        # homozygous-reference, so the UNGATED 7 must move from Het Ref to Hom Ref with it; this is why
+        # categorize_parquet takes the recomputed category for every applied row, not just gated ones.
+        raw, ref, true, drr_truth = np.array([5.0, 7.0]), np.full(2, 7.0), np.full(2, 9.0), np.full(2, 2.0)
+        out, _ = A._corrected_category(raw, np.array([7.0, 7.0]), np.array([True, False]), ref, true,
+                                       drr_truth, np.array(["L", "L"]))
+        self.assertEqual(list(out), ["Called Hom Ref", "Called Hom Ref"])
+        raw_cat = A.classify(raw - true, raw, drr_truth, raw - ref, raw == ref, np.array([False, False]))
+        self.assertEqual(raw_cat[1], "Called Het Ref")
+
+
+class TruthOrderSourceTest(unittest.TestCase):
+    def test_reversed_corrected_calls_are_repaired_by_size(self):
+        # Raw 10/18, truth 7/10; correcting the 18 to 6 gives 10/6, which matches the truth unphased.
+        locus = np.array(["L", "L", "M", "M"], dtype=object)
+        calls = np.array([10.0, 6.0, 5.0, 9.0])
+        true = np.array([7.0, 10.0, 5.0, 9.0])
+        src = A._truth_order_source(calls, true, locus)
+        np.testing.assert_array_equal(calls[src], [6.0, 10.0, 5.0, 9.0])
+        out, src = A._corrected_category(np.array([10.0, 18.0]), np.array([10.0, 6.0]), np.array([False, True]),
+                                         np.full(2, 10.0), np.array([7.0, 10.0]), np.array([-3.0, 0.0]),
+                                         np.array(["L", "L"], dtype=object))
+        self.assertEqual(list(out), ["Same", "Same"])
+        pok = np.array([0.9, 0.1])  # each call's own pOk travels with it: the 6 (pOk 0.1) is now row 0
+        np.testing.assert_array_equal(pok[src], [0.1, 0.9])
+
+    def test_pok_strata_of_a_corrected_variant_use_its_own_pok_column(self):
+        cat = pd.DataFrame({"motif": [3, 3], "purity": [1.0, 1.0], "xbin": [0, 0], "locus": ["L", "L"],
+                            "category": ["Same", "Same"], "pok": [0.9, 0.1],
+                            "category__p050": ["Same", "2"], "pok__p050": [0.1, 0.9]})
+        lt = A.bin_counts(cat, "category__p050", False, pok_stratum="lt")
+        self.assertEqual(lt["total"], 1)
+        self.assertEqual(sum(lt["counts"]["Same"]), 1)  # the row whose re-paired call has pOk 0.1
+
+
+class LociCohortTest(unittest.TestCase):
+    def test_whole_loci_are_kept_together_within_the_cap(self):
+        locus = np.array(["A", "A", "B", "B", "C", "C", "D"], dtype=object)
+        scoreable = np.array([True, True, True, False, True, True, False])  # D is a no-call locus
+        cohort = A._loci_cohort(locus, scoreable, 3)
+        for loc in set(locus):  # a locus is in or out as a whole
+            self.assertEqual(len(set(cohort[locus == loc])), 1)
+        self.assertLessEqual(int((cohort & scoreable).sum()), 3)
+        np.testing.assert_array_equal(cohort, A._loci_cohort(locus, scoreable, 3))
+
+    def test_no_cap_keeps_everything(self):
+        locus = np.array(["A", "B"], dtype=object)
+        self.assertTrue(A._loci_cohort(locus, np.array([True, True]), None).all())
+        self.assertTrue(A._loci_cohort(locus, np.array([True, True]), 5).all())
+
+
 def _frame(locus_ids, ehs, own_metrics=None):
     data = {"locus_id": locus_ids, "eh": ehs}
     if own_metrics is not None:

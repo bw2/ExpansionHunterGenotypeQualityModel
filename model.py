@@ -7,10 +7,14 @@ Each genotyping_regime expert is two scikit-learn ``HistGradientBoosting`` heads
 - **direction** (``train_direction``) -- a 3-class classifier
   ``[pOk, pTooLong, pTooShort]`` plus one per-class isotonic calibrator.
 
-Both heads use fixed, principled capacity/regularization (NOT tuned on test) and a
-MANUAL ``warm_start`` early-stopping loop scored on an externally supplied,
-chromosome-clean calibration set -- never sklearn's internal ``early_stopping``,
-whose random validation split would leak loci across the chromosome-clean folds.
+Both heads use fixed, principled capacity/regularization (NOT tuned on test). Given
+``n_iter`` (``_fit_fixed``), a head is fit to exactly that many boosting iterations: the
+exported model and the report's cross-validation use the per-regime sizes in
+``train.ITERATIONS_BY_REGIME``. Without it a head early-stops (``_fit_early_stop``, used by
+``report.py``'s feature ablations) with a MANUAL ``warm_start`` loop scored on the caller's
+held-out rows -- never sklearn's internal ``early_stopping``, whose random row split would put
+rows of the same person and locus on both sides. The direction head's isotonic calibrators
+are always fit on the caller's calibration set.
 Every estimator is built with ``random_state=SEED`` for determinism.
 
 ``serialize_genotyping_regime`` emits each head in the C++ schema (``GenotypeQualityModel.cpp``),
@@ -26,7 +30,9 @@ Pure apart from fitting the estimators returned; no module-level mutable state.
 """
 
 import gzip
+import hashlib
 import json
+import os
 
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
@@ -48,11 +54,14 @@ _GBM_KWARGS = dict(
     random_state=SEED,
 )
 
-# Early-stop monitor: grow max_iter by this step, stop after this many steps with
-# no calib improvement, never exceed this many boosting iterations.
+# Early-stop monitor (used when no fixed n_iter is given, i.e. the report's ablations): grow max_iter
+# by this step, stop after this many steps with no improvement on the held-out rows, never exceed this
+# many boosting iterations. The exported model does NOT early-stop: on held-out people the loss keeps
+# improving to any ceiling (more trees keep learning catalog loci the new people share), so its
+# per-regime sizes are fixed from learning curves instead (train.ITERATIONS_BY_REGIME).
 _STEP = 25
 _PATIENCE = 3
-_MAX_TOTAL_ITER = 500
+EARLY_STOP_MAX_ITERATIONS = 500
 _IMPROVE_TOL = 1e-6
 
 
@@ -74,16 +83,16 @@ def _log_loss(y_true, proba):
 def _fit_early_stop(make_estimator, fit, score):
     """Runs the shared warm-start early-stopping loop and returns the best estimator.
 
-    Builds one ``warm_start=True`` estimator, grows ``max_iter`` by ``_STEP`` and
-    refits (appending iterations) until the calib score has not improved for
-    ``_PATIENCE`` steps, then refits a FRESH estimator fixed at the best iteration.
+    Builds one ``warm_start=True`` estimator, grows ``max_iter`` by ``_STEP`` and refits (appending
+    iterations) until the held-out score has not improved for ``_PATIENCE`` steps, then refits a FRESH
+    estimator fixed at the best iteration.
     Boosting is deterministic given ``random_state`` + data, so the fresh fit
     reproduces exactly the trees the warm-start held at that iteration.
 
     Args:
         make_estimator: Zero-arg callable returning a fresh unfitted estimator.
         fit: ``fit(estimator)`` -- fits it on the (closed-over) training data.
-        score: ``score(estimator) -> calib_loss`` lower-is-better. The calibration set reaches
+        score: ``score(estimator) -> loss`` lower-is-better. The early-stopping set reaches
             this function only through this closure.
 
     Returns:
@@ -92,8 +101,8 @@ def _fit_early_stop(make_estimator, fit, score):
     est = make_estimator()
     est.set_params(warm_start=True)
     best_loss, best_n_iter, stalled, n_iter = np.inf, _STEP, 0, 0
-    while n_iter < _MAX_TOTAL_ITER:
-        n_iter = min(n_iter + _STEP, _MAX_TOTAL_ITER)
+    while n_iter < EARLY_STOP_MAX_ITERATIONS:
+        n_iter = min(n_iter + _STEP, EARLY_STOP_MAX_ITERATIONS)
         est.set_params(max_iter=n_iter)
         fit(est)
         loss = score(est)
@@ -111,18 +120,32 @@ def _fit_early_stop(make_estimator, fit, score):
 
 # --- q-median head --------------------------------------------------------
 
-def train_q_median(X, t, X_calib, t_calib):
-    """Fits the early-stopped median (0.5-quantile) regressor of ``t``.
+def _fit_fixed(make_estimator, fit, n_iter):
+    """Fits a fresh estimator to exactly ``n_iter`` boosting iterations (no early stopping)."""
+    est = make_estimator()
+    est.set_params(max_iter=n_iter)
+    fit(est)
+    return est
+
+
+def train_q_median(X, t, X_stop=None, t_stop=None, n_iter=None):
+    """Fits the median (0.5-quantile) regressor of ``t``.
+
+    With ``n_iter`` the fit has exactly that many iterations (the exported model's sizes are chosen
+    from learning curves; see ``train.ITERATIONS_BY_REGIME``). Otherwise it is early-stopped on the
+    held-out ``(X_stop, t_stop)``, with ``EARLY_STOP_MAX_ITERATIONS`` as the ceiling.
 
     Returns:
         A fitted ``HistGradientBoostingRegressor`` (``loss='quantile'``, q=0.5).
     """
     def make():
         return HistGradientBoostingRegressor(loss="quantile", quantile=0.5, **_GBM_KWARGS)
+    if n_iter:
+        return _fit_fixed(make, lambda e: e.fit(X, t), n_iter)
     return _fit_early_stop(
         make,
         fit=lambda e: e.fit(X, t),
-        score=lambda e: _pinball_loss(t_calib, e.predict(X_calib), 0.5))
+        score=lambda e: _pinball_loss(t_stop, e.predict(X_stop), 0.5))
 
 
 def predict_lcf(qreg, X):
@@ -145,14 +168,14 @@ def _proba_in_class_order(clf, X):
     return full
 
 
-def train_direction(X, y, X_calib, y_calib):
-    """Fits the early-stopped 3-class classifier plus per-class isotonic calibrators.
+def train_direction(X, y, X_calib, y_calib, n_iter=None):
+    """Fits the 3-class classifier plus per-class isotonic calibrators.
 
-    The classifier is fit with early stopping monitored on the calib set; then one
-    ``IsotonicRegression`` per class maps its raw one-vs-rest probability to the
-    empirical outcome on the calib set. A class absent from (or the only class in)
-    the calib split gets a pass-through calibrator so the simplex renormalization in
-    ``predict_proba`` does not zero it out.
+    With ``n_iter`` the classifier has exactly that many iterations (see ``train_q_median``).
+    Otherwise it is early-stopped on the calib set, with ``EARLY_STOP_MAX_ITERATIONS`` as the
+    ceiling. Then one ``IsotonicRegression`` per class maps its raw
+    one-vs-rest probability to the empirical outcome on the calib set. A class absent from (or the only class in) the calib split gets a pass-through
+    calibrator so the simplex renormalization in ``predict_proba`` does not zero it out.
 
     Returns:
         ``{"clf": clf, "calibrators": {idx: IsotonicRegression or None}}`` (None ==
@@ -160,10 +183,13 @@ def train_direction(X, y, X_calib, y_calib):
     """
     def make():
         return HistGradientBoostingClassifier(loss="log_loss", **_GBM_KWARGS)
-    clf = _fit_early_stop(
-        make,
-        fit=lambda e: e.fit(X, y),
-        score=lambda e: _log_loss(y_calib, _proba_in_class_order(e, X_calib)))
+    if n_iter:
+        clf = _fit_fixed(make, lambda e: e.fit(X, y), n_iter)
+    else:
+        clf = _fit_early_stop(
+            make,
+            fit=lambda e: e.fit(X, y),
+            score=lambda e: _log_loss(y_calib, _proba_in_class_order(e, X_calib)))
 
     raw_calib = _proba_in_class_order(clf, X_calib)
     y_calib = np.asarray(y_calib, dtype=int)
@@ -342,6 +368,17 @@ def verify_genotyping_regime(genotyping_regime, qreg, dmodel, genotyping_regime_
 # any consumer (e.g. the held-out benchmark) APPLIES the deployed model rather than re-fitting it.
 # Trees are compiled to flat arrays once per genotyping regime, then evaluated vectorized over rows
 # (one descent per tree); the logic mirrors ``_ser_lcf`` / ``_ser_proba`` and ``GenotypeQualityModel.cpp``.
+
+def fingerprint(path):
+    """Returns ``<basename>@<first 12 hex of the file's md5>``, identifying a model file by content.
+
+    Model files are named by day, so a same-day retrain reuses the name; the content hash tells the
+    two apart (evaluation artifacts record this so report.py never shows one model's numbers under
+    another's name).
+    """
+    with open(path, "rb") as f:
+        return "%s@%s" % (os.path.basename(path), hashlib.md5(f.read()).hexdigest()[:12])
+
 
 def load(path):
     """Loads a serialized model dict from a ``.json`` / ``.json.gz`` file (gzip auto-detected)."""

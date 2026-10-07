@@ -5,6 +5,7 @@
 #                           data/parquet/{quick,full}.parquet (skips work already done).
 #   2. train + export    -- fit the per-genotyping_regime experts and write the dated model .json.gz.
 #   3. evaluate + report  -- 5-fold chromosome-clean CV + a standalone HTML report.
+#   4. compare            -- new model vs the deployed one on the held-out samples (compare_models.py).
 #
 # Env overrides: PYTHON, DATA_DIR, MODEL_OUT, TRAIN_CAP, CV_TRAIN_CAP.
 set -euo pipefail
@@ -19,15 +20,15 @@ MODEL_OUT="${MODEL_OUT:-$HERE/model/genotype_quality_model_from_HG002_and_CHM1_C
 TRAIN_CAP="${TRAIN_CAP:-1000000}"
 CV_TRAIN_CAP="${CV_TRAIN_CAP:-400000}"
 
-echo "==== [1/3] download + build parquet ===================================="
+echo "==== [1/4] download + build parquet ===================================="
 "$PYTHON" dataset.py --data-dir "$DATA_DIR"
 
-echo "==== [2/3] train + export model ======================================="
+echo "==== [2/4] train + export model ======================================="
 "$PYTHON" train.py --data-dir "$DATA_DIR" --out "$MODEL_OUT" --train-cap "$TRAIN_CAP"
 
 # Optional external validation: build the held-out per-sample parquets (heldout.SAMPLES, absent from
-# training) so the report's held-out HPRC section is populated. Off by default (a ~7-8 GB download
-# for the original 30 samples, roughly 3x that for all 81). Enable with RUN_HELDOUT_SAMPLES=1. Once
+# training) so the report's held-out HPRC section is populated. Off by default (about 0.7 GB of gzipped
+# JSON per sample, about 57 GB for all 81, one sample at a time). Enable with RUN_HELDOUT_SAMPLES=1. Once
 # the parquets exist, report.py regenerates the held-out eval/stacked artifacts from them by default
 # (no extra gen_datasets.py step) -- pass --skip-heldout-samples to opt out.
 if [ "${RUN_HELDOUT_SAMPLES:-0}" = "1" ]; then
@@ -35,7 +36,7 @@ if [ "${RUN_HELDOUT_SAMPLES:-0}" = "1" ]; then
   "$PYTHON" heldout.py --model "$MODEL_OUT" --build-only
 fi
 
-echo "==== [3/3] evaluate (5-fold CV) + HTML report ========================="
+echo "==== [3/4] evaluate (5-fold CV) + HTML report ========================="
 # Homopolymer-only CV first (writes results_homopolymer.json + dir_oof_homopolymer.npz), so the
 # render below includes the homopolymer panels + the Excluded/Only-Homopolymers toggles.
 "$PYTHON" report.py --data-dir "$DATA_DIR" --cv-train-cap "$CV_TRAIN_CAP" --homopolymer-cv

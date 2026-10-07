@@ -2,10 +2,16 @@
 held-out HPRC benchmark, printing per-regime metric deltas. Run at the end of ``train_model.sh``.
 
 Both models are applied UNCHANGED (no fitting) to the same held-out parquets -- the samples in
-``heldout.SAMPLES``, absent from either model's training pool -- so the comparison is a fair
-generalization test. Metrics (raw/gated MAE, distance reduction, pOk accuracy, and the pOk<0.5
-net-helped count) reuse ``heldout.run_eval`` with the same per-sample allele cap the report uses
-(``gen_datasets.EVAL_CAP_DEFAULT``), so the new model's numbers match the report's held-out section.
+``heldout.SAMPLES``, absent from either model's training pool -- and to the same rows, via
+``heldout.run_eval`` with the per-sample allele cap the report uses (``gen_datasets.EVAL_CAP_DEFAULT``).
+
+Results are reported per genotyping regime AND per motif stratum (homopolymer vs non-homopolymer;
+``run_eval`` keeps them apart, and homopolymers are over half of the alleles EH scores). The verdict
+counts only gated MAE, as a per-sample paired difference with a bootstrap interval over samples; gate
+decision accuracy, 3-class direction accuracy, the median and the net-helped count are printed as
+context. The result is also given without ``heldout.FASTPATH_DIAGNOSIS_SAMPLES``, which were used during
+model development. The evaluated population is variant loci only (truth differs from the reference)
+and one row per emitted quality-metric entry; the printout says so.
 
 The "previous model" defaults to whichever model is deployed in the local ExpansionHunter-bw2 checkout
 (``$EXPANSIONHUNTER_BW2_REPO/ehunter/data/genotype_quality_model_*.json.gz`` -- i.e. the "should we
@@ -21,6 +27,8 @@ import glob
 import os
 import re
 import tempfile
+
+import numpy as np
 
 import dataset
 import features
@@ -59,11 +67,33 @@ def _model_sort_key(path):
     return (match.group(1) if match else "", os.path.basename(path))
 
 
-def _winner(prev, new, higher_is_better):
-    """Returns 'new'/'prev'/'tie' for a metric where new/prev are the two values."""
-    if new == prev:
-        return "tie"
-    return "new" if (new > prev) == higher_is_better else "prev"
+BOOTSTRAP_RESAMPLES = 2000
+BOOTSTRAP_SEED = 20260616
+MIN_SAMPLES_FOR_VERDICT = 10  # fewer samples in a stratum: reported, but it cannot be won or lost
+# The two motif strata run_eval reports per genotyping regime: (label, key of its metrics within the
+# regime's summary or None for the top level, per-sample allele-count key, per-sample error-sum key).
+MOTIF_STRATA = (("non-homopolymer", None, "n", "sum_gated_abs_error"),
+                ("homopolymer", "homopolymer", "homopolymer_n", "homopolymer_sum_gated_abs_error"))
+
+
+def _per_sample_gated_mae_deltas(prev_per_sample, new_per_sample, n_key, sum_key, samples):
+    """Returns new-minus-previous gated MAE for each of ``samples`` that has alleles in this stratum."""
+    return np.array([new_per_sample[s][sum_key] / new_per_sample[s][n_key]
+                     - prev_per_sample[s][sum_key] / prev_per_sample[s][n_key]
+                     for s in samples if s in prev_per_sample and prev_per_sample[s][n_key] > 0])
+
+
+def _bootstrap_mean_interval(values):
+    """Returns the 95% percentile-bootstrap interval of the mean of ``values`` (resampling samples)."""
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    means = rng.choice(values, size=(BOOTSTRAP_RESAMPLES, len(values))).mean(axis=1)
+    return np.percentile(means, [2.5, 97.5])
+
+
+def _pooled_gated_mae(per_sample, n_key, sum_key, samples):
+    """Returns the gated MAE pooled over ``samples`` (all alleles weighted equally)."""
+    n = sum(per_sample[s][n_key] for s in samples if s in per_sample)
+    return sum(per_sample[s][sum_key] for s in samples if s in per_sample) / n if n else float("nan")
 
 
 def compare(new_model, prev_model, data_dir, max_alleles):
@@ -102,33 +132,52 @@ def compare(new_model, prev_model, data_dir, max_alleles):
         prev = heldout.run_eval(paths, prev_model, os.path.join(td, "prev.json"), max_alleles)
         new = heldout.run_eval(paths, new_model, os.path.join(td, "new.json"), max_alleles)
 
-    wins = {"new": 0, "prev": 0, "tie": 0}
+    print("  scope: alleles at loci whose truth genotype differs from the reference (truth hom-ref loci are "
+          "not built into the held-out parquets), and one row per emitted quality-metric entry (the second "
+          "copy of a homozygous call is not scored, so a missed heterozygous allele is not counted).")
+    print("  verdict: per genotyping regime and motif stratum, the per-sample paired difference in gated MAE "
+          "(new - prev) with a %d-resample bootstrap 95%% interval over samples; a stratum is won only when "
+          "the interval excludes 0. The other rows are context and are not counted." % BOOTSTRAP_RESAMPLES)
+
+    samples = [os.path.splitext(os.path.basename(p))[0] for p in paths]
+    without_diagnosis = [s for s in samples if s not in heldout.FASTPATH_DIAGNOSIS_SAMPLES]
+    wins = {"new": 0, "prev": 0, "tie": 0, "too few samples": 0}
     for rk in features.GENOTYPING_REGIMES:
-        p = prev["genotyping_regimes"][rk]
-        n = new["genotyping_regimes"][rk]
-        if not p.get("n"):
-            continue
-        pnet = p["helped_lt"] - p["hurt_lt"]
-        nnet = n["helped_lt"] - n["hurt_lt"]
-        print("\n  [%s] n=%d  (raw MAE %.4f, identical input for both)" % (rk, p["n"], p["mae_raw"]))
-        for label, pv, nv, fmt, higher in (
-                ("gated MAE",            p["mae_gated"],      n["mae_gated"],      "%.4f", False),
-                ("pOk accuracy",         p["p_ok_accuracy"],  n["p_ok_accuracy"],  "%.4f", True),
-                ("median |err| (gated)", p["median_gated"],   n["median_gated"],   "%.3f", False),
-                ("net helped (pOk<0.5)", pnet,                nnet,                "%+d",  True)):
-            win = _winner(pv, nv, higher)
+        for stratum, key, n_key, sum_key in MOTIF_STRATA:
+            p_regime, n_regime = prev["genotyping_regimes"][rk], new["genotyping_regimes"][rk]
+            p, n = (p_regime, n_regime) if key is None else (p_regime[key], n_regime[key])
+            if not p.get("n"):
+                continue
+            deltas = _per_sample_gated_mae_deltas(p_regime["per_sample"], n_regime["per_sample"],
+                                                  n_key, sum_key, samples)
+            low, high = _bootstrap_mean_interval(deltas)
+            # A bootstrap over a handful of samples gives an interval far too narrow to mean anything
+            # (one sample gives [d, d]), so such a stratum is reported but never decides the verdict.
+            win = ("too few samples" if len(deltas) < MIN_SAMPLES_FOR_VERDICT
+                   else "new" if high < 0 else "prev" if low > 0 else "tie")
             wins[win] += 1
-            print("     %-22s prev %-11s new %-11s -> %s" % (label, fmt % pv, fmt % nv, win))
-        # Printed for context but deliberately NOT tallied: dist_reduction = 1 - mae_gated/mae_raw and
-        # mae_raw is identical for both models, so it can only ever agree with the gated-MAE row --
-        # counting it would weight that one signal twice and could flip the verdict on its own.
-        print("     %-22s prev %-11s new %-11s    (derived from gated MAE; not counted)"
-              % ("distance reduction", "%+.4f" % p["dist_reduction"], "%+.4f" % n["dist_reduction"]))
-    verdict = ("NEW is better overall" if wins["new"] > wins["prev"]
-               else "PREVIOUS is better overall" if wins["prev"] > wins["new"]
-               else "MIXED / roughly tied")
-    print("\n  VERDICT: %s  (metric wins -- new: %d, prev: %d, tie: %d)"
-          % (verdict, wins["new"], wins["prev"], wins["tie"]))
+            print("\n  [%s, %s] n=%d alleles in %d samples  (raw MAE %.4f, identical input for both)"
+                  % (rk, stratum, p["n"], len(deltas), p["mae_raw"]))
+            print("     %-34s prev %-9.4f new %-9.4f -> %s" % ("gated MAE", p["mae_gated"], n["mae_gated"], win))
+            print("     %-34s mean %+.4f, 95%% interval [%+.4f, %+.4f]; new better in %d of %d samples"
+                  % ("paired per-sample delta", deltas.mean(), low, high, int((deltas < 0).sum()), len(deltas)))
+            print("     %-34s prev %-9.4f new %-9.4f"
+                  % ("gated MAE without the %d diagnosis samples" % (len(samples) - len(without_diagnosis)),
+                     _pooled_gated_mae(p_regime["per_sample"], n_key, sum_key, without_diagnosis),
+                     _pooled_gated_mae(n_regime["per_sample"], n_key, sum_key, without_diagnosis)))
+            for label, pv, nv, fmt in (
+                    ("gate decision accuracy (pOk<0.5)", p["gate_decision_accuracy"], n["gate_decision_accuracy"], "%-9.4f"),
+                    ("direction accuracy (argmax)", p["p_ok_accuracy"], n["p_ok_accuracy"], "%-9.4f"),
+                    ("median |err| (gated)", p["median_gated"], n["median_gated"], "%-9.3f"),
+                    ("net helped (pOk<0.5)", p["helped_lt"] - p["hurt_lt"], n["helped_lt"] - n["hurt_lt"], "%-+9d")):
+                print("     %-34s prev %s new %s" % (label, fmt % pv, fmt % nv))
+    verdict = ("NEW is better" if wins["new"] and not wins["prev"]
+               else "PREVIOUS is better" if wins["prev"] and not wins["new"]
+               else "MIXED: each model is better in some strata" if wins["new"] and wins["prev"]
+               else "NO CLEAR DIFFERENCE")
+    print("\n  VERDICT: %s  (strata won -- new: %d, prev: %d, no clear difference: %d, too few samples "
+          "(< %d) to judge: %d)" % (verdict, wins["new"], wins["prev"], wins["tie"], MIN_SAMPLES_FOR_VERDICT,
+                                    wins["too few samples"]))
     print("=" * 108)
 
 

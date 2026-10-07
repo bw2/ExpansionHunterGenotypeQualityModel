@@ -50,6 +50,14 @@ class RoundTripTest(unittest.TestCase):
         self.assertEqual(proba.shape, (len(self.Xca), 3))
         np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-9)
 
+    def test_fixed_n_iter_fits_exactly_that_many_iterations(self):
+        qreg = M.train_q_median(self.Xtr, self.ttr, n_iter=37)
+        dmodel = M.train_direction(self.Xtr, self.ytr, self.Xca, self.yca, n_iter=23)
+        self.assertEqual(qreg.n_iter_, 37)
+        self.assertEqual(dmodel["clf"].n_iter_, 23)
+        proba = M.predict_proba(dmodel, self.Xca)  # still calibrated on the calib rows
+        np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-9)
+
     def test_lcf_positive(self):
         qreg = M.train_q_median(self.Xtr, self.ttr, self.Xca, self.tca)
         self.assertTrue(np.all(M.predict_lcf(qreg, self.Xca) > 0))
@@ -96,6 +104,21 @@ class FeatureNamesOfTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             M.feature_names_of({}, "m.json.gz")
         self.assertIn("m.json.gz", str(ctx.exception))
+
+
+class FingerprintTest(unittest.TestCase):
+    def test_same_name_different_content_differs(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.20261006.json.gz")
+            with open(path, "wb") as f:
+                f.write(b"first")
+            first = M.fingerprint(path)
+            with open(path, "wb") as f:
+                f.write(b"second")
+            self.assertTrue(first.startswith("m.20261006.json.gz@"))
+            self.assertNotEqual(first, M.fingerprint(path))
 
 
 if __name__ == "__main__":

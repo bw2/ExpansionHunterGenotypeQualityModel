@@ -48,7 +48,8 @@ class StridedTest(unittest.TestCase):
         a = np.array([1.0, 2.0, 3.0])
         out = heldout._strided(a, slice(None))
         np.testing.assert_array_equal(out, a)
-        self.assertEqual(out.dtype, np.float32)
+        self.assertEqual(out.dtype, np.float64)
+        self.assertLess(heldout._strided(np.array([0.9]), slice(None))[0] - 0.9, 1e-12)  # stays 0.900
 
     def test_strided_slice(self):
         a = np.arange(10, dtype=float)
@@ -69,8 +70,17 @@ class AccumulateTest(unittest.TestCase):
              mock.patch.object(M, "predict_proba_json",
                                return_value=np.array([[0.2, 0.7, 0.1], [0.1, 0.8, 0.1]])):
             heldout._accumulate(acc, self._sub(), comp=None, branch="full",
-                                names=features.FULL_FEATURES)
+                                names=features.FULL_FEATURES, sample_name="S1")
         return acc
+
+    def test_gate_decision_accuracy_and_per_sample_totals(self):
+        acc = self._run()
+        # Both rows are TOO_LONG and both have pOk < 0.5, so the gate decision is right for both.
+        self.assertEqual(acc["gate_correct"], 1)
+        self.assertEqual(acc["h_gate_correct"], 1)
+        self.assertEqual(acc["h_pok_correct"], 1)    # argmax([.2,.7,.1]) = TOO_LONG
+        # Homopolymer: 12/1.2 = 10, so its gated error is 0, like the non-homopolymer row.
+        self.assertEqual(acc["per_sample"]["S1"], [1, 0.0, 1, 0.0])
 
     def test_non_homopolymer_scalars(self):
         acc = self._run()
@@ -99,7 +109,8 @@ class AccumulateTest(unittest.TestCase):
         sub = pd.DataFrame([_raw_feature_row(eh=10.0, true=10.0, motif_size=1, dir_code=features.OK)])
         with mock.patch.object(M, "predict_lcf_json", return_value=np.array([1.0])), \
              mock.patch.object(M, "predict_proba_json", return_value=np.array([[0.9, 0.05, 0.05]])):
-            heldout._accumulate(acc, sub, comp=None, branch="full", names=features.FULL_FEATURES)
+            heldout._accumulate(acc, sub, comp=None, branch="full", names=features.FULL_FEATURES,
+                                sample_name="S1")
         self.assertEqual(acc["n"], 0)
         self.assertEqual(acc["h_n"], 1)
 
@@ -123,7 +134,7 @@ class HomopolymerSummaryTest(unittest.TestCase):
 class FinalizeTest(unittest.TestCase):
     def test_empty(self):
         result = heldout._finalize(heldout._new_acc(), n_samples=2)
-        self.assertEqual(result, {"n": 0, "homopolymer": {"n": 0}})
+        self.assertEqual(result, {"n": 0, "homopolymer": {"n": 0}, "per_sample": {}})
 
     def test_nonempty(self):
         acc = heldout._new_acc()
@@ -262,12 +273,14 @@ class RunEvalTest(unittest.TestCase):
             parquet_path = os.path.join(d, "S.parquet")
             pd.DataFrame(rows).to_parquet(parquet_path)
             out_json = os.path.join(d, "eval.json")
-            # feature_names must match the current contract -- run_eval refuses a model exported
-            # under a different one, since the compiled trees index features positionally.
+            # A model declaring the current contract. (run_eval builds each matrix from the MODEL's
+            # declared feature_names, so a model exported under an older contract is applied too; see
+            # the older-contract block below.)
             fake_model = {"feature_names": {b: features.feature_names(b)
                                             for b in (features.BRANCH_QUICK, features.BRANCH_FULL)},
                           "genotyping_regimes": {r: {} for r in features.GENOTYPING_REGIMES}}
             with mock.patch.object(M, "load", return_value=fake_model), \
+                 mock.patch.object(M, "fingerprint", return_value="fake_model.json.gz@0"), \
                  mock.patch.object(M, "compile_genotyping_regime", side_effect=lambda regime_json: regime_json), \
                  mock.patch.object(M, "predict_lcf_json", side_effect=lambda comp, X: np.ones(len(X))), \
                  mock.patch.object(M, "predict_proba_json",
@@ -289,6 +302,22 @@ class RunEvalTest(unittest.TestCase):
             with open(out_json) as f:
                 self.assertEqual(json.load(f), out)
             self.assertTrue(os.path.exists(os.path.join(d, "eval_violin.npz")))
+
+            # An older-contract model (a shorter, reordered list) gets matrices with exactly its own
+            # columns in its own order, which is what compare_models relies on.
+            older = {b: list(reversed(features.feature_names(b)))[:5]
+                     for b in (features.BRANCH_QUICK, features.BRANCH_FULL)}
+            seen = []
+            with mock.patch.object(M, "load", return_value=dict(fake_model, feature_names=older)), \
+                 mock.patch.object(M, "fingerprint", return_value="older_model.json.gz@0"), \
+                 mock.patch.object(M, "compile_genotyping_regime", side_effect=lambda regime_json: regime_json), \
+                 mock.patch.object(M, "predict_lcf_json",
+                                   side_effect=lambda comp, X: seen.append(list(X.columns)) or np.ones(len(X))), \
+                 mock.patch.object(M, "predict_proba_json",
+                                   side_effect=lambda comp, X: np.tile([0.9, 0.05, 0.05], (len(X), 1))):
+                heldout.run_eval([parquet_path], "older_model.json.gz", out_json, max_alleles=0)
+            self.assertEqual(sorted(map(tuple, seen)),
+                             sorted([tuple(older["quick"]), tuple(older["full"]), tuple(older["full"])]))
 
 
 if __name__ == "__main__":

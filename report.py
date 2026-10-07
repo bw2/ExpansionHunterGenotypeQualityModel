@@ -4,14 +4,16 @@ The deployable model (``train.py``) is fit on all real data, so it has no held-o
 set of its own. This module measures held-out accuracy honestly with 5-fold
 chromosome-clean cross-validation: the 24 chromosomes are partitioned into 5
 disjoint test groups, each genotyping_regime's heads are trained out-of-fold on the other
-chromosomes (early-stopped on a held-out calib chromosome subset), and the pooled
+chromosomes with the exported model's fitting steps (``train.fit_heads`` at the regime's fixed
+``train.ITERATIONS_BY_REGIME``, calibrated on a held-out chromosome subset; fit separately per motif
+panel, unlike the exported model), and the pooled
 out-of-fold predictions feed the report. Splitting by chromosome group -- never by
 row -- ensures no locus leaks between train and test.
 
 The report (a single standalone ``.html`` with embedded plots) shows:
   - the raw-EH vs gated-LCF MAE chart (apply the LCF only where ``pOk < 0.5``),
     per genotyping_regime, on a broken linear axis;
-  - per-genotyping_regime held-out accuracy + direction-head metrics;
+  - direction-head confusion matrices, ROC / precision-recall curves and probability violins;
   - per-genotyping_regime permutation feature importance (relative), for the q head
     and for the direction head separately;
   - add-one-feature ablation curves for both heads (q head scored by corrected-size
@@ -45,6 +47,7 @@ import features
 import heldout
 import metrics
 import model as M
+import train
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SEED = 20260616
@@ -59,6 +62,10 @@ TOP_N = 15               # features shown per importance panel
 ABLATION_KMAX = len(features.FULL_FEATURES)
 ABLATION_TRAIN_CAP = 120_000
 ABLATION_TEST_CAP = 150_000
+# The ablations refit a head once per prefix length (up to ABLATION_KMAX times per head), so they use
+# the simpler early-stopped recipe (model.EARLY_STOP_MAX_ITERATIONS ceiling, one calib set for stopping
+# and calibration, an ungated q-median head): they rank how much each added feature helps, not the
+# shipped model's accuracy.
 REGIME_COLORS = {"quick": "#4c72b0", "full_spanning": "#dd8452", "full_nonspanning": "#55a868"}
 
 
@@ -66,9 +73,9 @@ def make_folds(n_folds=5, n_calib=2, seed=SEED):
     """Partitions the chromosomes into ``n_folds`` disjoint OOF test groups.
 
     Each fold's test group is one partition block; ``n_calib`` chromosomes are drawn
-    (seeded) from the remaining chromosomes for the early-stop calib set and the rest
-    are the training chromosomes. Every chromosome is a test chromosome in exactly
-    one fold, so the pooled out-of-fold predictions cover the data once.
+    (seeded) from the remaining chromosomes for the isotonic-calibration set and the rest are
+    the training chromosomes. Every chromosome is a test chromosome in exactly one fold, so the
+    pooled out-of-fold predictions cover the data once.
 
     Returns:
         A list of ``{"train": [...], "calib": [...], "test": [...]}`` dicts.
@@ -91,8 +98,11 @@ def _cap_rows(idx, cap, seed):
     return idx
 
 
-def collect_oof(df, branch, folds, train_cap):
+def collect_oof(df, genotyping_regime, branch, folds, train_cap):
     """Runs 5-fold OOF training for one genotyping_regime; returns pooled per-row arrays + importance.
+
+    Each fold fits with ``train.fit_heads`` at the regime's ``train.ITERATIONS_BY_REGIME``, the exported
+    model's recipe.
 
     Returns:
         ``(oof, ranked, ranked_dir)`` where ``oof`` is a dict of concatenated arrays
@@ -107,22 +117,26 @@ def collect_oof(df, branch, folds, train_cap):
     acc = {k: [] for k in ("eh", "true", "true_pred", "t", "t_pred", "p_ok", "p_long", "p_short",
                            "dir_code", "tol_repeats")}
     ranked = ranked_dir = None
+    held_cap = max(1, train_cap // 5) if train_cap else None
+    # Test and calibration rows estimate frequencies, so only the representative rows qualify; the
+    # training-only quota top-up rows (dataset._cap_rows_per_genotyping_regime) only join training.
+    rep = df["representative"].to_numpy(bool)
     for i, f in enumerate(folds):
         m_tr = chrom.isin(set(f["train"])).to_numpy()
-        m_ca = chrom.isin(set(f["calib"])).to_numpy()
-        m_te = chrom.isin(set(f["test"])).to_numpy()
+        m_ca = chrom.isin(set(f["calib"])).to_numpy() & rep
+        m_te = chrom.isin(set(f["test"])).to_numpy() & rep
         if not m_te.any() or not m_tr.any() or not m_ca.any():
             continue
-        tr_idx = _cap_rows(np.where(m_tr)[0], train_cap, SEED + i)
-        Xtr, names = features.build_matrix(df.iloc[tr_idx], branch)
-        Xca, _ = features.build_matrix(df[m_ca], branch)
+        # The exported model's recipe (train.fit_heads), so these metrics describe what ships.
+        ca_idx = _cap_rows(np.where(m_ca)[0], held_cap, SEED + 2)
+        # Gating folds split by chromosome too, so no test-chromosome locus is learned anywhere.
+        qreg, dmodel, names, Xca = train.fit_heads(
+            df, np.where(m_tr)[0], ca_idx, chrom.to_numpy(), branch, train_cap,
+            train.ITERATIONS_BY_REGIME[genotyping_regime], "fold %d" % i)
         Xte, _ = features.build_matrix(df[m_te], branch)
-        ttr, tca = df["t"].to_numpy(float)[tr_idx], df.loc[m_ca, "t"].to_numpy(float)
-        ytr, yca = df["dir_code"].to_numpy(int)[tr_idx], df.loc[m_ca, "dir_code"].to_numpy(int)
+        tca, yca = df["t"].to_numpy(float)[ca_idx], df["dir_code"].to_numpy(int)[ca_idx]
         eh_te = df.loc[m_te, "eh"].to_numpy(float)
 
-        qreg = M.train_q_median(Xtr, ttr, Xca, tca)
-        dmodel = M.train_direction(Xtr, ytr, Xca, yca)
         t_pred = qreg.predict(Xte)
         proba = M.predict_proba(dmodel, Xte)
         acc["eh"].append(eh_te)
@@ -135,18 +149,19 @@ def collect_oof(df, branch, folds, train_cap):
         acc["p_short"].append(proba[:, 2])
         acc["dir_code"].append(df.loc[m_te, "dir_code"].to_numpy(int))
         acc["tol_repeats"].append(df.loc[m_te, "tol_repeats"].to_numpy(float))
-        print("    fold %d: train=%d test=%d" % (i, tr_idx.size, int(m_te.sum())), flush=True)
+        print("    fold %d: train pool=%d test=%d" % (i, int(m_tr.sum()), int(m_te.sum())), flush=True)
         if ranked is None:
             # Both rankings are measured on the CALIBRATION chromosomes, not the test ones. The
             # ablation curves add features in these orders and then score each prefix on the fold's
             # TEST chromosomes; ranking on those same test rows would let their labels pick the
             # feature subsets whose held-out score is then reported, biasing both curves optimistically.
             # The calib chromosomes are disjoint from both train and test, so the ordering is chosen
-            # without seeing a single ablation-scoring row. They are not pristine either: they steer
-            # early stopping for both heads AND the direction head's isotonic calibrators are fit on
-            # them, so these bars are out-of-training but not out-of-sample. The report's importance
-            # note says so.
-            ranked = _importance(qreg, Xca, tca, names)
+            # without seeing a single ablation-scoring row. They are not pristine either: the direction
+            # head's isotonic calibrators are fit on them, so these bars are out-of-training but not
+            # out-of-sample. The report's importance note says so. The LCF head is fit and applied only
+            # where the gate fires (train.fit_heads), so its importance is scored on those rows too.
+            fires = M.round_like_emitted(M.predict_proba(dmodel, Xca)[:, 0]) < 0.5
+            ranked = _importance(qreg, Xca[fires], tca[fires], names)
             ranked_dir = _dir_importance(dmodel, Xca, yca, names)
     return {k: np.concatenate(v) for k, v in acc.items()}, ranked, ranked_dir
 
@@ -215,9 +230,11 @@ def _ablation_split(df, branch, fold):
         feature column, plus the row selectors the caller uses to slice its own labels.
     """
     chrom = df["chrom"].astype(str)
+    # Test and calibration rows must be representative (see collect_oof); training may use every row.
+    rep = df["representative"].to_numpy(bool)
     tr_idx = _cap_rows(np.where(chrom.isin(set(fold["train"])).to_numpy())[0], ABLATION_TRAIN_CAP, SEED)
-    te_idx = _cap_rows(np.where(chrom.isin(set(fold["test"])).to_numpy())[0], ABLATION_TEST_CAP, SEED)
-    ca_mask = chrom.isin(set(fold["calib"])).to_numpy()
+    te_idx = _cap_rows(np.where(chrom.isin(set(fold["test"])).to_numpy() & rep)[0], ABLATION_TEST_CAP, SEED)
+    ca_mask = chrom.isin(set(fold["calib"])).to_numpy() & rep
     Xtr, _ = features.build_matrix(df.iloc[tr_idx], branch)
     Xca, _ = features.build_matrix(df[ca_mask], branch)
     Xte, _ = features.build_matrix(df.iloc[te_idx], branch)
@@ -351,7 +368,7 @@ def _dir_ablation_curve(df, branch, fold, order):
 
     Returns:
         A list of ``{"k", "feature", <scores from _dir_ablation_scores>}`` dicts. ``k=0`` is the
-        feature-free baseline: the class prior measured on this fold's training rows, predicted
+        feature-free baseline: the class prior measured on this fold's representative training rows, predicted
         constantly for every test row -- the log-loss any feature has to beat.
     """
     Xtr, Xca, Xte, tr_idx, ca_mask, te_idx = _ablation_split(df, branch, fold)
@@ -359,7 +376,10 @@ def _dir_ablation_curve(df, branch, fold, order):
     yca = df.loc[ca_mask, "dir_code"].to_numpy(int)
     yte = df["dir_code"].to_numpy(int)[te_idx]
 
-    prior = np.bincount(ytr, minlength=M.N_CLASSES) / ytr.size
+    # The prior is a frequency, so it is measured on the representative training rows only; the
+    # training-only quota top-up over-represents rare, error-prone calls.
+    rep_tr = df["representative"].to_numpy(bool)[tr_idx]
+    prior = np.bincount(ytr[rep_tr], minlength=M.N_CLASSES) / rep_tr.sum()
     curve = [{"k": 0, "feature": "(class prior)",
               **_dir_ablation_scores(yte, np.tile(prior, (yte.size, 1)))}]
     print("    dir ablation k= 0 (%-25s) log_loss=%.4f" % ("class prior", curve[0]["log_loss"]),
@@ -384,8 +404,10 @@ def _load_genotyping_regime_df(genotyping_regime, data_dir, homopolymers_only=Fa
     src = "quick" if genotyping_regime == features.GENOTYPING_REGIME_QUICK else "full"
     parquet = os.path.join(data_dir, "parquet", "%s.parquet" % src)
     need = (set(features.FULL_FEATURES) | set(features.ENGINEERED_RAW_INPUTS)
-            | {"eh", "true", "t", "dir_code", "chrom", "genotyping_regime", "tol_repeats"})
+            | {"eh", "true", "t", "dir_code", "chrom", "genotyping_regime", "tol_repeats", "representative"})
     cols = [c for c in pq.ParquetFile(parquet).schema.names if c in need]
+    if "representative" not in cols:
+        raise SystemExit("ERROR: %s has no 'representative' column; re-assemble it with dataset.py" % parquet)
     df = pd.read_parquet(parquet, columns=cols)
     df = df[df["genotyping_regime"] == genotyping_regime]
     df = df[df["motif_size"] == 1] if homopolymers_only else df[df["motif_size"] != 1]
@@ -422,7 +444,7 @@ def evaluate_genotyping_regime(genotyping_regime, data_dir, folds, train_cap, ho
     df, branch = _load_genotyping_regime_df(genotyping_regime, data_dir, homopolymers_only)
     print("=== %s (branch %s): %d rows ===" % (genotyping_regime, branch, len(df)), flush=True)
 
-    oof, ranked, ranked_dir = collect_oof(df, branch, folds, train_cap)
+    oof, ranked, ranked_dir = collect_oof(df, genotyping_regime, branch, folds, train_cap)
     order = [f for f, _, _ in (ranked or [])]
     order_dir = [f for f, _, _ in (ranked_dir or [])]
     print("  ablation (add-one curve, LCF head) ...", flush=True)
@@ -436,7 +458,12 @@ def evaluate_genotyping_regime(genotyping_regime, data_dir, folds, train_cap, ho
                                oof["tol_repeats"]),
         "direction": metrics.direction_metrics(
             oof["dir_code"], np.column_stack([oof["p_ok"], oof["p_long"], oof["p_short"]])),
-        "gated": metrics.gated_mae(oof["eh"], oof["true"], oof["true_pred"], oof["p_ok"]),
+        # The deployment metric: LCF and pOk rounded to the 3 decimals ExpansionHunter emits and the
+        # corrected call rounded to whole repeats, as the held-out evaluation does, so both score the
+        # same corrected call under the same gate.
+        "gated": metrics.gated_mae(oof["eh"], oof["true"],
+                                   np.round(oof["eh"] / M.round_like_emitted(np.exp(oof["t_pred"]))),
+                                   M.round_like_emitted(oof["p_ok"])),
         "importance": ranked,
         "importance_direction": ranked_dir,
         "ablation": ablation,
@@ -750,8 +777,8 @@ def plot_pr(oof, out_png, title_tag="non-homopolymer"):
 def plot_roc(oof, out_png, title_tag="non-homopolymer"):
     """One-vs-rest ROC curves for TOO_LONG and TOO_SHORT, regimes overlaid.
 
-    The same two error directions as the PR-ROC plot, shown as the TPR/FPR trade-off; the legend AUC
-    matches ``too_long_auc`` / ``too_short_auc`` in the table and the dashed diagonal is chance.
+    The same two error directions as the PR-ROC plot, shown as the TPR/FPR trade-off; the legend shows
+    each curve's AUC and the dashed diagonal is chance.
 
     Args:
         oof: Dict of ``<genotyping_regime>__{dir_code,p_ok,p_long,p_short}`` arrays (the dir_oof npz).
@@ -1371,8 +1398,11 @@ def _holdout_table(holdout):
 
 
 # Datasets the per-plot Dataset pill switches between (key -> display label).
-DATASETS = [("hg002_genome", "HG002 genome (31x)"),
-            ("heldout_hprc", "%d held-out HPRC" % len(heldout.SAMPLES)),
+# The held-out panel comes first (the default pill): it is the only dataset absent from training. Its
+# label gets the sample count of the artifact actually loaded (build_dataset_sections), not of
+# heldout.SAMPLES, since a partial build scores fewer samples.
+DATASETS = [("heldout_hprc", "held-out HPRC"),
+            ("hg002_genome", "HG002 genome (31x, a training sample)"),
             # ("hg002_exome", "HG002 exome (3x)"),  # disabled: input parquet unavailable, can't refresh
             ]
 
@@ -1429,15 +1459,14 @@ def _ds_dim_for(contents, present):
     return ("ds", "Dataset", [(k, l) for k, l in present if k in keys])
 
 
-def build_dataset_sections(out_dir, regenerate=True):
+def build_dataset_sections(out_dir, model_path="", regenerate=True):
     """Renders the per-dataset evaluation + accuracy-by-size plots and returns the report HTML.
 
     When ``regenerate`` is False (``report.py --render-text-only``) the PNGs are not re-plotted; the
     existing on-disk PNGs are embedded as-is and any that are missing are skipped.
 
-    Every plot carries a <b>Dataset</b> pill (HG002 genome 31x / the held-out HPRC samples,
-    sized from ``len(heldout.SAMPLES)``)
-    and the <b>Homopolymers</b> pill; the accuracy-by-size stacked-bar additionally gets an
+    Every plot carries a <b>Dataset</b> pill (the held-out HPRC samples, counted from the loaded
+    artifact, / HG002 genome 31x) and the <b>Homopolymers</b> pill; the accuracy-by-size stacked-bar additionally gets an
     <b>LCF correction</b> on/off pill. Reads ``eval_<key>.json`` + ``eval_<key>_violin.npz`` (the
     apply-based eval) and ``stacked_<key>.json`` (the accuracy-by-size counts) for each dataset.
     """
@@ -1451,7 +1480,27 @@ def build_dataset_sections(out_dir, regenerate=True):
         if os.path.exists(os.path.join(out_dir, "stacked_%s.json" % key)):
             with open(os.path.join(out_dir, "stacked_%s.json" % key)) as f:
                 stacked[key] = json.load(f)
-    present = [(k, l) for k, l in DATASETS if k in evals or k in stacked]
+    # Artifacts record the model that produced them (heldout.run_eval / gen_datasets.gen_stacked).
+    # Drop any that came from a different model than the one this report describes, rather than
+    # showing an older model's numbers under this model's name.
+    stale = []
+    if model_path:
+        # The content fingerprint (model.fingerprint), not the file name: names are dated by day, so a
+        # same-day retrain reuses the name.
+        want = M.fingerprint(model_path)
+        for key, _ in DATASETS:
+            for store in (evals, stacked):
+                if key in store and store[key].get("model") != want:
+                    stale.append("%s (%s)" % (key, store.pop(key).get("model") or "model not recorded"))
+            if key not in evals:
+                violins.pop(key, None)  # the violin npz is written alongside its eval JSON
+        for s in sorted(set(stale)):
+            print("  WARNING: skipping dataset artifact made by a different model: %s" % s, flush=True)
+
+    def label_of(key, label):
+        n = (evals.get(key) or {}).get("n_samples")
+        return "%d %s" % (n, label) if key == "heldout_hprc" and n else label
+    present = [(k, label_of(k, l)) for k, l in DATASETS if k in evals or k in stacked]
     if not present:
         return ""
     homo_dim = ("homo", "Homopolymers", [("nh", "Non-homopolymer"), ("ho", "Homopolymer")])
@@ -1459,13 +1508,15 @@ def build_dataset_sections(out_dir, regenerate=True):
     def P(name):
         return os.path.join(out_dir, name)
 
-    parts = ["<h2>External validation by dataset</h2>",
+    parts = ["<h2>Accuracy by dataset</h2>",
              "<p class='note'>The exported model is applied unchanged (no fitting) to each dataset, "
              "scored against truth. Use the <b>Dataset</b> pill on every plot below to switch between "
-             "<b>HG002 genome (31x)</b> and the <b>%d held-out HPRC samples</b> (absent from training -- a "
-             "further %d HPRC samples were promoted into the training pool below for ancestry/sex "
-             "diversity).</p>"
-             % (len(heldout.SAMPLES), len(dataset.PROMOTED_HELDOUT_SAMPLES))]
+             "datasets: %s. Only the held-out HPRC samples are absent from training (a further %d HPRC "
+             "samples were promoted into the training pool for ancestry/sex diversity); HG002 is a "
+             "training sample, so its numbers are in-sample and show fit, not generalization.%s</p>"
+             % (", ".join("<b>%s</b>" % l for _, l in present), len(dataset.PROMOTED_HELDOUT_SAMPLES),
+                "" if not stale else " Skipped because they were made by a different model: %s."
+                % html.escape(", ".join(sorted(set(stale)))))]
 
     # --- accuracy by true allele size (str-truth-set-v2 stacked-bar replica) ---
     abs_imgs = {}
@@ -1507,8 +1558,9 @@ def build_dataset_sections(out_dir, regenerate=True):
                              [(k, lbl) for k, lbl, _ in ABS.POK_VARIANTS])],
                    abs_imgs),
             "<p class='note'>Each allele is colored by how the "
-            "ExpansionHunter call compares to its true size (<b>Same</b> = within &plusmn;1 repeat = "
-            "exactly right; blue = under-call, orange = over-call, cyan = wrong direction, plus "
+            "ExpansionHunter call compares to its true size (<b>Same</b> = within &plusmn;1 repeat, "
+            "widened to &plusmn;2 / &plusmn;3 / &plusmn;4 for calls longer than 120 / 240 / 360 repeats; "
+            "blue = under-call, orange = over-call, cyan = wrong direction, plus "
             "No&nbsp;Call / Hom&nbsp;Ref / Het&nbsp;Ref); the x-axis is true allele size minus the "
             "reference. Left panel = allele counts, right panel = fractions. The <b>LCF correction</b> "
             "pill replaces each gated call with <code>round(eh/LCF)</code>, growing the green "
@@ -1518,8 +1570,9 @@ def build_dataset_sections(out_dir, regenerate=True):
             "threshold restricted to full_nonspanning-bucket alleles). The <b>Repeat Purity Filter</b> pill "
             "(<b>Off</b> vs <b>&gt; 0.95 pure</b>) restricts the plot to alleles whose truth repeat "
             "purity exceeds 0.95 (purity is on a 0&ndash;1 scale), i.e. near-perfect tandem repeats "
-            "without interruptions. (Every dataset is categorized from its per-allele parquet; the "
-            "corrected bands reflect a capped per-sample model apply. A dataset whose parquet lacks "
+            "without interruptions. (Every dataset is categorized from its per-allele parquet; the raw "
+            "and corrected bands both cover the same capped, whole-locus sample per parquet, so "
+            "switching the correction changes only the calls. A dataset whose parquet lacks "
             "no-call rows notes so in its panel title.)</p>"]
 
     # --- per-dataset held-out accuracy table ---
@@ -1682,8 +1735,13 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "used as a training filter, but is available below as an opt-in <b>Repeat Purity Filter</b> "
         "stratification pill.</p>",
         "<p class='note'>Held-out accuracy is measured by 5-fold cross validation: "
-        "each fold trains on 17-18 chromosomes, early-stops on 2 calibration chromosomes, and "
-        "tests on the remaining 4-5.</p>",
+        "each fold trains on 17-18 chromosomes with the exported model's fitting steps (quota "
+        "sampling, gated length-correction fit, the same fixed number of boosting iterations per "
+        "regime), calibrates on 2 other chromosomes, and tests on the remaining 4-5, so it measures "
+        "accuracy on loci the model never saw. Unlike the exported model, which trains one model per "
+        "regime on homopolymer and non-homopolymer loci together, the cross-validation fits the "
+        "homopolymer and non-homopolymer panels separately, so it approximates rather than "
+        "reproduces the exported model.</p>",
         "<h2>ExpansionHunter output fields used for model training</h2>",
         "<p class='note'>The raw per-allele <code>AlleleQualityMetrics.Alleles[]</code> fields read from "
         "each ExpansionHunter output JSON.</p>",
@@ -1710,15 +1768,14 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "direction; each cell shows the allele count and its row-percent, and the diagonal is "
         "per-class <b>recall</b>. Row-normalizing (rather than showing raw counts) keeps the rare "
         "TOO_LONG / TOO_SHORT rows readable next to the dominant OK row, and exposes the asymmetry "
-        "in <i>where</i> the predictor misroutes calls. This is the hard-decision view of the same "
-        "probabilities shown calibrated above.</p>",
+        "in <i>where</i> the predictor misroutes calls. It is the hard-decision (argmax) view of the "
+        "calibrated probabilities.</p>",
         ("<h3>ROC curves: detecting TOO_LONG / TOO_SHORT calls</h3>" if roc_png else ""),
         (_img_toggle(roc_png, roc_homopolymer_png, "roc") if roc_png else ""),
         ("<p class='note'>One-vs-rest ROC for the two error directions the pOk &lt; 0.5 threshold must "
          "catch: true "
          "positive rate vs false positive rate as the probability threshold sweeps, allele size buckets "
-         "overlaid. The legend <code>AUC</code> matches <code>TOO_LONG AUC</code> / "
-         "<code>TOO_SHORT AUC</code> in the table; the dashed diagonal is chance. ROC is "
+         "overlaid. The legend gives each curve's <code>AUC</code>; the dashed diagonal is chance. ROC is "
          "threshold-independent but, because OK calls dominate, reads optimistically &mdash; see the "
          "PR-ROC curves below for the rare-class precision trade-off.</p>" if roc_png else ""),
         ("<h3>PR-ROC curves: detecting TOO_LONG / TOO_SHORT calls</h3>" if pr_png else ""),
@@ -1754,9 +1811,11 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "<b>calibration</b> chromosomes &mdash; not its test chromosomes, so that the ablation curves "
         "below, which add features in this order and score on the test chromosomes, never have their "
         "feature subsets chosen using the rows they are scored on. Those calibration chromosomes are "
-        "held out of <i>training</i> but are not untouched: they stop both heads early, and the "
-        "direction head's isotonic calibrators are fit on them, so read these bars as a feature "
-        "ranking rather than as an out-of-sample effect size.</p>",
+        "held out of <i>training</i> but are not untouched: the direction head's isotonic "
+        "calibrators are fit on them, so read these bars as a feature "
+        "ranking rather than as an out-of-sample effect size. The LCF prediction is fit and applied only "
+        "where the <code>pOk&lt;0.5</code> gate fires, so its bars are measured on those calibration "
+        "rows only.</p>",
         "<h2>Add-one-feature ablation (LCF prediction)</h2>",
         _img_toggle(ablation_png, ablation_homopolymer_png, "abl"),
         "<p class='note'>The LCF prediction (the regressor predicting the length-correction factor "
@@ -1768,7 +1827,10 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "%s. Ungated (the correction is applied to every allele, unlike the "
         % (". The y-axis is broken so the large raw-EH baseline and the corrected detail are both "
            "readable" if ablation_axis == "broken" else ""),
-        "gated MAE bar chart above which compares raw EH vs the pOk&lt;0.5-gated correction).</p>",
+        "gated MAE bar chart above which compares raw EH vs the pOk&lt;0.5-gated correction). Each "
+        "prefix fits a <b>simplified</b> LCF prediction, on every training row rather than only the rows "
+        "the gate fires on and with at most %d boosting iterations, so the curve ranks how much each "
+        "feature adds rather than reproducing the shipped LCF prediction.</p>" % M.EARLY_STOP_MAX_ITERATIONS,
     ]
     if dir_importance_png:
         parts += [
@@ -1795,8 +1857,8 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
             "y-axis is the <b>held-out multinomial log-loss</b> of the calibrated "
             "<code>[pOk, pTooLong, pTooShort]</code> probabilities -- the head's own training "
             "objective, so lower is strictly better and it rewards calibration, not just ranking. "
-            "<b>x = 0 is the class prior</b> (the feature-free predictor: this fold's training-set "
-            "class frequencies emitted for every allele), which is the log-loss any feature has to "
+            "<b>x = 0 is the class prior</b> (the feature-free predictor: this fold's representative "
+            "training-set class frequencies emitted for every allele), which is the log-loss any feature has to "
             "beat. Same fold, rows and caps as the LCF ablation above, so the two curves describe "
             "the same alleles.</p>",
         ]
@@ -1807,30 +1869,35 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
     print("wrote %s" % out_html)
 
 
-HELDOUT_DATASET = "heldout_hprc"  # gen_datasets key regenerated by default (see main())
+def _maybe_regenerate_dataset_artifacts(args):
+    """Regenerates every ``DATASETS`` entry's eval + stacked artifacts before the sections are built.
 
-
-def _maybe_regenerate_heldout_samples(args):
-    """Regenerates the held-out HPRC eval + stacked artifacts before the dataset sections are built.
-
-    Runs by default; skipped when ``--skip-heldout-samples`` is set, in ``--render-text-only`` mode (a
-    pure re-render that regenerates nothing), or when no model was given (the apply needs one).
-    Downloads nothing -- ``gen_datasets.generate`` is a no-op when the per-sample parquets haven't been
-    built locally (build them with ``heldout.py --build-only`` / ``RUN_HELDOUT_SAMPLES=1 ./train_model.sh``).
+    Runs by default, so every dataset section describes the model being reported (artifacts made by
+    another model are dropped by ``build_dataset_sections``). Skipped when ``--skip-heldout-samples``
+    is set, in ``--render-text-only`` mode (a pure re-render that regenerates nothing), or when no model
+    was given (the apply needs one). Downloads nothing -- ``gen_datasets.generate`` is a no-op for a
+    dataset whose parquets haven't been built locally (build the held-out ones with
+    ``heldout.py --build-only`` / ``RUN_HELDOUT_SAMPLES=1 ./train_model.sh``).
     """
     if args.skip_heldout_samples or args.render_text_only:
         return
     if not args.model:
-        print("held-out HPRC: no --model given, skipping regeneration (pass --skip-heldout-samples to "
+        print("datasets: no --model given, skipping regeneration (pass --skip-heldout-samples to "
               "silence)", flush=True)
         return
     import gen_datasets
-    print("\n==== regenerate held-out HPRC artifacts (default; --skip-heldout-samples to skip) ====",
-          flush=True)
-    if gen_datasets.generate(HELDOUT_DATASET, args.model, args.out_dir) == 0:
-        print("  held-out HPRC: no per-sample parquets under data_eval_43/real_43/ -- skipping "
-              "(build them with `heldout.py --build-only` or `RUN_HELDOUT_SAMPLES=1 ./train_model.sh`)",
+    for key, label in DATASETS:
+        print("\n==== regenerate %s artifacts (default; --skip-heldout-samples to skip) ====" % label,
               flush=True)
+        # This runs after the hours-long CV, so a dataset whose parquets fail the feature-contract
+        # check (heldout.assert_parquets_carry_contract, e.g. held-out parquets not rebuilt after a
+        # features.py change) is skipped with a warning instead of aborting the report. Its old
+        # artifacts then carry a different model and are dropped by build_dataset_sections.
+        try:
+            if gen_datasets.generate(key, args.model, args.out_dir, data_dir=args.data_dir) == 0:
+                print("  %s: no local parquets -- skipping" % label, flush=True)
+        except RuntimeError as e:
+            print("  WARNING: %s skipped -- %s" % (label, e), flush=True)
 
 
 def main():
@@ -1852,8 +1919,9 @@ def main():
                         help="run the in-pool CV on ONLY homopolymer (1 bp motif) loci, write "
                              "results_homopolymer.json, and exit (feeds the side-by-side homopolymer charts)")
     parser.add_argument("--skip-heldout-samples", action="store_true",
-                        help="skip regenerating the held-out HPRC eval/stacked artifacts (by default "
-                             "they are regenerated from any locally-built held-out parquets, needs --model)")
+                        help="skip regenerating the per-dataset eval/stacked artifacts (held-out HPRC and "
+                             "HG002 genome; by default they are regenerated from any locally-built "
+                             "parquets, needs --model)")
     args = parser.parse_args()
     if args.render_text_only:  # text-only reuses the cached CV results exactly like --render-only
         args.render_only = True
@@ -2018,16 +2086,16 @@ def main():
     ablation_axes = {drawn.get(n) for n in ("ablation.png", "ablation_homopolymer.png")} - {None}
     ablation_axis = ablation_axes.pop() if len(ablation_axes) == 1 else "single"
 
-    # By default, regenerate the held-out HPRC eval/stacked artifacts from any locally-built held-out
-    # parquets so the section always reflects the current model (no download; --skip-heldout-samples
-    # opts out, --render-text-only never regenerates data). The other datasets' artifacts are still
-    # produced only by an explicit gen_datasets.py run.
-    _maybe_regenerate_heldout_samples(args)
+    # By default, regenerate every dataset's eval/stacked artifacts from the locally-built parquets so
+    # the sections reflect the current model (no download; --skip-heldout-samples opts out,
+    # --render-text-only never regenerates data).
+    _maybe_regenerate_dataset_artifacts(args)
 
-    # Per-dataset external-validation sections (Dataset / Homopolymers / LCF pills). Rendered from the
-    # eval_<key>.json + eval_<key>_violin.npz + stacked_<key>.json artifacts (gen_datasets.py); absent
-    # datasets are simply skipped.
-    dataset_sections_html = build_dataset_sections(args.out_dir, regenerate=not args.render_text_only)
+    # Per-dataset sections (Dataset / Homopolymers / LCF pills). Rendered from the eval_<key>.json +
+    # eval_<key>_violin.npz + stacked_<key>.json artifacts (gen_datasets.py); absent datasets, and
+    # artifacts recorded for a different model than --model, are skipped.
+    dataset_sections_html = build_dataset_sections(args.out_dir, args.model,
+                                                   regenerate=not args.render_text_only)
 
     render_html(results, mae_png, importance_png, ablation_png,
                 args.model or "(model not specified)",

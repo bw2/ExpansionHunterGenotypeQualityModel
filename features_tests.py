@@ -95,9 +95,10 @@ class BuildMatrixTest(unittest.TestCase):
 
 
 class FeatureContractTest(unittest.TestCase):
-    def test_full_is_quick_plus_flank_depths(self):
+    def test_full_is_quick_plus_flank_depths_and_inrepeat_total(self):
         self.assertEqual(features.FULL_FEATURES,
-                         features.QUICK_FEATURES + ["left_flank_norm_depth", "right_flank_norm_depth"])
+                         features.QUICK_FEATURES
+                         + ["left_flank_norm_depth", "right_flank_norm_depth", "inrepeat_total"])
 
     def test_names_match_the_cpp_assembler(self):
         # The C++ consumer keeps its own copy of this list in GenotypeQualityFeatures.cpp

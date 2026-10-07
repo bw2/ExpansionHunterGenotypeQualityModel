@@ -27,12 +27,14 @@ import numpy as np
 
 import accuracy_by_size as A
 import heldout
+import model as M
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = "EHv5-bw2-optimized"
 # Per-parquet allele caps (shared by this CLI and report.py's default held-out regeneration).
 EVAL_CAP_DEFAULT = 30_000        # apply-based eval (violins / MAE)
-CORRECTED_CAP_DEFAULT = 400_000  # stacked LCF-corrected apply
+CORRECTED_CAP_DEFAULT = 400_000  # stacked accuracy-by-size: whole-locus cohort for raw AND corrected panels
+DEFAULT_DATA_DIR = os.path.join(HERE, "data")  # training data dir (dataset.py / report.py --data-dir)
 
 
 def _heldout_parquets():
@@ -49,12 +51,13 @@ def _heldout_parquets():
 
 
 # key -> {label, coverage_label, list of per-allele parquets, optional no_call_note}.
-def datasets():
+def datasets(data_dir=DEFAULT_DATA_DIR):
+    """Returns the dataset specs; ``data_dir`` is the training data dir holding ``real_quick/``."""
     heldout_parquets = _heldout_parquets()
     return {
         "hg002_genome": {
             "label": "HG002 genome (31x)", "coverage_label": "31x Illumina Genome data",
-            "parquets": [os.path.join(HERE, "data/real_quick/HG002_31x.parquet")]},
+            "parquets": [os.path.join(data_dir, "real_quick", "HG002_31x.parquet")]},
         # Disabled: the legacy hand-built input parquet (data_eval_misc/HG002_exome_3x.parquet) is
         # unavailable and has no downloader, so its eval can't be refreshed against the current model.
         # Re-enable (and uncomment the DATASETS entry in report.py) once the parquet is rebuilt.
@@ -113,8 +116,8 @@ def gen_stacked(spec, model_path, out_json, corrected_cap):
     for p in spec["parquets"]:
         fold(A.categorize_parquet(p, model_path, corrected_cap=corrected_cap), os.path.basename(p))
 
-    out = {"label": spec["label"], "coverage_label": spec["coverage_label"],
-           "tool_label": A.TITLE_TOOL_LABELS[TOOL]}
+    out = {"model": M.fingerprint(model_path), "label": spec["label"],
+           "coverage_label": spec["coverage_label"], "tool_label": A.TITLE_TOOL_LABELS[TOOL]}
     if spec.get("no_call_note"):
         out["no_call_note"] = spec["no_call_note"]
     for homo, name in ((False, "nonhomo"), (True, "homo")):
@@ -137,7 +140,7 @@ def gen_stacked(spec, model_path, out_json, corrected_cap):
 
 
 def generate(dataset_key, model_path, out_dir, eval_cap=EVAL_CAP_DEFAULT,
-             corrected_cap=CORRECTED_CAP_DEFAULT, skip_eval=False):
+             corrected_cap=CORRECTED_CAP_DEFAULT, skip_eval=False, data_dir=DEFAULT_DATA_DIR):
     """Writes one dataset's eval + stacked artifacts into ``out_dir`` (no download; no fitting).
 
     Applies the exported ``model_path`` to that dataset's local per-allele parquets. Returns the number
@@ -145,7 +148,7 @@ def generate(dataset_key, model_path, out_dir, eval_cap=EVAL_CAP_DEFAULT,
     like report.py can regenerate the held-out section only when its parquets have been built. Shared by
     this module's CLI and report.py's default held-out regeneration.
     """
-    spec = datasets()[dataset_key]
+    spec = datasets(data_dir)[dataset_key]
     # Configured paths are not necessarily present: hg002_genome names one path unconditionally, so
     # without this filter an unbuilt dataset raised FileNotFoundError instead of the documented no-op.
     parquets = [p for p in spec["parquets"] if os.path.exists(p)]
@@ -177,13 +180,17 @@ def main():
     parser.add_argument("--eval-cap", type=int, default=EVAL_CAP_DEFAULT,
                         help="per-parquet allele cap for the apply-based eval (violins/MAE)")
     parser.add_argument("--corrected-cap", type=int, default=CORRECTED_CAP_DEFAULT,
-                        help="per-parquet allele cap for the stacked LCF-corrected apply (0 = all)")
+                        help="per-parquet cap on the called alleles of the stacked accuracy-by-size plots; "
+                             "it selects a seeded whole-locus sample used by the raw and the corrected "
+                             "panels alike (0 = all)")
     parser.add_argument("--skip-eval", action="store_true",
                         help="only (re)generate the stacked-bar JSON")
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR,
+                        help="training data dir holding real_quick/ (for the HG002 genome dataset)")
     args = parser.parse_args()
 
     if generate(args.dataset, args.model, args.out_dir, args.eval_cap,
-                args.corrected_cap, args.skip_eval) == 0:
+                args.corrected_cap, args.skip_eval, args.data_dir) == 0:
         print("no parquet(s) found for dataset %s -- nothing to do" % args.dataset, flush=True)
 
 
