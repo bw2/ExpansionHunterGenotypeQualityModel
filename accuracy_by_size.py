@@ -120,14 +120,19 @@ PURITY_VARIANTS = (
     ("p95", "> 0.95 pure", 0.95),
 )
 
-# pOk-stratum filter for the accuracy-by-size pill: splits alleles by the model's own predicted
-# confidence, independent of which LCF-correction variant is selected (so e.g. "Raw EH, pOk < 0.5" shows
-# how the uncorrected calls look specifically where the model would consider applying a correction).
-# (key, pill label, mode) where mode is None (no filter) / "lt" (pOk < 0.5) / "ge" (pOk >= 0.5).
+# pOk-stratum filter for the accuracy-by-size pill: keeps only the alleles on one side of a threshold on
+# the model's own predicted confidence, independent of which LCF-correction variant is selected (so e.g.
+# "Raw EH, pOk < 0.5" shows how the uncorrected calls look specifically where the model would consider
+# applying a correction). (key, pill label, mode) where mode is None (no filter) or (direction, threshold):
+# ("lt", t) keeps pOk < t, ("ge", t) keeps pOk >= t. The "lt" strata are nested, not disjoint (pOk < 0.2
+# is a subset of pOk < 0.3, etc.); the thresholds below 0.5 show how the calls look as the gate tightens.
 POK_VARIANTS = (
     ("all", "All", None),
-    ("lt050", "pOk < 0.5", "lt"),
-    ("ge050", "pOk ≥ 0.5", "ge"),
+    ("lt020", "pOk < 0.2", ("lt", 0.2)),
+    ("lt030", "pOk < 0.3", ("lt", 0.3)),
+    ("lt040", "pOk < 0.4", ("lt", 0.4)),
+    ("lt050", "pOk < 0.5", ("lt", 0.5)),
+    ("ge050", "pOk ≥ 0.5", ("ge", 0.5)),
 )
 
 
@@ -345,9 +350,10 @@ def bin_counts(cat, category_col, homopolymer, purity_min=None, pok_stratum=None
     """Tallies a per-category x-bin count matrix for the homopolymer / non-homopolymer subset.
 
     ``purity_min`` (when not None) additionally keeps only alleles whose truth repeat purity strictly
-    exceeds it (NaN purity is dropped). ``pok_stratum`` (when not None) additionally keeps only alleles
-    whose predicted ``pok`` is ``< 0.5`` (``"lt"``) or ``>= 0.5`` (``"ge"``); NaN pok (model not applied
-    to that allele) is dropped. Rows whose ``category_col`` is None are dropped too: every category
+    exceeds it (NaN purity is dropped). ``pok_stratum`` (when not None) is a ``(direction, threshold)``
+    pair from ``POK_VARIANTS`` and additionally keeps only alleles whose predicted ``pok`` is
+    ``< threshold`` (``"lt"``) or ``>= threshold`` (``"ge"``); NaN pok (model not applied to that
+    allele) is dropped. Rows whose ``category_col`` is None are dropped too: every category
     column, raw and corrected alike, is None outside the capped whole-locus cohort
     (``categorize_parquet``), so the raw and corrected panels count the same alleles.
     Returns a dict with ``counts`` (category -> list of ``len(X_LABELS)`` ints), ``alleles_per_bin``
@@ -363,7 +369,8 @@ def bin_counts(cat, category_col, homopolymer, purity_min=None, pok_stratum=None
         # in its own column (categorize_parquet); the raw panel uses the plain one.
         pok_col = "pok__" + category_col[len("category__"):] if category_col.startswith("category__") else "pok"
         pok = pd.to_numeric(sel[pok_col if pok_col in sel.columns else "pok"], errors="coerce")
-        sel = sel[(pok < 0.5) if pok_stratum == "lt" else (pok >= 0.5)]
+        direction, threshold = pok_stratum
+        sel = sel[(pok < threshold) if direction == "lt" else (pok >= threshold)]
     sel = sel[sel[category_col].notna()]  # drop alleles the model wasn't applied to (corrected variants)
     nb = len(X_LABELS)
     xb = sel["xbin"].to_numpy()

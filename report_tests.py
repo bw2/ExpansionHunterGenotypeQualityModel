@@ -7,12 +7,14 @@ assertions beyond "a PNG got written", which would just re-test matplotlib itsel
 """
 
 import base64
+import io
 import os
 import tempfile
 import unittest
 
 import numpy as np
 
+import accuracy_by_size as ABS
 import eh_json
 import features
 import report as R
@@ -175,6 +177,50 @@ class ImgTest(unittest.TestCase):
             self.assertTrue(html.startswith('<img src="data:image/png;base64,'))
             embedded = base64.b64decode(html.split("base64,", 1)[1].split('"', 1)[0])
             self.assertTrue(embedded.startswith(b"\x89PNG\r\n\x1a\n"))  # re-encoded to a valid PNG
+
+    def test_fixed_palette_keeps_every_category_color_exactly(self):
+        # One 1-pixel column per accuracy-by-size category plus a column of the plot's gray text color:
+        # the categories come back unchanged, and the gray maps to a nearby gray, not a category color.
+        from PIL import Image
+        cats = [tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) for h in ABS.CATEGORY_COLORS.values()]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.png")
+            src = Image.new("RGB", (len(cats) + 1, 1))
+            src.putdata(cats + [(0x77, 0x77, 0x77)])
+            src.save(path, format="PNG")
+            html = R._img(path, palette=R._fixed_palette(ABS.CATEGORY_COLORS.values()))
+            out = list(Image.open(io.BytesIO(base64.b64decode(html.split("base64,", 1)[1].split('"', 1)[0])))
+                       .convert("RGB").getdata())
+        self.assertEqual(out[:-1], cats)
+        r, g, b = out[-1]
+        self.assertTrue(r == g == b and abs(r - 0x77) <= 8)
+
+
+class ReportHtmlNameTest(unittest.TestCase):
+    def test_dated_model_gets_its_date(self):
+        self.assertEqual(
+            R.report_html_name("/m/genotype_quality_model_from_HG002_and_CHM1_CHM13_plus50.20261008.json.gz"),
+            "model_report.2026-10-08_model.html")
+
+    def test_model_name_not_ending_in_a_date_is_used_whole(self):
+        self.assertEqual(R.report_html_name("model/q_plus50.20261006.quick500.json.gz"),
+                         "model_report.q_plus50.20261006.quick500_model.html")
+
+    def test_no_model_keeps_the_plain_name(self):
+        self.assertEqual(R.report_html_name(""), "model_report.html")
+
+
+class StackedHasEveryPillOptionTest(unittest.TestCase):
+    @staticmethod
+    def _stacked(pok_keys):
+        return {h: {vk: {pk: {kk: {} for kk in pok_keys} for pk, _, _ in ABS.PURITY_VARIANTS}
+                    for vk, _, _, _ in ABS.CORRECTION_VARIANTS} for h in ("nonhomo", "homo")}
+
+    def test_current_layout_passes(self):
+        self.assertTrue(R._stacked_has_every_pill_option(self._stacked([k for k, _, _ in ABS.POK_VARIANTS])))
+
+    def test_json_written_before_the_lower_pok_thresholds_is_out_of_date(self):
+        self.assertFalse(R._stacked_has_every_pill_option(self._stacked(["all", "lt050", "ge050"])))
 
 
 class ImgToggleTest(unittest.TestCase):

@@ -86,8 +86,9 @@ def gen_stacked(spec, model_path, out_json, corrected_cap):
     ``A.CORRECTION_VARIANTS`` key (``raw`` reads the ``category`` column, every gated variant its
     ``category__<key>`` column) crossed with each ``A.PURITY_VARIANTS`` key (``off`` = all alleles, the
     filtered key keeps only alleles above its truth-purity threshold) crossed with each
-    ``A.POK_VARIANTS`` key (``all`` = every allele, the other two split on the model's own predicted
-    ``pok`` regardless of which correction variant is selected).
+    ``A.POK_VARIANTS`` key (``all`` = every allele, every other key keeps only the alleles below, or at
+    or above, its threshold on the model's own predicted ``pok``, regardless of which correction variant
+    is selected; the "below" strata are nested, not disjoint).
     """
     nb = len(A.X_LABELS)
     variants = [(key, "category" if gate is None else "category__" + key)

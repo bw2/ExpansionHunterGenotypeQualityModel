@@ -48,9 +48,17 @@ class TruthOrderSourceTest(unittest.TestCase):
         cat = pd.DataFrame({"motif": [3, 3], "purity": [1.0, 1.0], "xbin": [0, 0], "locus": ["L", "L"],
                             "category": ["Same", "Same"], "pok": [0.9, 0.1],
                             "category__p050": ["Same", "2"], "pok__p050": [0.1, 0.9]})
-        lt = A.bin_counts(cat, "category__p050", False, pok_stratum="lt")
+        lt = A.bin_counts(cat, "category__p050", False, pok_stratum=("lt", 0.5))
         self.assertEqual(lt["total"], 1)
         self.assertEqual(sum(lt["counts"]["Same"]), 1)  # the row whose re-paired call has pOk 0.1
+
+    def test_pok_strata_use_their_own_threshold(self):
+        # One pOk between each pair of thresholds, plus one exactly at 0.3 to check the strict "<".
+        cat = pd.DataFrame({"motif": [3] * 6, "purity": [1.0] * 6, "xbin": [0] * 6, "locus": list("ABCDEF"),
+                            "category": ["Same"] * 6, "pok": [0.15, 0.25, 0.3, 0.35, 0.45, 0.6]})
+        totals = {key: A.bin_counts(cat, "category", False, pok_stratum=mode)["total"]
+                  for key, _, mode in A.POK_VARIANTS}
+        self.assertEqual(totals, {"all": 6, "lt020": 1, "lt030": 2, "lt040": 4, "lt050": 5, "ge050": 1})
 
 
 class LociCohortTest(unittest.TestCase):

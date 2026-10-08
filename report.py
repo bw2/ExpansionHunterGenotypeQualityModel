@@ -1266,15 +1266,34 @@ def plot_violins_lcf_bins(violin, out_png, pfx="", title_tag="non-homopolymer",
 
 # --- HTML -----------------------------------------------------------------
 
-def _img(path):
+def _fixed_palette(hex_colors, n_grays=17):
+    """Returns a PIL palette image holding exactly ``hex_colors`` plus ``n_grays`` evenly spaced grays.
+
+    For the accuracy-by-size stacked-bar charts, the report's largest image family (one chart per
+    dataset x motif x correction x purity x pOk-filter pill combination): quantizing them onto their own
+    category colors plus grays for text, axes and edges keeps every category exactly its color, at
+    ~23% fewer bytes than the adaptive 256-color palette. A small adaptive palette would be smaller
+    still, but median-cut gives scarce category colors no slot of their own and merges them.
+    """
+    rgb = [tuple(int(h.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)) for h in hex_colors]
+    rgb += [(v, v, v) for v in np.linspace(0, 255, n_grays).round().astype(int)]
+    palette = Image.new("P", (1, 1))
+    palette.putpalette([x for c in rgb for x in c] + [0] * (768 - 3 * len(rgb)))
+    return palette
+
+
+def _img(path, palette=None):
     """Embeds a PNG as a base64 data URI, palette-quantized to keep the standalone HTML small enough
     to commit + serve on GitHub Pages.
 
     matplotlib charts use few distinct colors, so an adaptive 256-color palette is visually
     near-lossless yet ~2-3x smaller than the truecolor PNG; the on-disk PNG (a gitignored build
-    artifact) is left untouched -- only the embedded copy is quantized.
+    artifact) is left untouched -- only the embedded copy is quantized. ``palette`` (from
+    ``_fixed_palette``) maps the image onto a fixed set of colors instead, without dithering.
     """
-    quantized = Image.open(path).convert("RGB").convert("P", palette=Image.ADAPTIVE, colors=256)
+    rgb = Image.open(path).convert("RGB")
+    quantized = (rgb.quantize(palette=palette, dither=Image.Dither.NONE) if palette is not None
+                 else rgb.convert("P", palette=Image.ADAPTIVE, colors=256))
     buf = io.BytesIO()
     quantized.save(buf, format="PNG", optimize=True)
     return '<img src="data:image/png;base64,%s" />' % base64.b64encode(buf.getvalue()).decode()
@@ -1459,6 +1478,13 @@ def _ds_dim_for(contents, present):
     return ("ds", "Dataset", [(k, l) for k, l in present if k in keys])
 
 
+def _stacked_has_every_pill_option(sd):
+    """True if a loaded ``stacked_<key>.json`` has counts for every accuracy-by-size pill combination."""
+    return all(kk in sd[h].get(vk, {}).get(pk, {}) for h in ("nonhomo", "homo")
+               for vk, _, _, _ in ABS.CORRECTION_VARIANTS for pk, _, _ in ABS.PURITY_VARIANTS
+               for kk, _, _ in ABS.POK_VARIANTS)
+
+
 def build_dataset_sections(out_dir, model_path="", regenerate=True):
     """Renders the per-dataset evaluation + accuracy-by-size plots and returns the report HTML.
 
@@ -1491,11 +1517,17 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
         for key, _ in DATASETS:
             for store in (evals, stacked):
                 if key in store and store[key].get("model") != want:
-                    stale.append("%s (%s)" % (key, store.pop(key).get("model") or "model not recorded"))
+                    stale.append("%s (made by a different model: %s)"
+                                 % (key, store.pop(key).get("model") or "not recorded"))
             if key not in evals:
                 violins.pop(key, None)  # the violin npz is written alongside its eval JSON
-        for s in sorted(set(stale)):
-            print("  WARNING: skipping dataset artifact made by a different model: %s" % s, flush=True)
+    # A stacked JSON written before a pill option existed (e.g. a pOk threshold added later) has no counts
+    # for it, so that button would show an empty panel; skip the JSON like a different model's.
+    for key in [k for k, sd in stacked.items() if not _stacked_has_every_pill_option(sd)]:
+        stale.append("%s (made before the current accuracy-by-size pill options)" % key)
+        stacked.pop(key)
+    for s in sorted(set(stale)):
+        print("  WARNING: skipping out-of-date dataset artifact: %s" % s, flush=True)
 
     def label_of(key, label):
         n = (evals.get(key) or {}).get("n_samples")
@@ -1515,11 +1547,12 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
              "samples were promoted into the training pool for ancestry/sex diversity); HG002 is a "
              "training sample, so its numbers are in-sample and show fit, not generalization.%s</p>"
              % (", ".join("<b>%s</b>" % l for _, l in present), len(dataset.PROMOTED_HELDOUT_SAMPLES),
-                "" if not stale else " Skipped because they were made by a different model: %s."
+                "" if not stale else " Skipped because they are out of date: %s."
                 % html.escape(", ".join(sorted(set(stale)))))]
 
     # --- accuracy by true allele size (str-truth-set-v2 stacked-bar replica) ---
     abs_imgs = {}
+    abs_palette = _fixed_palette(ABS.CATEGORY_COLORS.values())
     for key, _ in present:
         if key not in stacked:
             continue
@@ -1529,9 +1562,7 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
             for vkey, _, vnote, _ in ABS.CORRECTION_VARIANTS:
                 for pkey, _, pmin in ABS.PURITY_VARIANTS:
                     for kkey, klabel, _ in ABS.POK_VARIANTS:
-                        data = sd[hcol].get(vkey, {}).get(pkey, {}).get(kkey)
-                        if data is None:
-                            continue
+                        data = sd[hcol][vkey][pkey][kkey]  # present: _stacked_has_every_pill_option
                         hdesc = (hdesc0 + ("" if pmin is None else ", repeat purity > %g" % pmin)
                                  + ("" if kkey == "all" else ", %s" % klabel))
                         png = P("ds_abs_%s_%s_%s_%s_%s.png" % (key, hk, vkey, pkey, kkey))
@@ -1542,7 +1573,7 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
                                 ABS.plot_accuracy_by_size(data, png, sd["tool_label"],
                                                           sd["coverage_label"] + sd.get("no_call_note", ""),
                                                           hdesc, vnote)
-                            abs_imgs[(key, hk, vkey, pkey, kkey)] = _img(png)
+                            abs_imgs[(key, hk, vkey, pkey, kkey)] = _img(png, palette=abs_palette)
                         except Exception as e:
                             print("  [%s] accuracy-by-size %s/%s/%s/%s skipped: %s"
                                   % (key, hk, vkey, pkey, kkey, e), flush=True)
@@ -1570,7 +1601,10 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
             "threshold restricted to full_nonspanning-bucket alleles). The <b>Repeat Purity Filter</b> pill "
             "(<b>Off</b> vs <b>&gt; 0.95 pure</b>) restricts the plot to alleles whose truth repeat "
             "purity exceeds 0.95 (purity is on a 0&ndash;1 scale), i.e. near-perfect tandem repeats "
-            "without interruptions. (Every dataset is categorized from its per-allele parquet; the raw "
+            "without interruptions. The <b>pOk Filter</b> pill keeps only alleles whose own predicted "
+            "<code>pOk</code> is below 0.2, 0.3, 0.4 or 0.5, or at least 0.5, independent of the "
+            "correction selected, so the lower thresholds show how the calls look as the gate tightens. "
+            "(Every dataset is categorized from its per-allele parquet; the raw "
             "and corrected bands both cover the same capped, whole-locus sample per parquet, so "
             "switching the correction changes only the calls. A dataset whose parquet lacks "
             "no-call rows notes so in its panel title.)</p>"]
@@ -1659,6 +1693,25 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
     return "".join(parts)
 
 
+def report_html_name(model_path):
+    """Returns the report's file name, suffixed with the model it describes so that one model's report
+    never overwrites another's: ``..._plus50.20261008.json.gz`` -> ``model_report.2026-10-08_model.html``.
+
+    A model file name that does not end in an 8-digit date (e.g. ``....20261006.quick500.json.gz``) is
+    used whole, minus ``.json.gz``, as the suffix. Without a model the name is ``model_report.html``.
+    """
+    if not model_path:
+        return "model_report.html"
+    stem = os.path.basename(model_path)
+    for extension in (".gz", ".json"):
+        if stem.endswith(extension):
+            stem = stem[:-len(extension)]
+    date = stem.rsplit(".", 1)[-1]
+    if len(date) == 8 and date.isdigit():
+        return "model_report.%s-%s-%s_model.html" % (date[:4], date[4:6], date[6:])
+    return "model_report.%s_model.html" % stem
+
+
 def render_html(results, mae_png, importance_png, ablation_png, model_path, out_html,
                 mae_homopolymer_png=None, ablation_homopolymer_png=None, importance_homopolymer_png=None,
                 pr_png=None, roc_png=None, confusion_png=None, prob_violins_png=None,
@@ -1730,18 +1783,20 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "<p class='note'><b>Truth set:</b> <a href='https://github.com/broadinstitute/str-truth-set-v2'>"
         "<code>str-truth-set-v2</code></a>. Per-allele true repeat counts "
         "(and repeat purity) are derived from haplotype-resolved long-read genome assemblies of the "
-        "same samples (HG002, CHM1&ndash;CHM13), giving the true repeat number at each tandem-repeat "
-        "locus. Negative-control loci are filtered out before training; truth repeat purity is not "
+        "same samples (HG002, CHM1&ndash;CHM13 and the HPRC samples), giving the true repeat number at "
+        "each tandem-repeat locus. Negative-control loci are filtered out before training; truth repeat purity is not "
         "used as a training filter, but is available below as an opt-in <b>Repeat Purity Filter</b> "
         "stratification pill.</p>",
         "<p class='note'>Held-out accuracy is measured by 5-fold cross validation: "
         "each fold trains on 17-18 chromosomes with the exported model's fitting steps (quota "
         "sampling, gated length-correction fit, the same fixed number of boosting iterations per "
         "regime), calibrates on 2 other chromosomes, and tests on the remaining 4-5, so it measures "
-        "accuracy on loci the model never saw. Unlike the exported model, which trains one model per "
-        "regime on homopolymer and non-homopolymer loci together, the cross-validation fits the "
-        "homopolymer and non-homopolymer panels separately, so it approximates rather than "
-        "reproduces the exported model.</p>",
+        "accuracy on loci the model never saw. It approximates rather than reproduces the exported "
+        "model, which trains one model per regime on homopolymer and non-homopolymer loci together "
+        "(the cross-validation fits the two panels separately) and fits its isotonic calibration on "
+        "%d of its training HPRC samples, kept out of tree fitting, plus one autosome each of %s "
+        "(the cross-validation calibrates on chromosomes). None of the held-out HPRC samples below "
+        "is used.</p>" % (train.N_CALIB_INDIVIDUALS, " and ".join(train.ALWAYS_TRAIN_INDIVIDUALS)),
         "<h2>ExpansionHunter output fields used for model training</h2>",
         "<p class='note'>The raw per-allele <code>AlleleQualityMetrics.Alleles[]</code> fields read from "
         "each ExpansionHunter output JSON.</p>",
@@ -2099,7 +2154,7 @@ def main():
 
     render_html(results, mae_png, importance_png, ablation_png,
                 args.model or "(model not specified)",
-                os.path.join(args.out_dir, "model_report.html"),
+                os.path.join(args.out_dir, report_html_name(args.model)),
                 mae_homopolymer_png=mae_homopolymer_png,
                 ablation_homopolymer_png=ablation_homopolymer_png,
                 importance_homopolymer_png=importance_homopolymer_png,

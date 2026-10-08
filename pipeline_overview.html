@@ -155,11 +155,11 @@
       <p class="kicker">Role</p>
       <ol class="sub-steps">
         <li><strong>3a. Homopolymer CV pass</strong> (<span class="file">--homopolymer-cv</span>, run first): 5-fold chromosome-clean OOF on 1&nbsp;bp-motif loci only &rarr; <span class="file">results_homopolymer.json</span>, <span class="file">dir_oof_homopolymer.npz</span>.</li>
-        <li><strong>3b. Main CV + render</strong>: identical OOF on non-homopolymer rows; <span class="file">metrics.py</span> scores q-head accuracy, direction log-loss/AUC/calibration, and the gated MAE (apply LCF only where <code>pOk &lt; 0.5</code>); permutation importance + add-one ablation; renders the PNGs and <span class="file">report/model_report.html</span>.
+        <li><strong>3b. Main CV + render</strong>: identical OOF on non-homopolymer rows; <span class="file">metrics.py</span> scores q-head accuracy, direction log-loss/AUC/calibration, and the gated MAE (apply LCF only where <code>pOk &lt; 0.5</code>); permutation importance + add-one ablation; renders the PNGs and <span class="file">report/model_report.&lt;model date&gt;_model.html</span>.
           <br><b>Dataset regeneration (default-on):</b> before rendering the dataset sections, <span class="file">report.py</span> calls <span class="file">gen_datasets.generate</span> for every dataset (held-out HPRC, HG002 genome) to refresh its eval/stacked artifacts from the locally-built parquets (no download), and drops any artifact recorded for a different model than <span class="file">--model</span>. Pass <span class="file">--skip-heldout-samples</span> to opt out; a dataset whose parquets haven't been built is skipped.</li>
       </ol>
       <p class="kicker">Outputs</p>
-      <ul><li><span class="file">report/results.json</span>, <span class="file">report/dir_oof.npz</span>, the PNG charts, and the final <span class="file">report/model_report.html</span>.</li></ul>
+      <ul><li><span class="file">report/results.json</span>, <span class="file">report/dir_oof.npz</span>, the PNG charts, and the final <span class="file">report/model_report.&lt;model date&gt;_model.html</span> (e.g. <span class="file">model_report.2026-10-08_model.html</span>, named after the <code>--model</code> file).</li></ul>
     </div>
   </li>
 
@@ -200,7 +200,7 @@
         <li>When the two models declare different <span class="file">feature_names</span> contracts it reports the difference and builds each model's own feature matrix. <b>Self-skips</b> (prints a note, exit 0) if the held-out parquets weren't built (no <span class="file">RUN_HELDOUT_SAMPLES=1</span>) or no previous model exists.</li>
       </ul>
       <p class="kicker">Output</p>
-      <ul><li><b>Console only</b> &mdash; the per-regime delta table + verdict is printed to stdout / the pipeline log. Nothing is written to disk and nothing is folded into <span class="file">model_report.html</span>.</li></ul>
+      <ul><li><b>Console only</b> &mdash; the per-regime delta table + verdict is printed to stdout / the pipeline log. Nothing is written to disk and nothing is folded into <span class="file">model_report.&lt;model date&gt;_model.html</span>.</li></ul>
     </div>
   </li>
 </ul>
@@ -252,7 +252,7 @@
     </div>
     <div class="arrow">&#8595;</div>
     <div class="box eval">
-      <div class="t">report/model_report.html (+ results*.json, *.png)</div>
+      <div class="t">report/model_report.&lt;model date&gt;_model.html (+ results*.json, *.png)</div>
       OOF metrics + importance + ablation + calibration/PR/ROC + per-dataset accuracy-by-size
     </div>
   </div>
@@ -276,7 +276,7 @@
     <div class="arrow">&#8595;</div>
     <div class="box opt">
       <div class="t">4b. picked up by report.py (default)</div>
-      gen_datasets.generate("heldout_hprc") &rarr; eval_heldout_hprc.json + stacked_heldout_hprc.json &rarr; folded into model_report.html
+      gen_datasets.generate("heldout_hprc") &rarr; eval_heldout_hprc.json + stacked_heldout_hprc.json &rarr; folded into model_report.&lt;model date&gt;_model.html
     </div>
     <div class="arrow">&#8595;</div>
     <div class="box opt">
