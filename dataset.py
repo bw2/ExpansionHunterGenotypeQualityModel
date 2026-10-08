@@ -68,8 +68,11 @@ EH_RESULTS_ROOT = "gs://tandem-repeat-explorer/tool_genotype_quality/expansion_h
 # per sample+coverage -- truth doesn't depend on short-read coverage). Never tied to a specific EH run,
 # so it cannot go stale relative to one. Unlike the earlier per-catalog truth files it lists nearly
 # every catalog locus (5,657,793 of 5,657,854 for HG01993), hom-ref ones included. See
-# `_load_truth_from_genotypes_tsv`.
-TRUTH_GENOTYPES_ROOT = "gs://tandem-repeat-explorer/tool_genotype_quality/truth_genotypes_v2.1"
+# `_load_truth_from_genotypes_tsv`. Built with str-analysis bd68a2a, which counts a repeat insertion that
+# DipCall's left-alignment placed up to one motif length before a locus (as at FXN, NOP56 and C9ORF72);
+# the earlier truth_genotypes_v2.1/ folder reported the reference length there.
+TRUTH_GENOTYPES_ROOT = ("gs://tandem-repeat-explorer/tool_genotype_quality/"
+                        "truth_genotypes_v2.1_with_upstream_repeat_insertions")
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The truth genotyper reports the reference length both for a locus that matches the reference and for
 # one DipCall could not call, so a truth genotype only counts inside the sample's DipCall
