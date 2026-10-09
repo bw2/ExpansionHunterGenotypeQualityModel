@@ -267,6 +267,22 @@ class DsDimForTest(unittest.TestCase):
         self.assertEqual(dim, ("ds", "Dataset", [("hg002_genome", "HG002 genome")]))
 
 
+class ViolinsSkippingEmptyBinsTest(unittest.TestCase):
+    def test_empty_bins_get_no_violin_and_keep_their_slot(self):
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots()
+        try:
+            data = [np.array([1.0, 2.0]), np.array([]), np.array([-1.0, 0.5, 3.0])]
+            vp = R._violins_skipping_empty_bins(ax, data, ["#111111", "#222222", "#333333"], 0.5)
+            self.assertEqual(len(vp["bodies"]), 2)
+            # Medians sit at x positions 1 and 3; nothing is drawn at the empty bin's position 2.
+            xs = sorted(seg[0][0] for seg in vp["cmedians"].get_segments())
+            np.testing.assert_allclose(xs, [1 - 0.85 / 4, 3 - 0.85 / 4])
+            self.assertIsNone(R._violins_skipping_empty_bins(ax, [np.array([])], ["#111111"], 0.5))
+        finally:
+            plt.close(fig)
+
+
 class PlotViolinsTest(unittest.TestCase):
     def test_all_empty_regime_does_not_raise(self):
         # every threshold bin is empty for "quick" -- previously raised ValueError in _violin_ylim

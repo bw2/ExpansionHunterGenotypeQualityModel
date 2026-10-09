@@ -56,7 +56,8 @@ def datasets(data_dir=DEFAULT_DATA_DIR):
     heldout_parquets = _heldout_parquets()
     return {
         "hg002_genome": {
-            "label": "HG002 genome (31x)", "coverage_label": "31x Illumina Genome data",
+            "label": "HG002 genome (31x)",
+            "coverage_label": "HG002 31x Illumina genome (a training sample)",
             "parquets": [os.path.join(data_dir, "real_quick", "HG002_31x.parquet")]},
         # Disabled: the legacy hand-built input parquet (data_eval_misc/HG002_exome_3x.parquet) is
         # unavailable and has no downloader, so its eval can't be refreshed against the current model.
@@ -181,9 +182,10 @@ def main():
     parser.add_argument("--eval-cap", type=int, default=EVAL_CAP_DEFAULT,
                         help="per-parquet allele cap for the apply-based eval (violins/MAE)")
     parser.add_argument("--corrected-cap", type=int, default=CORRECTED_CAP_DEFAULT,
-                        help="per-parquet cap on the called alleles of the stacked accuracy-by-size plots; "
-                             "it selects a seeded whole-locus sample used by the raw and the corrected "
-                             "panels alike (0 = all)")
+                        help="per-parquet cap on the called alleles ExpansionHunter scores (one per "
+                             "homozygous call) for the stacked accuracy-by-size plots; it selects a seeded "
+                             "whole-locus sample used by the raw and the corrected panels alike, which also "
+                             "keeps both copies of each homozygous call and the no-calls (0 = all)")
     parser.add_argument("--skip-eval", action="store_true",
                         help="only (re)generate the stacked-bar JSON")
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR,

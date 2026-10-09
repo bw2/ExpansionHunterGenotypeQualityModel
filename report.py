@@ -495,8 +495,12 @@ def _save_dir_oof(evals, path):
 
 # --- plots ----------------------------------------------------------------
 
-def plot_mae(results, out_png):
-    """Draws the raw-EH vs gated-LCF MAE bar chart (broken linear axis), per genotyping_regime."""
+def plot_mae(results, out_png, title_tag=""):
+    """Draws the raw-EH vs gated-LCF MAE bar chart (broken linear axis), per genotyping_regime.
+
+    ``title_tag`` (the dataset and loci set) is added as a second title line, so charts of different
+    datasets cannot be mistaken for one another.
+    """
     labels = [features.GENOTYPING_REGIME_DISPLAY[r["genotyping_regime"]] for r in results]
     raw = [r["gated"]["mae_raw"] for r in results]
     gat = [r["gated"]["mae_gated"] for r in results]
@@ -512,6 +516,8 @@ def plot_mae(results, out_png):
         ax.grid(axis="y", alpha=0.3)
 
     title = "Mean absolute error: raw EH allele size vs allele size after LCF correction"
+    if title_tag:
+        title += "\n" + title_tag
     ylabel = "MAE |true − call|  (repeat units)"
     if not broken:
         fig, ax = plt.subplots(figsize=(7, 4.6))
@@ -615,7 +621,7 @@ def plot_importance_panel(results, out_png, top_n=TOP_N, loci_label="non-homopol
                 color="#4c72b0", ecolor="gray", capsize=3)
         ax.set_yticks(pos)
         ax.set_yticklabels(["%s (#%d)" % (f, rank.get(f, 0)) for f, _, _ in ranked])
-        ax.set_xlabel("relative importance (%s)" % score_label)
+        ax.set_xlabel("relative importance\n(%s, divided by the bucket's largest)" % score_label)
         ax.set_title(features.GENOTYPING_REGIME_DISPLAY[reg])
         ax.grid(True, axis="x", alpha=0.3)
     fig.suptitle("Relative feature importance (%s, calibration chromosomes; %s) — rank # set by "
@@ -854,11 +860,9 @@ def plot_prob_violins(oof, out_png, title_tag="non-homopolymer"):
                 vals = p[bin_idx == b]
                 if vals.size > _DELTA_VIOLIN_CAP:
                     vals = vals[rng.choice(vals.size, _DELTA_VIOLIN_CAP, replace=False)]
-                data.append(vals if vals.size else np.zeros(1))
-            vp = ax.violinplot(data, showmedians=True, showextrema=False, widths=0.9)
-            for body, c in zip(vp["bodies"], colors):
-                body.set_facecolor(c); body.set_alpha(0.75)
-            if "cmedians" in vp:
+                data.append(vals)
+            vp = _violins_skipping_empty_bins(ax, data, colors, 0.75, widths=0.9, showextrema=False)
+            if vp and "cmedians" in vp:
                 vp["cmedians"].set_color("k"); vp["cmedians"].set_linewidth(0.8)
             ax.axvline(14, color="k", lw=0.8, ls="--", alpha=0.5)  # the "0" (no-change) bin
             ax.set_ylim(-0.02, 1.02); ax.grid(axis="y", alpha=0.3)
@@ -995,11 +999,29 @@ def _style_violin_extrema(vp):
             vp[key].set_linewidth(lw)
 
 
+def _violins_skipping_empty_bins(ax, data, colors, alpha, widths=0.85, showextrema=True):
+    """Draws one violin per non-empty array in ``data`` at x position ``i + 1``, colored ``colors[i]``.
+
+    An empty bin keeps its x slot (callers set every tick) but gets no violin, rather than a made-up
+    zero-valued one whose median and extrema would read as observed data. Returns the
+    ``violinplot`` dict, or None when every bin is empty.
+    """
+    positions = [i + 1 for i, d in enumerate(data) if len(d)]
+    if not positions:
+        return None
+    vp = ax.violinplot([data[p - 1] for p in positions], positions=positions, showmedians=True,
+                       showextrema=showextrema, widths=widths)
+    _style_violin_extrema(vp)
+    for body, p in zip(vp["bodies"], positions):
+        body.set_facecolor(colors[p - 1]); body.set_alpha(alpha)
+    return vp
+
+
 def plot_violins(violin, out_png, thresholds=(0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1),
                  pfx="", title_tag="non-homopolymer", dataset_label="held-out HPRC"):
     """Violins of the per-allele signed error reduction, one panel per genotyping regime.
 
-    reduction = |true - eh| - |true - eh/LCF| (>0 = correction moved the call closer to truth). Per
+    reduction = |true - eh| - |true - round(eh/LCF)| (>0 = correction moved the call closer to truth). Per
     panel: one violin for each tightening gate pOk < t (blue, nested subsets) plus pOk >= 0.5 (orange,
     where the gate keeps raw EH). Per-regime y-scale; y clipped to the 1-99th percentile.
 
@@ -1015,12 +1037,8 @@ def plot_violins(violin, out_png, thresholds=(0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3,
         pok = np.asarray(violin["%s__%spok" % (r, pfx)], dtype=float)
         data = [red[pok < t] for t in thresholds] + [red[pok >= 0.5]]
         counts = [int(d.size) for d in data]
-        data = [d if d.size else np.zeros(1) for d in data]
         _violin_ylim(ax, data)
-        vp = ax.violinplot(data, showmedians=True, showextrema=True, widths=0.85)
-        _style_violin_extrema(vp)
-        for body, c in zip(vp["bodies"], ["#4c72b0"] * len(thresholds) + ["#dd8452"]):
-            body.set_facecolor(c); body.set_alpha(0.65)
+        _violins_skipping_empty_bins(ax, data, ["#4c72b0"] * len(thresholds) + ["#dd8452"], 0.65)
         ax.axhline(0, color="k", lw=0.9, ls="--")
         ax.set_xticks(np.arange(1, len(data) + 1))
         ax.set_xticklabels(["pOk<%g" % t for t in thresholds] + ["pOk≥0.5"], fontsize=8, rotation=45)
@@ -1077,11 +1095,7 @@ def plot_violins_lcf(violin, out_png, pfx="", title_tag="non-homopolymer", datas
             data = [red[cm & (bin_idx == b)] for b in range(len(_LCF_BIN_LABELS))]
             counts = [int(d.size) for d in data]
             row_ylim += [d for d in data if len(d)]
-            data = [d if d.size else np.zeros(1) for d in data]
-            vp = ax.violinplot(data, showmedians=True, showextrema=True, widths=0.85)
-            _style_violin_extrema(vp)
-            for body, c in zip(vp["bodies"], _LCF_BIN_COLORS):
-                body.set_facecolor(c); body.set_alpha(0.65)
+            _violins_skipping_empty_bins(ax, data, _LCF_BIN_COLORS, 0.65)
             ax.axhline(0, color="k", lw=0.9, ls="--")
             ax.set_xticks(np.arange(1, len(_LCF_BIN_LABELS) + 1))
             ax.set_xticklabels(_LCF_BIN_LABELS, fontsize=7)
@@ -1137,11 +1151,7 @@ def plot_violins_motif(violin, out_png, dataset_label="held-out HPRC"):
         data = [red[gate & (mbin == b)] for b in range(len(_MOTIF_BIN_LABELS))]
         counts = [int(d.size) for d in data]
         nonempty = [d for d in data if d.size]
-        data = [d if d.size else np.zeros(1) for d in data]
-        vp = ax.violinplot(data, showmedians=True, showextrema=True, widths=0.85)
-        _style_violin_extrema(vp)
-        for body, c in zip(vp["bodies"], _MOTIF_BIN_COLORS):
-            body.set_facecolor(c); body.set_alpha(0.65)
+        _violins_skipping_empty_bins(ax, data, _MOTIF_BIN_COLORS, 0.65)
         ax.axhline(0, color="k", lw=0.9, ls="--")
         if nonempty:
             lo, hi = np.percentile(np.concatenate(nonempty), [1, 99]); pad = max(0.5, 0.1 * (hi - lo))
@@ -1169,8 +1179,8 @@ def plot_violins_pdiff(violin, out_png, pfx="", title_tag="non-homopolymer", dat
     """Violins of per-allele signed error reduction, one panel per genotyping regime, binned by the
     direction-head lean ``pTooLong - pTooShort``.
 
-    reduction = |true - eh| - |true - eh/LCF| (>0 = correction moved the call closer to truth). Within
-    each panel one violin per 0.1-wide ``pTooLong - pTooShort`` bin from -1.0 (certain TOO_SHORT)
+    reduction = |true - eh| - |true - round(eh/LCF)| (>0 = correction moved the call closer to truth).
+    Within each panel one violin per 0.1-wide ``pTooLong - pTooShort`` bin from -1.0 (certain TOO_SHORT)
     through 0 (balanced) to +1.0 (certain TOO_LONG); violins colored blue (short) -> red (long).
     Per-regime y-scale; y clipped to the 1-99th percentile.
 
@@ -1189,11 +1199,7 @@ def plot_violins_pdiff(violin, out_png, pfx="", title_tag="non-homopolymer", dat
         data = [red[bin_idx == b] for b in range(nb)]
         counts = [int(d.size) for d in data]
         nonempty = [d for d in data if d.size]
-        data = [d if d.size else np.zeros(1) for d in data]
-        vp = ax.violinplot(data, showmedians=True, showextrema=True, widths=0.85)
-        _style_violin_extrema(vp)
-        for body, c in zip(vp["bodies"], colors):
-            body.set_facecolor(c); body.set_alpha(0.7)
+        _violins_skipping_empty_bins(ax, data, colors, 0.7)
         ax.axhline(0, color="k", lw=0.9, ls="--")
         if nonempty:
             lo, hi = np.percentile(np.concatenate(nonempty), [1, 99]); pad = max(0.5, 0.1 * (hi - lo))
@@ -1222,9 +1228,9 @@ def plot_violins_lcf_bins(violin, out_png, pfx="", title_tag="non-homopolymer",
     """Violins of per-allele signed error reduction, one panel per genotyping regime, binned by the
     predicted ``LCF`` (correction size + direction).
 
-    reduction = |true - eh| - |true - eh/LCF| (>0 = correction moved the call closer to truth). Within
-    each panel one violin per predicted-LCF stratum (0-0.2, 0.2-0.25, 0.25-0.5, 0.5-1, 1-2, 2-4, 4-5,
-    >5); corrected = eh/LCF, so LCF<1 grows the call, LCF>1 shrinks it, LCF~1 (the 0.5-1 / 1-2 bins)
+    reduction = |true - eh| - |true - round(eh/LCF)| (>0 = correction moved the call closer to truth).
+    Within each panel one violin per predicted-LCF stratum (0-0.2, 0.2-0.25, 0.25-0.5, 0.5-1, 1-2, 2-4,
+    4-5, >5); corrected = round(eh/LCF), so LCF<1 grows the call, LCF>1 shrinks it, LCF~1 (the 0.5-1 / 1-2 bins)
     leaves it ~unchanged. Violins colored blue (grow) -> red (shrink); per-regime y-scale, y clipped to
     the 1-99th percentile.
 
@@ -1243,11 +1249,7 @@ def plot_violins_lcf_bins(violin, out_png, pfx="", title_tag="non-homopolymer",
         data = [red[bin_idx == b] for b in range(nb)]
         counts = [int(d.size) for d in data]
         nonempty = [d for d in data if d.size]
-        data = [d if d.size else np.zeros(1) for d in data]
-        vp = ax.violinplot(data, showmedians=True, showextrema=True, widths=0.85)
-        _style_violin_extrema(vp)
-        for body, c in zip(vp["bodies"], colors):
-            body.set_facecolor(c); body.set_alpha(0.7)
+        _violins_skipping_empty_bins(ax, data, colors, 0.7)
         ax.axhline(0, color="k", lw=0.9, ls="--")
         if nonempty:
             lo, hi = np.percentile(np.concatenate(nonempty), [1, 99]); pad = max(0.5, 0.1 * (hi - lo))
@@ -1259,7 +1261,7 @@ def plot_violins_lcf_bins(violin, out_png, pfx="", title_tag="non-homopolymer",
         ax.set_ylabel(_REDUCTION_LABEL)
         ax.grid(axis="y", alpha=0.3)
     fig.suptitle("Per-allele error reduction from LCF correction (%s), by predicted LCF "
-                 "(corrected = eh/LCF) — %s" % (dataset_label, title_tag), fontsize=13, weight="bold")
+                 "(corrected = round(eh/LCF)) — %s" % (dataset_label, title_tag), fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_png, dpi=130, bbox_inches="tight"); plt.close(fig)
 
@@ -1358,13 +1360,19 @@ def _eh_output_glossary():
 
 
 # The per-allele quantities each regime model predicts: (output, head, meaning, range, use).
+# The tolerance tiers below restate features.tol_repeats, which defines OK / TOO_LONG / TOO_SHORT.
 _MODEL_OUTPUTS = (
-    ("pOk", "direction predictor (3-class classifier + per-class isotonic calibration)", "probability that the EH call is correct (within tolerance)",
+    ("pOk", "direction predictor (3-class classifier + per-class isotonic calibration)",
+     "probability that the EH call is correct, i.e. within a tolerance of the true allele size that "
+     "depends on the true allele's length: exact (0 repeats) under 50 bp, 1 repeat for 50&ndash;120 bp, "
+     "2 for 121&ndash;269 bp, 4 for 270&ndash;599 bp, 8 at 600 bp or more",
      "0&ndash;1"),
     ("pTooLong", "direction predictor (3-class classifier + per-class isotonic calibration)",
-     "probability that the true allele size is shorter than what EH called", "0&ndash;1"),
+     "probability that EH called the allele longer than its true size by more than the pOk tolerance",
+     "0&ndash;1"),
     ("pTooShort", "direction predictor (3-class classifier + per-class isotonic calibration)",
-     "probability that the true allele size is longer than what EH called", "0&ndash;1"),
+     "probability that EH called the allele shorter than its true size by more than the pOk tolerance",
+     "0&ndash;1"),
     ("LCF", "length predictor (regression)",
      "<span style='white-space:nowrap'>predicted length-correction factor = "
      "(EH called allele size)/(true allele size)</span><br>"
@@ -1403,7 +1411,7 @@ def _holdout_homopolymer_results(holdout):
 def _holdout_table(holdout):
     rows = ["<tr><th>allele size bucket</th><th>n</th><th>raw EH MAE</th><th>gated MAE</th>"
             "<th>dist. reduction</th><th>median |err|: EH&rarr;gated</th><th>exact: EH&rarr;gated</th>"
-            "<th>pOk argmax acc.</th></tr>"]
+            "<th>3-class direction argmax acc.</th></tr>"]
     for r in features.GENOTYPING_REGIMES:
         m = holdout["genotyping_regimes"][r]
         if not m.get("n"):
@@ -1540,13 +1548,33 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
     def P(name):
         return os.path.join(out_dir, name)
 
+    import gen_datasets  # imported here, like _maybe_regenerate_dataset_artifacts does
+    # The apply-based eval scores a seeded sample of at most this many alleles per sample (heldout.run_eval).
+    eval_caps = sorted({e.get("max_alleles_per_sample") for e in evals.values()} - {None})
     parts = ["<h2>Accuracy by dataset</h2>",
              "<p class='note'>The exported model is applied unchanged (no fitting) to each dataset, "
              "scored against truth. Use the <b>Dataset</b> pill on every plot below to switch between "
              "datasets: %s. Only the held-out HPRC samples are absent from training (a further %d HPRC "
              "samples were promoted into the training pool for ancestry/sex diversity); HG002 is a "
-             "training sample, so its numbers are in-sample and show fit, not generalization.%s</p>"
+             "training sample, so its numbers are in-sample and show fit, not generalization. %d of the "
+             "held-out HPRC samples (%s) were never trained on but were used during model development to "
+             "diagnose defects and compare candidate features, and all of the held-out samples were used "
+             "to compare candidate models and training recipes (for example, how calibration data is held "
+             "out), so none of them is entirely untouched by development.%s%s</p>"
              % (", ".join("<b>%s</b>" % l for _, l in present), len(dataset.PROMOTED_HELDOUT_SAMPLES),
+                len(heldout.FASTPATH_DIAGNOSIS_SAMPLES), ", ".join(heldout.FASTPATH_DIAGNOSIS_SAMPLES),
+                "" if not eval_caps else
+                " The accuracy table and the MAE, help-vs-hurt and error-reduction charts score a seeded "
+                "random sample of at most %s alleles per sample (homopolymers included, split out "
+                "afterwards), and the error-reduction violins keep an evenly spaced subset of at most %s "
+                "of those per sample and allele size bucket, so their counts can be smaller than the "
+                "table's; the accuracy-by-size charts use a separate, larger seeded sample of whole loci "
+                "holding at most %s alleles per sample that ExpansionHunter scores (one per homozygous "
+                "call; the cap report.py regenerates them with), and count both copies of each "
+                "homozygous call plus the no-calls of those loci, so they show more alleles than that "
+                "and their allele counts are not comparable."
+                % (" / ".join(format(c, ",") for c in eval_caps), format(heldout.VIOLIN_PER_SAMPLE, ","),
+                   format(gen_datasets.CORRECTED_CAP_DEFAULT, ",")),
                 "" if not stale else " Skipped because they are out of date: %s."
                 % html.escape(", ".join(sorted(set(stale)))))]
 
@@ -1577,6 +1605,15 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
                         except Exception as e:
                             print("  [%s] accuracy-by-size %s/%s/%s/%s skipped: %s"
                                   % (key, hk, vkey, pkey, kkey, e), flush=True)
+    # The caption names each LCF correction option by its own pill label, so the two cannot drift apart.
+    correction_notes = {"raw": "no correction",
+                        "p050": "the LCF applied to alleles with <code>pOk&lt;0.5</code>",
+                        "p025": "a stricter <code>pOk&lt;0.25</code> threshold",
+                        "p050ns": "the <code>pOk&lt;0.5</code> threshold restricted to full_nonspanning-bucket "
+                                  "alleles"}
+    correction_options = ", ".join(
+        "<b>%s</b>%s" % (html.escape(label), " (%s)" % correction_notes[k] if k in correction_notes else "")
+        for k, label, _, _ in ABS.CORRECTION_VARIANTS)
     if abs_imgs:
         parts += [
             "<h3>Accuracy by true allele size (per-allele call vs truth)</h3>",
@@ -1593,26 +1630,34 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
             "widened to &plusmn;2 / &plusmn;3 / &plusmn;4 for calls longer than 120 / 240 / 360 repeats; "
             "blue = under-call, orange = over-call, cyan = wrong direction, plus "
             "No&nbsp;Call / Hom&nbsp;Ref / Het&nbsp;Ref); the x-axis is true allele size minus the "
-            "reference. Left panel = allele counts, right panel = fractions. The <b>LCF correction</b> "
+            "reference. Left panel = allele counts, right panel = fractions. <b>Same</b> is not the "
+            "tolerance behind <code>pOk</code> (see the model outputs table): for true alleles under 50 bp "
+            "the model counts only an exact call as correct, so a call one repeat off can be <b>Same</b> "
+            "here yet TOO_LONG or TOO_SHORT for the model. The <b>LCF correction</b> "
             "pill replaces each gated call with <code>round(eh/LCF)</code>, growing the green "
-            "<b>Same</b> band where it helps: <b>Raw EH</b> (no correction), <b>p&lt;0.5</b> "
-            "(correct alleles with <code>pOk&lt;0.5</code>), <b>p&lt;0.25</b> (a stricter "
-            "<code>pOk&lt;0.25</code> threshold), and <b>p&lt;0.5, non-spanning</b> (the <code>pOk&lt;0.5</code> "
-            "threshold restricted to full_nonspanning-bucket alleles). The <b>Repeat Purity Filter</b> pill "
+            "<b>Same</b> band where it helps: " + correction_options + ". The <b>Repeat Purity Filter</b> pill "
             "(<b>Off</b> vs <b>&gt; 0.95 pure</b>) restricts the plot to alleles whose truth repeat "
             "purity exceeds 0.95 (purity is on a 0&ndash;1 scale), i.e. near-perfect tandem repeats "
             "without interruptions. The <b>pOk Filter</b> pill keeps only alleles whose own predicted "
             "<code>pOk</code> is below 0.2, 0.3, 0.4 or 0.5, or at least 0.5, independent of the "
             "correction selected, so the lower thresholds show how the calls look as the gate tightens. "
+            "No-call alleles have no <code>pOk</code>, so every option other than <b>All</b> leaves them "
+            "out (the No Call band is empty there), and <b>pOk &lt; 0.5</b> plus <b>pOk &ge; 0.5</b> add up "
+            "to <b>All</b> minus the no-calls. "
             "(Every dataset is categorized from its per-allele parquet; the raw "
-            "and corrected bands both cover the same capped, whole-locus sample per parquet, so "
-            "switching the correction changes only the calls. A dataset whose parquet lacks "
+            "and corrected bands both cover the same capped, whole-locus sample per parquet, so with the "
+            "pOk Filter at All, switching the correction changes only the calls. With a pOk threshold, "
+            "each corrected call keeps its own <code>pOk</code> after the calls are re-paired with the true "
+            "alleles by size, so which true alleles fall below the threshold can shift slightly between "
+            "corrections. A dataset whose parquet lacks "
             "no-call rows notes so in its panel title.)</p>"]
 
     # --- per-dataset held-out accuracy table ---
     etab = {(k,): _holdout_table(evals[k]) for k, _ in present if k in evals}
-    parts += ["<h3>Held-out accuracy (raw EH vs pOk&lt;0.5-gated LCF)</h3>",
-              _pills("etab", [_ds_dim_for(etab, present)], etab)]
+    parts += ["<h3>Accuracy table, non-homopolymer loci (raw EH vs pOk&lt;0.5-gated LCF)</h3>",
+              _pills("etab", [_ds_dim_for(etab, present)], etab),
+              "<p class='note'>Homopolymer (1 bp motif) alleles are left out of this table; the charts below "
+              "show them under their <b>Homopolymers</b> pill.</p>"]
 
     def homo_family(gid, h3, prefix, render, desc, datasets_with):
         imgs = {}
@@ -1637,11 +1682,12 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
     parts += homo_family(
         "dmae", "Mean absolute error: raw EH vs gated-LCF", "mae",
         lambda k, png, pfx, tag, label: plot_mae(
-            _holdout_homopolymer_results(evals[k]) if pfx == "h" else _holdout_results(evals[k]), png),
+            _holdout_homopolymer_results(evals[k]) if pfx == "h" else _holdout_results(evals[k]), png,
+            title_tag="%s, %s" % (label, tag)),
         "<p class='note'>Raw-EH MAE vs the MAE after applying the LCF only where <code>pOk&lt;0.5</code>, "
         "per allele size bucket (repeat units).</p>", [k for k, _ in present if k in evals])
     parts += homo_family(
-        "dhh", "Loci the LCF would help vs hurt, by pOk stratum", "hh",
+        "dhh", "Allele calls the LCF would help vs hurt, by pOk stratum", "hh",
         lambda k, png, pfx, tag, label: plot_helped_hurt(evals[k], png, homopolymer=(pfx == "h"),
                                                          title_tag=tag, dataset_label=label),
         "<p class='note'>Would the LCF move each call <b>closer</b> (green) or <b>further</b> (red) from "
@@ -1651,7 +1697,7 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
         "dpokv", "Per-allele error reduction (signed), by pOk stratum", "pokv",
         lambda k, png, pfx, tag, label: plot_violins(violins[k], png, pfx=pfx, title_tag=tag,
                                                       dataset_label=label),
-        "<p class='note'>Signed error reduction <code>|true&minus;eh| &minus; |true&minus;eh/LCF|</code> "
+        "<p class='note'>Signed error reduction <code>|true&minus;eh| &minus; |true&minus;round(eh/LCF)|</code> "
         "(above 0 = closer to truth) as the pOk threshold tightens.</p>",
         [k for k, _ in present if k in violins])
     parts += homo_family(
@@ -1672,7 +1718,7 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
         lambda k, png, pfx, tag, label: plot_violins_lcf_bins(violins[k], png, pfx=pfx, title_tag=tag,
                                                                dataset_label=label),
         "<p class='note'>Signed error reduction binned by the predicted LCF "
-        "(0&ndash;0.2 .. &gt;5; corrected = <code>eh/LCF</code>).</p>",
+        "(0&ndash;0.2 .. &gt;5; corrected = <code>round(eh/LCF)</code>).</p>",
         [k for k, _ in present if k in violins])
 
     motif_imgs = {}
@@ -1771,22 +1817,33 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "<p class='note'>Model file: <code>%s</code></p>" % html.escape(os.path.basename(model_path)),
         "<h2>Model Overview</h2>",
         "<p class='note'>The model scores each ExpansionHunter (EH) allele call vs the probable true "
-        "allele size. Each allele gets its own set of 4 scores:</p>",
+        "allele size. Each called allele gets a set of 4 scores (a homozygous or hemizygous call gets one "
+        "set, shared by both copies):</p>",
         _model_outputs_table(),
-        "<p class='note'>During model training and prediction, ExpansionHunter genotyped allele sizes are "
-        "split into two separate buckets: the <b>full_spanning</b> bucket for allele sizes supported by "
-        "&ge;1 spanning read, and the <b>full_nonspanning</b> bucket for alleles with no spanning reads. "
-        "Additionally, in <code>--analysis-mode optimized-streaming</code>, a 3rd <b>quick</b> bucket is "
-        "added for alleles that could be confidently and quickly genotyped using only spanning reads "
-        "without running the full, computationally-expensive ExpansionHunter genotyping algorithm.</p>",
-        "<p class='note'><b>Training data:</b> %s &mdash; Illumina whole-genome sequencing.</p>" % html.escape(pool),
-        "<p class='note'><b>Truth set:</b> <a href='https://github.com/broadinstitute/str-truth-set-v2'>"
-        "<code>str-truth-set-v2</code></a>. Per-allele true repeat counts "
-        "(and repeat purity) are derived from haplotype-resolved long-read genome assemblies of the "
-        "same samples (HG002, CHM1&ndash;CHM13 and the HPRC samples), giving the true repeat number at "
-        "each tandem-repeat locus. Negative-control loci are filtered out before training; truth repeat purity is not "
-        "used as a training filter, but is available below as an opt-in <b>Repeat Purity Filter</b> "
-        "stratification pill.</p>",
+        "<p class='note'>ExpansionHunter genotyped allele sizes are split into separate buckets, each with "
+        "its own predictor. In <code>--analysis-mode optimized-streaming</code>, the <b>quick</b> bucket "
+        "holds alleles that could be confidently and quickly genotyped using only spanning reads, without "
+        "running the full, computationally-expensive ExpansionHunter genotyping algorithm; alleles at the "
+        "other loci are genotyped by the full algorithm and split into the <b>full_spanning</b> bucket "
+        "(&ge;1 spanning read at the called size) and the <b>full_nonspanning</b> bucket (no spanning read "
+        "at the called size; the locus may still have spanning reads supporting other sizes). All training "
+        "and evaluation data come from optimized-streaming runs, so the full_spanning and full_nonspanning "
+        "predictors were trained and scored only on the loci the quick path left to the full algorithm; "
+        "other analysis modes, which send every locus through the full algorithm, give them a different "
+        "population of loci than they were trained on.</p>",
+        "<p class='note'><b>Training data:</b> %s &mdash; Illumina whole-genome sequencing, genotyped by "
+        "ExpansionHunter-bw2 with <code>--analysis-mode optimized-streaming</code>.</p>" % html.escape(pool),
+        "<p class='note'><b>Truth set:</b> <code>%s</code> (TRExplorer v2.1 catalog). Per-allele true "
+        "repeat counts (and repeat purity) are derived from haplotype-resolved long-read genome "
+        "assemblies of the same samples (HG002, CHM1&ndash;CHM13 and the HPRC samples) aligned with "
+        "DipCall, giving the true repeat number at each tandem-repeat locus; a repeat insertion that "
+        "DipCall placed up to one motif length before a locus is counted in that locus. Training and "
+        "every evaluation below use only loci inside each sample's DipCall high-confidence regions (from "
+        "<a href='https://github.com/broadinstitute/str-truth-set-v2'><code>str-truth-set-v2</code></a>) "
+        "where at least one true allele differs from the reference, so "
+        "loci where the sample is homozygous for the reference allele are left out. Truth repeat purity "
+        "is not used as a training filter, but is available below as an opt-in <b>Repeat Purity "
+        "Filter</b> stratification pill.</p>" % html.escape(os.path.basename(dataset.TRUTH_GENOTYPES_ROOT)),
         "<p class='note'>Held-out accuracy is measured by 5-fold cross validation: "
         "each fold trains on 17-18 chromosomes with the exported model's fitting steps (quota "
         "sampling, gated length-correction fit, the same fixed number of boosting iterations per "
@@ -1795,15 +1852,22 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "model, which trains one model per regime on homopolymer and non-homopolymer loci together "
         "(the cross-validation fits the two panels separately) and fits its isotonic calibration on "
         "%d of its training HPRC samples, kept out of tree fitting, plus one autosome each of %s "
-        "(the cross-validation calibrates on chromosomes). None of the held-out HPRC samples below "
-        "is used.</p>" % (train.N_CALIB_INDIVIDUALS, " and ".join(train.ALWAYS_TRAIN_INDIVIDUALS)),
+        "(the cross-validation calibrates on chromosomes). Each cross-validation head is also fit on "
+        "fewer rows: at most <code>report.py --cv-train-cap</code> rows (400,000 in "
+        "<code>train_model.sh</code>, with a fifth as many calibration rows), where the exported heads "
+        "use up to <code>train.py --train-cap</code> rows (1,000,000), with the same iteration counts. "
+        "None of the held-out HPRC samples below is used.</p>"
+        % (train.N_CALIB_INDIVIDUALS, " and ".join(train.ALWAYS_TRAIN_INDIVIDUALS)),
         "<h2>ExpansionHunter output fields used for model training</h2>",
-        "<p class='note'>The raw per-allele <code>AlleleQualityMetrics.Alleles[]</code> fields read from "
-        "each ExpansionHunter output JSON.</p>",
+        "<p class='note'>The fields of each ExpansionHunter output JSON that the model features are "
+        "computed from: per-locus, per-variant and per-allele "
+        "(<code>AlleleQualityMetrics.Alleles[]</code>).</p>",
         _eh_output_glossary(),
         "<h2>Feature definitions (derived from ExpansionHunter output fields)</h2>",
-        "<p class='note'>The model features, with their <code>full_nonspanning</code> importance rank "
-        "(<code>#1</code> = most important there). These are derived (and two engineered: "
+        "<p class='note'>The model features, with their <code>full_nonspanning</code> importance rank for "
+        "the LCF (length) prediction (<code>#1</code> = most important there; the direction prediction "
+        "that produces <code>pOk</code> ranks them differently, see its importance panel below). These "
+        "are derived (and two engineered: "
         "<code>ci_asymmetry</code>, <code>ci_over_eh</code>) from the ExpansionHunter output fields "
         "above.</p>",
         stale_contract_html,
@@ -1815,14 +1879,17 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "applied only where <code>pOk &lt; 0.5</code>; calls with <code>pOk &ge; 0.5</code> keep the raw "
         "EH allele size. "
         "MAE is computed over held-out alleles, and is measured in repeat units. The pOk &lt; 0.5 threshold "
-        "concentrates the correction on the "
-        "<code>full_nonspanning</code> allele size bucket, where flanking/IRR sizing makes raw EH most error-prone.</p>",
+        "fires on few <code>quick</code> alleles, so the correction is concentrated on the two "
+        "full-genotyper buckets (most <code>full_spanning</code> and <code>full_nonspanning</code> alleles "
+        "in the default panel; among homopolymers, nearly all <code>full_nonspanning</code> alleles but "
+        "under a quarter of <code>full_spanning</code> ones).</p>",
         "<h3>Confusion matrix (argmax prediction, row-normalized)</h3>",
         _img_toggle(confusion_png, confusion_homopolymer_png, "cm"),
         "<p class='note'>Rows are the <b>true</b> direction, columns the <b>argmax</b>-predicted "
         "direction; each cell shows the allele count and its row-percent, and the diagonal is "
-        "per-class <b>recall</b>. Row-normalizing (rather than showing raw counts) keeps the rare "
-        "TOO_LONG / TOO_SHORT rows readable next to the dominant OK row, and exposes the asymmetry "
+        "per-class <b>recall</b>. Row-normalizing (rather than showing raw counts) keeps every true "
+        "direction readable however many alleles it has (the OK / TOO_LONG / TOO_SHORT mix differs a lot "
+        "between buckets; the PR-ROC legend below gives each class's share), and exposes the asymmetry "
         "in <i>where</i> the predictor misroutes calls. It is the hard-decision (argmax) view of the "
         "calibrated probabilities.</p>",
         ("<h3>ROC curves: detecting TOO_LONG / TOO_SHORT calls</h3>" if roc_png else ""),
@@ -1831,13 +1898,14 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
          "catch: true "
          "positive rate vs false positive rate as the probability threshold sweeps, allele size buckets "
          "overlaid. The legend gives each curve's <code>AUC</code>; the dashed diagonal is chance. ROC is "
-         "threshold-independent but, because OK calls dominate, reads optimistically &mdash; see the "
-         "PR-ROC curves below for the rare-class precision trade-off.</p>" if roc_png else ""),
+         "threshold-independent but ignores how common each class is, so it reads optimistically for a "
+         "rare class &mdash; see the PR-ROC curves below for precision at each class's actual "
+         "prevalence.</p>" if roc_png else ""),
         ("<h3>PR-ROC curves: detecting TOO_LONG / TOO_SHORT calls</h3>" if pr_png else ""),
         (_img_toggle(pr_png, pr_homopolymer_png, "pr") if pr_png else ""),
         ("<p class='note'>One-vs-rest precision&ndash;recall for the two error directions the pOk &lt; 0.5 "
-         "threshold must catch. Because OK calls dominate, ROC-AUC looks optimistic; PR-ROC shows the real "
-         "trade-off when the positive class is rare. <code>AP</code> is the average precision (area "
+         "threshold must catch. Unlike ROC, PR-ROC depends on how common the class is, so it shows the "
+         "real precision trade-off where a class is rare. <code>AP</code> is the average precision (area "
          "under the curve); <code>base</code> (the dotted line) is the class prevalence &mdash; the "
          "precision a random classifier would get, so the gap above it is the model's lift. "
          "<code>full_nonspanning</code>, where raw EH mis-sizes most, is where detection matters "
@@ -1862,7 +1930,9 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "charts so a feature can be tracked between allele size buckets. Toggle between "
         "<b>non-homopolymer</b> loci and <b>homopolymer</b> (1&nbsp;bp motif) loci (the homopolymer panel's "
         "<code>#</code> ranks are set by its own homopolymer full_nonspanning order). "
-        "Bars are the rise in loss when that feature's column is shuffled, measured on fold&nbsp;0's "
+        "Bars are the rise in loss when that feature's column is shuffled, divided by the largest rise in "
+        "that bucket (so each bucket's top feature is 1, and bars compare features within a bucket, not "
+        "across buckets), measured on fold&nbsp;0's "
         "<b>calibration</b> chromosomes &mdash; not its test chromosomes, so that the ablation curves "
         "below, which add features in this order and score on the test chromosomes, never have their "
         "feature subsets chosen using the rows they are scored on. Those calibration chromosomes are "
@@ -1883,9 +1953,11 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         % (". The y-axis is broken so the large raw-EH baseline and the corrected detail are both "
            "readable" if ablation_axis == "broken" else ""),
         "gated MAE bar chart above which compares raw EH vs the pOk&lt;0.5-gated correction). Each "
-        "prefix fits a <b>simplified</b> LCF prediction, on every training row rather than only the rows "
-        "the gate fires on and with at most %d boosting iterations, so the curve ranks how much each "
-        "feature adds rather than reproducing the shipped LCF prediction.</p>" % M.EARLY_STOP_MAX_ITERATIONS,
+        "prefix fits a <b>simplified</b> LCF prediction, on a seeded random sample of at most %s "
+        "training-chromosome rows (not only the rows the gate fires on), scored on at most %s test rows, "
+        "and with at most %d boosting iterations, so the curve ranks how much each feature adds rather "
+        "than reproducing the shipped LCF prediction.</p>"
+        % (format(ABLATION_TRAIN_CAP, ","), format(ABLATION_TEST_CAP, ","), M.EARLY_STOP_MAX_ITERATIONS),
     ]
     if dir_importance_png:
         parts += [
@@ -1895,7 +1967,8 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
             "<b>direction predictor</b> (<code>pOk</code> / <code>pTooLong</code> / "
             "<code>pTooShort</code>) instead of the LCF regressor: each feature's column is shuffled "
             "and the bar is the resulting <b>rise in log-loss</b> of the calibrated probabilities "
-            "(classifier + isotonic, exactly what ExpansionHunter emits). The two heads are ranked "
+            "(classifier + isotonic, exactly what ExpansionHunter emits), divided by the largest rise in "
+            "that bucket as in the panel above. The two heads are ranked "
             "separately because they answer different questions -- a feature that pins down "
             "<i>how far off</i> a call is need not be the one that says <i>whether</i> it is off. "
             "Because the rankings differ, the <code>(#n)</code> suffixes on THIS panel are "
@@ -1908,7 +1981,8 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
             _img_toggle(dir_ablation_png, dir_ablation_homopolymer_png, "dirabl"),
             "<p class='note'>The direction predictor is re-fit using only its top-1 most-important "
             "feature, then top-2, ... up to all features (x-axis; added in each allele size bucket's "
-            "own <b>direction</b> importance order, not the LCF order used by the chart above). The "
+            "own <b>direction</b> importance order from the panel above, not the LCF order used by the "
+            "LCF ablation further up). The "
             "y-axis is the <b>held-out multinomial log-loss</b> of the calibrated "
             "<code>[pOk, pTooLong, pTooShort]</code> probabilities -- the head's own training "
             "objective, so lower is strictly better and it rewards calibration, not just ranking. "
@@ -2046,7 +2120,8 @@ def main():
             drawn[name] = plot_fn(path)
         return path if os.path.exists(path) else None
 
-    mae_png = _png("mae_raw_vs_gated.png", lambda p: plot_mae(results, p))
+    mae_png = _png("mae_raw_vs_gated.png",
+                   lambda p: plot_mae(results, p, title_tag="non-homopolymer, 5-fold held-out"))
     importance_png = _png("feature_importance.png", lambda p: plot_importance_panel(results, p))
     ablation_png = _png("ablation.png", lambda p: plot_ablation(results, p))
     # plot_ablation reports whether it actually broke the y-axis. --render-text-only never redraws,
@@ -2106,7 +2181,8 @@ def main():
                           "report.py --homopolymer-cv" % stale, flush=True)
         if not stale:
             mae_homopolymer_png = _png("mae_raw_vs_gated_homopolymer.png",
-                                       lambda p: plot_mae(homo_results, p))
+                                       lambda p: plot_mae(homo_results, p,
+                                                          title_tag=htag + ", 5-fold held-out"))
             ablation_homopolymer_png = _png("ablation_homopolymer.png",
                                             lambda p: plot_ablation(homo_results, p))
             importance_homopolymer_png = _png("feature_importance_homopolymer.png",

@@ -39,6 +39,14 @@ _REGION_RE = re.compile(r"^([^:]+):(\d+)-(\d+)$")
 # names are leaf names. Source of truth for the field names is ``extract_variant_rows`` below.
 EH_OUTPUT_FIELDS = [
     ("Coverage", "Per-locus read depth over the locus's two reference flanks."),
+    ("RepeatUnit", "Per-variant: the repeat motif; its length is motif_size."),
+    ("ReferenceRegion", "Per-variant: the reference repeat interval; gives ref_size_bp and num_repeats_in_reference."),
+    ("QuickGenotype", "Per-variant: whether EH's quick genotyping path made the call; selects the quick bucket."),
+    ("Genotype", "Per-variant: the called allele sizes in repeats (eh), one per allele."),
+    ("GenotypeConfidenceInterval", "Per-variant: the confidence interval of each called allele size (the ci_* features)."),
+    ("CountsOfSpanningReads", "Per-variant: spanning reads by allele size (the spanning_* features and support_frac)."),
+    ("CountsOfFlankingReads", "Per-variant: flanking reads by allele size (the flanking_* features)."),
+    ("CountsOfHighQualityUnambiguousReads", "Per-variant: high-quality unambiguous reads by allele size (hq_unamb_total)."),
     ("CountsOfInrepeatReads", "Per-variant: reads lying entirely inside the repeat, by size (full genotyper only)."),
     ("ReferenceRepeatPurity", "Per-variant: fraction of the reference repeat region matching a perfect motif tiling."),
     ("Depth", "Per-allele read depth."),

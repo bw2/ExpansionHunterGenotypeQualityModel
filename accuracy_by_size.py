@@ -10,9 +10,11 @@ Two panels share the x-axis ``True Allele Size - Number of Repeats in Reference`
 Each allele is colored by how the genotyped call compares to truth (``DiffRepeats = call - truth``):
 No Call / Called Hom Ref / Called Het Ref / Wrong Direction, then the signed magnitude bands
 (-21 or more ... -2, Same, 2 ... 21 or more). "Same" = within +/-1 repeat (widening for long
-alleles), as in str-truth-set. With a corrected cap (gen_datasets' --corrected-cap, 400,000 called
-alleles by default) every panel, raw included, covers only a seeded whole-locus sample of each parquet,
-so the counts match str-truth-set's published numbers only with --corrected-cap 0.
+alleles), as in str-truth-set. With a corrected cap (gen_datasets' --corrected-cap, 400,000 by
+default, counting the called alleles ExpansionHunter scores: one per homozygous call) every panel, raw
+included, covers only a seeded whole-locus sample of each parquet, which also keeps both copies of each
+homozygous call and the no-calls of those loci, so the counts match str-truth-set's published numbers
+only with --corrected-cap 0.
 
 The category boundaries, colors, x-bins, override precedence, and "exactly right" numerator are
 transcribed verbatim from the v1 script (verified byte-for-byte against the example SVG). Pure
