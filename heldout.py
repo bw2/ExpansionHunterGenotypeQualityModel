@@ -64,10 +64,11 @@ FASTPATH_DIAGNOSIS_SAMPLES = (
 )
 
 
-def build_sample(sample, data_dir, force):
+def build_sample(sample, data_dir, force, keep_hom_ref_loci=False):
     """Downloads + joins one held-out sample and writes its per-sample parquet.
 
     ``sample`` is both the sample label of its ``dataset.EH_RESULTS_ROOT`` folder and its truth sample id.
+    ``keep_hom_ref_loci`` is passed to ``dataset.extract_rows_and_join_truth``.
     """
     out_path = os.path.join(data_dir, "real_43", "%s.parquet" % sample)
     json_remote = dataset._list_json_inputs(sample)
@@ -80,7 +81,8 @@ def build_sample(sample, data_dir, force):
     json_sources = [("json shard %d" % i, r, l) for i, (r, l) in enumerate(zip(json_remote, json_locals))]
     dataset._check_freshness(sample, json_sources + truth_sources)
 
-    if dataset._parquet_reusable(out_path, json_sources + truth_sources, force):
+    if dataset._parquet_reusable(out_path, json_sources + truth_sources,
+                                 force or dataset.lacks_all_loci_columns(out_path, keep_hom_ref_loci)):
         return out_path
     print("=== %s: %d json file(s) ===" % (sample, len(json_remote)), flush=True)
 
@@ -92,7 +94,8 @@ def build_sample(sample, data_dir, force):
         sample, [("json shard %d" % i, p) for i, p in enumerate(json_local)])
 
     merged = dataset.extract_rows_and_join_truth(
-        json_local, genotypes_tsv_local, high_confidence_bed_local, sample, sample).drop(columns=["sample_id"])
+        json_local, genotypes_tsv_local, high_confidence_bed_local, sample, sample,
+        keep_hom_ref_loci=keep_hom_ref_loci).drop(columns=["sample_id"])
     # Feature columns stay float64 all the way to fit(). Downcasting here used to halve the parquet
     # and frame size, but it permanently quantized every value: sklearn's HistGradientBoosting upcasts
     # back to float64 internally (X_DTYPE) and bins to uint8, so the downcast bought nothing at fit
@@ -322,6 +325,109 @@ def _rebuild_instructions(complaints):
                      for p, c in sorted(complaints.items()))
 
 
+EARLY_WARNING_FLAG_RATES = (0.01, 0.02, 0.05, 0.10)
+
+
+def _tie_aware_recall(suspicion, is_miss, rate):
+    """Share of misses among the ``rate`` most suspicious calls; the calls tied at the cutoff share the remaining
+    places evenly (what a random tie break gives on average)."""
+    n_flag = int(rate * len(suspicion))
+    if n_flag == 0 or not is_miss.any():
+        return float("nan")
+    cutoff = np.sort(suspicion)[::-1][n_flag - 1]
+    tied = suspicion == cutoff
+    weights = (suspicion > cutoff).astype(float)
+    weights[tied] = (n_flag - weights.sum()) / tied.sum()
+    return float((weights * is_miss).sum() / is_miss.sum())
+
+
+def _roc_auc(score, is_positive):
+    """ROC-AUC with ties counted half (Mann-Whitney), NaN without both classes."""
+    n_pos, n_neg = int(is_positive.sum()), int((~is_positive).sum())
+    if not n_pos or not n_neg:
+        return float("nan")
+    ranks = pd.Series(score).rank(method="average").to_numpy()
+    return float((ranks[is_positive].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+
+
+def _fast_path_loci_of_sample(path, compiled_quick, quick_names):
+    """Per representative fast-path locus of one all-loci parquet: pOk, reference-length call, miss, chrX/chrY.
+
+    The representative loci are an equal-probability sample of all loci (``dataset._kept_rows_of_locus``). A
+    locus's pOk is the mean of the model's rounded pOk over its scored alleles, as compare_eh_to_truth.py
+    averages what ExpansionHunter writes. Distances are from the truth TSV's reference count
+    (``truth_reference_repeats``), like compare_eh_to_truth.py: a reference-length call has every allele within
+    1 repeat of it, and a miss is a reference-length call whose truth is more than 2 repeats from it
+    (operating_points.py's definition). Returns None for a parquet built without hom-ref loci.
+    """
+    if dataset.lacks_all_loci_columns(path, keep_hom_ref_loci=True):
+        return None
+    df = pd.read_parquet(path, filters=[("all_loci_representative", "=", True),
+                                        ("genotyping_branch", "=", features.BRANCH_QUICK)])
+    # ANALYSIS_OK[imputation]: no-call rows (eh NaN) and loci without a reference count are left out below.
+    df = df[df["eh"].notna() & df["truth_reference_repeats"].notna()].reset_index(drop=True)
+    scored = df["has_own_quality_metrics"].to_numpy(bool)
+    pok = np.full(len(df), np.nan)
+    if scored.any():
+        X, _ = features.build_matrix(df[scored], features.BRANCH_QUICK, names=quick_names)
+        pok[scored] = M.round_like_emitted(M.predict_proba_json(compiled_quick, X))[:, features.OK]
+    reference = df["truth_reference_repeats"].to_numpy(float)
+    per_row = pd.DataFrame({
+        "locus_id": df["locus_id"], "pok": pok,
+        "eh_distance": np.abs(df["eh"].to_numpy(float) - reference),
+        "truth_distance": np.abs(pd.to_numeric(df["true"], errors="coerce").to_numpy(float) - reference),
+        "one_allele": df["n_alleles"].to_numpy(float) == 1})
+    loci = per_row.groupby("locus_id", sort=False).agg(pok=("pok", "mean"), eh_distance=("eh_distance", "max"),
+                                                      truth_distance=("truth_distance", "max"),
+                                                      one_allele=("one_allele", "all"))
+    loci = loci[loci["pok"].notna()]
+    loci["on_chrx_or_chry"] = loci.index.str.split("-").str[0].str.replace("chr", "", regex=False).isin(["X", "Y"])
+    loci["reference_call"] = loci["eh_distance"] <= 1
+    loci["miss"] = loci["reference_call"] & (loci["truth_distance"] > 2)
+    return loci.reset_index(drop=True)
+
+
+def all_loci_early_warning(paths, model_path):
+    """The all-loci early-warning view: how well low pOk flags fast-path misses, on held-out parquets built with
+    ``--keep-hom-ref-loci`` (others are skipped).
+
+    Per sample (``_fast_path_loci_of_sample``): ROC-AUC of 1 - pOk for the misses among reference-length calls,
+    and the share of fast-path loci below pOk 0.5. Pooled over samples: recall of the misses at each of
+    ``EARLY_WARNING_FLAG_RATES``, for all samples, without chrX/chrY, and by sex. Sex is read from the calls:
+    ExpansionHunter genotypes chrX/chrY with one allele in a male run, so a sample is male when most of its
+    chrX/chrY loci have one-allele calls.
+    """
+    serialized = M.load(model_path)
+    compiled_quick = M.compile_genotyping_regime(serialized["genotyping_regimes"][features.GENOTYPING_REGIME_QUICK])
+    quick_names = M.feature_names_of(serialized, model_path)[features.BRANCH_QUICK]
+    per_sample, pooled = {}, []
+    for path in paths:
+        loci = _fast_path_loci_of_sample(path, compiled_quick, quick_names)
+        if loci is None:
+            continue
+        sample = os.path.splitext(os.path.basename(path))[0]
+        sex_chromosome_loci = loci[loci["on_chrx_or_chry"]]
+        sex = "male" if len(sex_chromosome_loci) and sex_chromosome_loci["one_allele"].mean() > 0.5 else "female"
+        reference_calls = loci[loci["reference_call"]]
+        per_sample[sample] = {"sex": sex, "n_reference_calls": int(len(reference_calls)),
+                              "n_misses": int(reference_calls["miss"].sum()),
+                              "auc_miss": _roc_auc(1.0 - reference_calls["pok"].to_numpy(),
+                                                   reference_calls["miss"].to_numpy(bool)),
+                              "share_below_half": float((loci["pok"] < 0.5).mean())}
+        pooled.append(reference_calls.assign(sex=sex))
+    if not pooled:
+        return None
+    pooled = pd.concat(pooled, ignore_index=True)
+    recall = {}
+    for subset_name, subset in (("all", pooled), ("chrX/chrY left out", pooled[~pooled["on_chrx_or_chry"]]),
+                                ("female", pooled[pooled["sex"] == "female"]), ("male", pooled[pooled["sex"] == "male"])):
+        recall[subset_name] = {rate: _tie_aware_recall(1.0 - subset["pok"].to_numpy(), subset["miss"].to_numpy(bool),
+                                                       rate) for rate in EARLY_WARNING_FLAG_RATES}
+    return {"per_sample": per_sample, "recall": recall,
+            "auc_miss_mean": float(np.nanmean([s["auc_miss"] for s in per_sample.values()])),
+            "share_below_half_mean": float(np.mean([s["share_below_half"] for s in per_sample.values()]))}
+
+
 def run_eval(paths, model_path, out_json, max_alleles):
     """Applies the exported model to ``paths`` (per-allele parquets) and writes ``out_json`` + its
     ``*_violin.npz``; returns the metrics dict.
@@ -355,7 +461,7 @@ def run_eval(paths, model_path, out_json, max_alleles):
     print("\n==== predict + gate on %d parquet(s) (no fitting, cap %s alleles/sample) ===="
           % (len(paths), cap or "none"), flush=True)
     for p in paths:
-        df, _ = dataset.label_and_filter(pd.read_parquet(p))
+        df, _ = dataset.label_and_filter(dataset.variant_locus_rows(pd.read_parquet(p)))
         if cap and len(df) > cap:
             df = df.sample(cap, random_state=20260616).reset_index(drop=True)
         for regime in features.GENOTYPING_REGIMES:
@@ -404,6 +510,9 @@ def main():
     parser.add_argument("--out", default=os.path.join(HERE, "report", "heldout.json"))
     parser.add_argument("--build-only", action="store_true", help="only download + build parquets")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--keep-hom-ref-loci", action="store_true",
+                        help="also keep a sample of the loci where the truth equals the reference (see "
+                             "dataset.py --keep-hom-ref-loci)")
     parser.add_argument("--samples", nargs="+", default=None,
                         help="subset (default: all %d)" % len(SAMPLES))
     parser.add_argument("--max-alleles-per-sample", type=int, default=2_000_000,
@@ -413,7 +522,7 @@ def main():
     wanted = args.samples or SAMPLES
     print("==== build %d held-out sample parquet(s) ====" % len(wanted), flush=True)
     for s in wanted:
-        build_sample(s, args.data_dir, args.force)
+        build_sample(s, args.data_dir, args.force, keep_hom_ref_loci=args.keep_hom_ref_loci)
     if args.build_only:
         return
 

@@ -369,6 +369,203 @@ class LabelAndFilterTest(unittest.TestCase):
         self.assertEqual(len(kept), 2)
 
 
+class GenotypeLevelLabelTest(unittest.TestCase):
+    """``dir_code_genotype``: a homozygous call is OK only if it is OK against both truth alleles."""
+
+    def _call(self, eh, true_short, true_long, n_alleles=2, n_distinct=1, motif_size=3):
+        rows = [{"locus_id": "1-9-10-A", "is_negative_locus": False, "eh": eh, "true": true_short,
+                 "motif_size": motif_size, "genotyping_branch": "quick", "spanning_at_called": 5,
+                 "allele_rank": 0, "n_alleles": n_alleles, "n_distinct_alleles": n_distinct,
+                 "has_own_quality_metrics": True}]
+        if n_alleles == 2:
+            rows.append(dict(rows[0], allele_rank=1, true=true_long, has_own_quality_metrics=n_distinct == 2))
+        kept, _ = dataset.label_and_filter(pd.DataFrame(rows))
+        return kept
+
+    def test_reference_call_that_misses_an_expansion_is_too_short(self):
+        kept = self._call(eh=10.0, true_short=10.0, true_long=15.0)
+        self.assertEqual(len(kept), 1)  # the rank-1 twin is still dropped
+        self.assertEqual(kept["dir_code"].iloc[0], features.OK)  # per allele: matched to the short truth
+        self.assertEqual(kept["true_other_allele"].iloc[0], 15.0)
+        self.assertEqual(kept["dir_code_genotype"].iloc[0], features.TOO_SHORT)
+
+    def test_reference_call_that_misses_a_contraction_stays_too_long(self):
+        kept = self._call(eh=10.0, true_short=5.0, true_long=10.0)
+        self.assertEqual(kept["dir_code"].iloc[0], features.TOO_LONG)
+        self.assertEqual(kept["dir_code_genotype"].iloc[0], features.TOO_LONG)
+
+    def test_call_right_for_both_alleles_is_ok(self):
+        kept = self._call(eh=10.0, true_short=10.0, true_long=10.0)
+        self.assertEqual(kept["dir_code_genotype"].iloc[0], features.OK)
+
+    def test_the_larger_miss_wins_and_a_tie_goes_to_the_longer_allele(self):
+        larger_long_miss = self._call(eh=10.0, true_short=8.0, true_long=15.0)
+        self.assertEqual(larger_long_miss["dir_code_genotype"].iloc[0], features.TOO_SHORT)
+        larger_short_miss = self._call(eh=10.0, true_short=4.0, true_long=12.0)
+        self.assertEqual(larger_short_miss["dir_code_genotype"].iloc[0], features.TOO_LONG)
+        tie = self._call(eh=10.0, true_short=7.0, true_long=13.0)
+        self.assertEqual(tie["dir_code_genotype"].iloc[0], features.TOO_SHORT)
+
+    def test_when_both_alleles_are_missed_the_larger_miss_in_repeats_wins(self):
+        # HG002 10x, locus 2-59086030-59086114 (36 bp motif): call 9/9, truth 5/14. Tolerances are 2 repeats
+        # (180 bp) and 4 repeats (504 bp); the misses are 4 and 5 repeats, so the long allele's miss is larger
+        # although it is smaller once each tolerance is subtracted.
+        kept = self._call(eh=9.0, true_short=5.0, true_long=14.0, motif_size=36)
+        self.assertEqual(kept["dir_code"].iloc[0], features.TOO_LONG)
+        self.assertEqual(kept["dir_code_genotype"].iloc[0], features.TOO_SHORT)
+
+    def test_tolerance_comes_from_each_truth_allele_size(self):
+        # 20 repeats x 3 bp = 60 bp -> +-1 repeat; the 10-repeat (30 bp) short allele needs an exact match.
+        kept = self._call(eh=10.0, true_short=10.0, true_long=21.0)
+        self.assertEqual(kept["dir_code_genotype"].iloc[0], features.TOO_SHORT)
+        within = self._call(eh=20.0, true_short=20.0, true_long=21.0)
+        self.assertEqual(within["dir_code_genotype"].iloc[0], features.OK)
+
+    def test_heterozygous_and_one_allele_calls_keep_their_per_allele_label(self):
+        het = self._call(eh=10.0, true_short=10.0, true_long=15.0, n_distinct=2)
+        self.assertEqual(list(het["dir_code_genotype"]), list(het["dir_code"]))
+        self.assertTrue(het["true_other_allele"].isna().all())
+        one_allele = self._call(eh=10.0, true_short=15.0, true_long=15.0, n_alleles=1)
+        self.assertEqual(list(one_allele["dir_code_genotype"]), [features.TOO_SHORT])
+        self.assertTrue(one_allele["true_other_allele"].isna().all())
+
+    def test_two_sources_in_one_frame_are_refused(self):
+        rows = [{"locus_id": "1-9-10-A", "is_negative_locus": False, "eh": 10.0, "true": 10.0, "motif_size": 3,
+                 "genotyping_branch": "quick", "spanning_at_called": 5, "allele_rank": rank, "n_alleles": 2,
+                 "n_distinct_alleles": 1, "has_own_quality_metrics": rank == 0} for rank in (0, 1, 0, 1)]
+        with self.assertRaises(ValueError):
+            dataset.label_and_filter(pd.DataFrame(rows))
+
+
+class KeepHomRefLociTest(unittest.TestCase):
+    """``extract_rows_and_join_truth(..., keep_hom_ref_loci=True)`` and its helpers."""
+
+    TRUTH_DF = ExtractRowsAndJoinTruthTest.TRUTH_DF
+    TRUTH_BY_LOCUS = pd.DataFrame({"reference_repeats": [8.0, 4.0, 6.0], "is_hom_ref": [False, True, True],
+                                   "purity": [1.0, 1.0, 0.9]},
+                                  index=pd.Index(["1-1-2-A", "1-5-6-A", "1-7-8-A"], name="LocusId"))
+
+    @staticmethod
+    def _row(locus_id, rank, eh, branch="quick", motif_size=3):
+        return {"locus_id": locus_id, "allele_rank": rank, "eh": eh, "motif_size": motif_size,
+                "genotyping_branch": branch}
+
+    def _run(self, rows, hash_fractions, keep_hom_ref_loci=True, row_sample_id="HG002_10x"):
+        individuals = []
+
+        def hash_fraction(locus, individual):
+            individuals.append(individual)
+            return hash_fractions[locus]
+
+        with mock.patch.object(dataset.eh_json, "extract_rows", return_value=rows), \
+             mock.patch.object(dataset.eh_json, "typical_read_length_in_file", return_value=150), \
+             mock.patch.object(dataset, "_load_truth_from_genotypes_tsv",
+                               return_value=(self.TRUTH_DF.copy(), {"1-1-2-A", "1-5-6-A", "1-7-8-A"})), \
+             mock.patch.object(dataset, "_load_reference_repeats_and_hom_ref_truth",
+                               return_value=self.TRUTH_BY_LOCUS) as load_hom_ref, \
+             mock.patch.object(dataset, "_locus_hash_fraction", side_effect=hash_fraction), \
+             mock.patch.object(dataset, "_assert_catalog_agreement"):
+            merged = dataset.extract_rows_and_join_truth(["a.json.gz"], "t.tsv.gz", "t.bed.gz", row_sample_id,
+                                                         "unit", keep_hom_ref_loci=keep_hom_ref_loci)
+            self.assertEqual(load_hom_ref.called, keep_hom_ref_loci)
+            # Loci are sampled per individual: HG002_10x's coverage suffix is dropped.
+            self.assertEqual(set(individuals), {"HG002"} if individuals else set())
+            return merged
+
+    def test_keeps_sampled_hom_ref_loci_whole_with_their_truth(self):
+        rows = [self._row("chr1-1-2-A", 0, 10.0), self._row("chr1-1-2-A", 1, 20.0),   # variant locus
+                self._row("chr1-5-6-A", 0, 4.0), self._row("chr1-5-6-A", 1, 4.0),     # hom-ref, sampled
+                self._row("chr1-7-8-A", 0, 6.0), self._row("chr1-7-8-A", 1, 6.0),     # hom-ref, not sampled
+                self._row("chr1-9-9-A", 0, 5.0)]                                       # no truth
+        merged = self._run(rows, {"1-1-2-A": 0.5, "1-5-6-A": 0.01, "1-7-8-A": 0.99})
+        self.assertEqual(list(merged["locus_id"]), ["1-1-2-A", "1-1-2-A", "1-5-6-A", "1-5-6-A"])
+        self.assertEqual(list(merged["true"]), [9.0, 21.0, 4.0, 4.0])
+        self.assertEqual(list(merged["purity"]), [1.0, 1.0, 1.0, 1.0])
+        self.assertEqual(list(merged["variant_locus"]), [True, True, False, False])
+        self.assertEqual(list(merged["truth_reference_repeats"]), [8.0, 8.0, 4.0, 4.0])
+        # 20 repeats x 3 bp = 60 bp puts the variant locus in the 60-100 bp bin (rate 0.5); the hom-ref locus
+        # (12 bp calls) is in the lowest bin (0.02).
+        self.assertEqual(list(merged["all_loci_keep_probability"]), [0.5, 0.5, 0.02, 0.02])
+        self.assertEqual(list(merged["in_all_loci_pool"]), [False, False, True, True])
+        self.assertEqual(list(merged["all_loci_representative"]), [False, False, True, True])
+
+    def test_default_extraction_is_unchanged(self):
+        rows = [self._row("chr1-1-2-A", 0, 10.0), self._row("chr1-1-2-A", 1, 20.0),
+                self._row("chr1-5-6-A", 0, 4.0)]
+        merged = self._run(rows, {}, keep_hom_ref_loci=False)
+        self.assertEqual(list(merged["locus_id"]), ["1-1-2-A", "1-1-2-A"])
+        self.assertNotIn("variant_locus", merged.columns)
+
+    def test_keep_rates_follow_the_called_size_and_the_branch(self):
+        rates = dataset._locus_keep_and_representative_rates
+        quick = dataset.HOM_REF_KEEP_RATE_BY_CALLED_SIZE_BIN[dataset.eh_json.BRANCH_QUICK]
+        self.assertEqual(rates([self._row("x", 0, 5.0)]), (quick[0], quick[0]))           # 15 bp
+        self.assertEqual(rates([self._row("x", 0, 5.0), self._row("x", 1, 40.0)]),
+                         (quick[4], quick[0]))                                            # 120 bp allele wins
+        self.assertEqual(rates([self._row("x", 0, None), self._row("x", 1, None)]), (0.0, 0.0))  # no-call locus
+        self.assertEqual(rates([self._row("x", 0, None, branch=dataset.eh_json.BRANCH_FULL)]), (0.0, 0.0))
+        self.assertEqual(rates([self._row("x", 0, 5.0, branch=dataset.eh_json.BRANCH_FULL)]), (1.0, 1.0))
+        for branch_rates in dataset.HOM_REF_KEEP_RATE_BY_CALLED_SIZE_BIN.values():
+            self.assertEqual(list(branch_rates), sorted(branch_rates))  # the lowest bin's rate is the lowest
+
+    def test_locus_hash_fraction_is_fixed_in_range_and_differs_between_individuals(self):
+        loci = ["1-%d-%d-CAG" % (i, i + 30) for i in range(1000)]
+        values = [dataset._locus_hash_fraction(locus, "HG002") for locus in loci]
+        self.assertEqual(values[:3], [dataset._locus_hash_fraction(locus, "HG002") for locus in loci[:3]])
+        self.assertTrue(all(0.0 <= v < 1.0 for v in values))
+        self.assertAlmostEqual(np.mean(values), 0.5, delta=0.05)
+        other = [dataset._locus_hash_fraction(locus, "HG00738") for locus in loci]
+        kept_by_both = sum(a < 0.1 and b < 0.1 for a, b in zip(values, other))
+        self.assertLess(kept_by_both, 30)  # about 10 expected for independent 10% samples of 1,000 loci
+
+    def test_no_call_loci_are_left_out_of_the_all_loci_sample(self):
+        rows = [self._row("chr1-1-2-A", 0, None, branch="full"), self._row("chr1-1-2-A", 1, None, branch="full"),
+                self._row("chr1-5-6-A", 0, None, branch="full"), self._row("chr1-5-6-A", 1, None, branch="full")]
+        merged = self._run(rows, {"1-1-2-A": 0.0, "1-5-6-A": 0.0})
+        # The variant no-call locus stays for the variant-only views; the hom-ref one is not kept.
+        self.assertEqual(list(merged["locus_id"]), ["1-1-2-A", "1-1-2-A"])
+        self.assertEqual(list(merged["all_loci_keep_probability"]), [0.0, 0.0])
+        self.assertFalse(merged["in_all_loci_pool"].any() or merged["all_loci_representative"].any())
+
+    def test_keep_hom_ref_loci_needs_a_sample_id(self):
+        with self.assertRaises(ValueError):
+            self._run([self._row("chr1-1-2-A", 0, 10.0)], {"1-1-2-A": 0.5}, row_sample_id=None)
+
+    def test_reference_repeats_and_hom_ref_truth_cover_only_truth_loci(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "truth.tsv.gz")
+            _write_truth_tsv_and_bed(path, [
+                {"LocusId": "chr1-1-2-A", "Chrom": "chr1", "NumRepeatsInReference": 5,      # hom-ref
+                 "NumRepeatsShortAllele": 5, "NumRepeatsLongAllele": 5,
+                 "RepeatPurityShortAllele": 0.9, "RepeatPurityLongAllele": 0.9},
+                {"LocusId": "1-3-4-A", "Chrom": "chr1", "NumRepeatsInReference": 5,         # variant
+                 "NumRepeatsShortAllele": 5, "NumRepeatsLongAllele": 9,
+                 "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 1.0},
+                {"LocusId": "1-5-6-A", "Chrom": "chr1", "NumRepeatsInReference": 2,         # not a truth locus
+                 "NumRepeatsShortAllele": 2, "NumRepeatsLongAllele": 2,
+                 "RepeatPurityShortAllele": 1.0, "RepeatPurityLongAllele": 1.0},
+            ])
+            out = dataset._load_reference_repeats_and_hom_ref_truth(path, {"1-1-2-A", "1-3-4-A"})
+        self.assertEqual(sorted(out.index), ["1-1-2-A", "1-3-4-A"])
+        self.assertEqual(list(out.loc[["1-1-2-A", "1-3-4-A"], "reference_repeats"]), [5.0, 5.0])
+        self.assertEqual(list(out.loc[["1-1-2-A", "1-3-4-A"], "is_hom_ref"]), [True, False])
+        self.assertEqual(out.at["1-1-2-A", "purity"], 0.9)
+
+    def test_variant_only_readers_and_rebuild_check(self):
+        df = pd.DataFrame({"eh": [1.0, 2.0, 3.0], "variant_locus": [True, False, True]})
+        self.assertEqual(list(dataset.variant_locus_rows(df)["eh"]), [1.0, 3.0])
+        old = df.drop(columns=["variant_locus"])
+        self.assertIs(dataset.variant_locus_rows(old), old)
+        with tempfile.TemporaryDirectory() as d:
+            with_columns, without_columns = os.path.join(d, "a.parquet"), os.path.join(d, "b.parquet")
+            df.to_parquet(with_columns)
+            old.to_parquet(without_columns)
+            self.assertTrue(dataset.lacks_all_loci_columns(without_columns, keep_hom_ref_loci=True))
+            self.assertFalse(dataset.lacks_all_loci_columns(with_columns, keep_hom_ref_loci=True))
+            self.assertFalse(dataset.lacks_all_loci_columns(without_columns, keep_hom_ref_loci=False))
+            self.assertFalse(dataset.lacks_all_loci_columns(os.path.join(d, "missing.parquet"), True))
+
+
 class LocalMd5Test(unittest.TestCase):
     def test_matches_hashlib_base64(self):
         import base64
@@ -740,6 +937,56 @@ class AssembleBranchTest(unittest.TestCase):
             dataset.assemble_branch(d, "quick", "src")  # must not raise
             self.assertFalse(os.path.exists(os.path.join(d, "parquet", "quick.parquet")))
 
+    @staticmethod
+    def _all_loci_part(path):
+        """An all-loci source: 2 representative hom-ref loci, 1 pool-only hom-ref locus, 1 variant locus in the
+        pool and 1 variant locus outside it."""
+        base = {c: 1.0 for c in features.FULL_FEATURES if c not in ("ci_asymmetry", "ci_over_eh")}
+        base.update({"has_own_quality_metrics": True, "is_negative_locus": False, "true": 10.0, "eh": 10.0,
+                     "motif_size": 3, "genotyping_branch": "quick", "spanning_at_called": 5,
+                     "all_loci_keep_probability": 0.5})
+        rows = [dict(base, locus_id="1-1-2-A", variant_locus=False, in_all_loci_pool=True, all_loci_representative=True),
+                dict(base, locus_id="1-3-4-A", variant_locus=False, in_all_loci_pool=True, all_loci_representative=True),
+                dict(base, locus_id="1-5-6-A", variant_locus=False, in_all_loci_pool=True, all_loci_representative=False),
+                dict(base, locus_id="1-7-8-A", variant_locus=True, in_all_loci_pool=True, all_loci_representative=False,
+                     true=12.0),
+                dict(base, locus_id="1-9-10-A", variant_locus=True, in_all_loci_pool=False,
+                     all_loci_representative=False, true=12.0)]
+        pd.DataFrame(rows).to_parquet(path)
+
+    def test_all_loci_population_uses_the_representative_rows_and_the_pool(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "src"))
+            self._all_loci_part(os.path.join(d, "src", "a.parquet"))
+            dataset.assemble_branch(d, "quick", "src", training_population="all_loci")
+            out = pd.read_parquet(os.path.join(d, "parquet_all_loci", "quick.parquet"))
+            # Within the cap the whole pool is kept: 2 representative rows plus the 2 other pool rows; the
+            # variant locus outside the pool is left out.
+            self.assertEqual(len(out), 4)
+            self.assertEqual(int(out["representative"].sum()), 2)
+            self.assertTrue(out.loc[out["representative"], "all_loci_representative"].all())
+            self.assertTrue(out["in_all_loci_pool"].all())
+            # The variant-only recipe on the same part keeps the 2 variant-locus rows and writes data/parquet/.
+            dataset.assemble_branch(d, "quick", "src")
+            self.assertEqual(len(pd.read_parquet(os.path.join(d, "parquet", "quick.parquet"))), 2)
+
+    def test_all_loci_cap_bounds_the_representative_rows_and_tops_up_only_from_the_pool(self):
+        df = pd.DataFrame({"genotyping_regime": ["quick"] * 6, "motif_size": [3.0] * 6,
+                           "eh": [10.0, 10.0, 10.0, 10.0, 40.0, 40.0],
+                           "in_all_loci_pool": [True, True, True, True, True, False],
+                           "all_loci_representative": [True, True, True, False, False, False]})
+        out = dataset._cap_all_loci_rows_per_genotyping_regime(df, cap=2, seed=1)
+        self.assertEqual(int(out["representative"].sum()), 2)            # 3 representative rows, capped to 2
+        self.assertTrue(out["in_all_loci_pool"].all())                   # never the row outside the pool
+        self.assertIn(40.0, list(out.loc[~out["representative"], "eh"]))  # the rare 120 bp cell is topped up
+
+    def test_all_loci_population_refuses_variant_only_parts(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "src"))
+            write_contract_parquet(os.path.join(d, "src", "old.parquet"))
+            with self.assertRaises(RuntimeError):
+                dataset.assemble_branch(d, "quick", "src", training_population="all_loci")
+
 
 class LinkPromotedHeldoutSamplesTest(unittest.TestCase):
     def test_symlinks_each_promoted_sample_once(self):
@@ -754,6 +1001,25 @@ class LinkPromotedHeldoutSamplesTest(unittest.TestCase):
                     self.assertTrue(os.path.islink(dst))
                 # a second pass must not re-symlink or crash on an already-existing dst
                 dataset._link_promoted_heldout_samples(d, force=False)
+
+    def test_keep_hom_ref_loci_reaches_every_promoted_sample(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src.parquet")
+            pd.DataFrame({"eh": [1.0]}).to_parquet(src)
+            with mock.patch.object(heldout, "build_sample", return_value=src) as m:
+                dataset._link_promoted_heldout_samples(d, force=False, keep_hom_ref_loci=True)
+            self.assertEqual(len(m.call_args_list), len(dataset.PROMOTED_HELDOUT_SAMPLES))
+            self.assertTrue(all(c.kwargs["keep_hom_ref_loci"] for c in m.call_args_list))
+
+    def test_main_passes_keep_hom_ref_loci_to_combos_and_promoted_samples(self):
+        with mock.patch.object(dataset, "build_combo") as build_combo, \
+             mock.patch.object(dataset, "_link_promoted_heldout_samples") as link, \
+             mock.patch.object(dataset, "assemble_branch"), \
+             mock.patch("sys.argv", ["dataset.py", "--keep-hom-ref-loci"]):
+            dataset.main()
+        self.assertEqual(len(build_combo.call_args_list), len(dataset.COMBOS))
+        self.assertTrue(all(c.kwargs["keep_hom_ref_loci"] for c in build_combo.call_args_list))
+        self.assertTrue(link.call_args.kwargs["keep_hom_ref_loci"])
 
 
 class PromotedHeldoutSamplesTest(unittest.TestCase):
@@ -785,6 +1051,23 @@ class AssertParquetsUpToDateTest(unittest.TestCase):
             self._setup(d)  # upstream present, but no parquet written
             with self.assertRaises(SystemExit):
                 dataset.assert_parquets_up_to_date(d)
+
+    def test_the_suggested_command_rebuilds_the_checked_population_and_keeps_the_hom_ref_loci(self):
+        # No --force (it would rebuild every per-source parquet), and --keep-hom-ref-loci wherever a rebuild
+        # without it would replace per-source parquets that keep the hom-ref loci with variant-only ones.
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "PROMOTED_HELDOUT_SAMPLES", ()):
+            self._setup(d)
+            self.assertEqual(dataset.command_that_builds_branch_parquets(d, "parquet"),
+                             "`python3 dataset.py --data-dir %s`" % d)
+            with self.assertRaises(SystemExit) as raised:
+                dataset.assert_parquets_up_to_date(d, parquet_subdir="parquet_all_loci")
+            self.assertIn("`python3 dataset.py --data-dir %s --keep-hom-ref-loci --training-population all_loci`" % d,
+                          str(raised.exception))
+            part = os.path.join(d, dataset.SOURCE_SUBDIR, "HG002_31x.parquet")
+            write_contract_parquet(part).assign(variant_locus=True).to_parquet(part, index=False)
+            self.assertEqual(dataset.command_that_builds_branch_parquets(d, "parquet"),
+                             "`python3 dataset.py --data-dir %s --keep-hom-ref-loci`" % d)
 
     def test_stale_parquet_exits(self):
         with tempfile.TemporaryDirectory() as d, \
@@ -854,7 +1137,8 @@ class DePromotedSymlinkCleanupTest(unittest.TestCase):
             import heldout as heldout_module
             with mock.patch.object(dataset, "PROMOTED_HELDOUT_SAMPLES", ("KEPT",)), \
                  mock.patch.object(heldout_module, "build_sample",
-                                   side_effect=lambda s, dd, force: os.path.join(src_dir, "%s.parquet" % s)):
+                                   side_effect=lambda s, dd, force, keep_hom_ref_loci:
+                                   os.path.join(src_dir, "%s.parquet" % s)):
                 dataset._link_promoted_heldout_samples(os.path.join(d, "data"), force=False)
             remaining = sorted(os.path.basename(p) for p in glob.glob(os.path.join(subdir, "*.parquet")))
             self.assertEqual(remaining, ["HG002_31x.parquet", "KEPT.parquet"])
@@ -1051,6 +1335,15 @@ class AssertPartsShareFeatureContractTest(unittest.TestCase):
             self.assertIn("old.parquet", str(ctx.exception))
             self.assertIn("coverage", str(ctx.exception))
             self.assertNotIn("new.parquet", str(ctx.exception))
+
+
+class AllLociPopulationNeedsHomRefLociTest(unittest.TestCase):
+    def test_refused_before_any_per_source_parquet_is_built(self):
+        argv = ["dataset.py", "--data-dir", "D", "--training-population", "all_loci"]
+        with mock.patch("sys.argv", argv), mock.patch.object(dataset, "build_combo") as build_combo, \
+             mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            dataset.main()
+        build_combo.assert_not_called()
 
 
 if __name__ == "__main__":

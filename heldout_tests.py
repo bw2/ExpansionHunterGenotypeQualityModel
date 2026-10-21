@@ -258,6 +258,18 @@ class AssertParquetsCarryContractTest(unittest.TestCase):
             self.assertIn("heldout.py --build-only --force --samples HG00438", msg)
             self.assertIn("dataset.py --force", msg)
 
+    def test_the_command_keeps_the_hom_ref_loci_of_a_parquet_built_with_them(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "real_43"))
+            os.makedirs(os.path.join(d, "real_quick"))
+            sample = os.path.join(d, "real_43", "HG00438.parquet")
+            combo = os.path.join(d, "real_quick", "HG002_31x.parquet")
+            for path in (sample, combo):
+                dataset_tests.write_contract_parquet(path).assign(variant_locus=True).to_parquet(path, index=False)
+            self.assertEqual(dataset.rebuild_command_for(sample),
+                             "python3 heldout.py --build-only --force --keep-hom-ref-loci --samples HG00438")
+            self.assertEqual(dataset.rebuild_command_for(combo), "python3 dataset.py --force --keep-hom-ref-loci")
+
 
 class RunEvalTest(unittest.TestCase):
     def test_writes_metrics_and_violin_npz(self):
@@ -318,6 +330,64 @@ class RunEvalTest(unittest.TestCase):
                 heldout.run_eval([parquet_path], "older_model.json.gz", out_json, max_alleles=0)
             self.assertEqual(sorted(map(tuple, seen)),
                              sorted([tuple(older["quick"]), tuple(older["full"]), tuple(older["full"])]))
+
+
+class AllLociEarlyWarningTest(unittest.TestCase):
+    """heldout.all_loci_early_warning on hand-made all-loci parquets; the model's pOk is read from ``depth``."""
+
+    @staticmethod
+    def _locus_rows(locus_id, calls, truths, reference, pok, representative=True):
+        rows = []
+        for rank, (call, truth) in enumerate(zip(calls, truths)):
+            rows.append(_raw_feature_row(
+                locus_id=locus_id, allele_rank=rank, eh=call, true=truth, truth_reference_repeats=reference,
+                motif_size=3, depth=pok, genotyping_branch=features.BRANCH_QUICK, n_alleles=len(calls),
+                has_own_quality_metrics=rank == 0 or calls[rank] != calls[0], variant_locus=truth != reference,
+                in_all_loci_pool=representative, all_loci_representative=representative,
+                all_loci_keep_probability=0.02))
+        return rows
+
+    def _run(self, parquets):
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for name, rows in parquets.items():
+                paths.append(os.path.join(d, "%s.parquet" % name))
+                pd.DataFrame(rows).to_parquet(paths[-1])
+            names = {features.BRANCH_QUICK: features.QUICK_FEATURES, features.BRANCH_FULL: features.FULL_FEATURES}
+            with mock.patch.object(M, "load", return_value={"genotyping_regimes": {"quick": {}}}), \
+                 mock.patch.object(M, "compile_genotyping_regime", return_value=None), \
+                 mock.patch.object(M, "feature_names_of", return_value=names), \
+                 mock.patch.object(M, "predict_proba_json", side_effect=lambda comp, X: np.column_stack(
+                     [X["depth"], 1 - X["depth"], np.zeros(len(X))])):
+                return heldout.all_loci_early_warning(paths, "model.json.gz")
+
+    def test_per_locus_misses_auc_and_sex(self):
+        rows = (self._locus_rows("1-10-40-CAG", [10, 10], [10, 15], 10, pok=0.2)      # hidden expansion: a miss
+                + self._locus_rows("1-50-80-CAG", [10, 10], [10, 10], 10, pok=0.9)    # right
+                + self._locus_rows("1-90-120-CAG", [10, 20], [10, 20], 10, pok=0.3)   # not a reference call
+                + self._locus_rows("1-130-160-CAG", [10, 10], [10, 15], 10, pok=0.1, representative=False)
+                + self._locus_rows("X-10-40-CAG", [10], [10], 10, pok=0.8)            # one allele on chrX
+                + self._locus_rows("X-50-80-CAG", [10], [10], 10, pok=0.8))
+        result = self._run({"male_sample": rows})
+        sample = result["per_sample"]["male_sample"]
+        self.assertEqual(sample["sex"], "male")
+        self.assertEqual(sample["n_reference_calls"], 4)   # the het call and the non-representative locus are out
+        self.assertEqual(sample["n_misses"], 1)
+        self.assertEqual(sample["auc_miss"], 1.0)          # the miss has the lowest pOk
+        self.assertAlmostEqual(sample["share_below_half"], 2 / 5)
+        self.assertEqual(set(result["recall"]), {"all", "chrX/chrY left out", "female", "male"})
+
+    def test_variant_only_parquets_are_skipped(self):
+        self.assertIsNone(self._run({"old": [_raw_feature_row(eh=10.0, true=12.0)]}))
+
+    def test_tie_aware_recall_and_auc(self):
+        suspicion = np.array([0.9, 0.5, 0.5, 0.5, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0])
+        is_miss = np.array([True, True, False, False, False, False, False, False, False, False])
+        # 2 of 10 flagged: the 0.9 call, then 1 of the 3 tied at 0.5 (a third of a miss on average).
+        self.assertAlmostEqual(heldout._tie_aware_recall(suspicion, is_miss, 0.2), (1 + 1 / 3) / 2)
+        self.assertEqual(heldout._roc_auc(np.array([0.9, 0.1]), np.array([True, False])), 1.0)
+        self.assertEqual(heldout._roc_auc(np.array([0.5, 0.5]), np.array([True, False])), 0.5)
+        self.assertTrue(np.isnan(heldout._roc_auc(np.array([0.5]), np.array([True]))))
 
 
 if __name__ == "__main__":

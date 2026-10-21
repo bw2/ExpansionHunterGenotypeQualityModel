@@ -11,7 +11,9 @@ counts only gated MAE, as a per-sample paired difference with a bootstrap interv
 decision accuracy, 3-class direction accuracy, the median and the net-helped count are printed as
 context. The result is also given without ``heldout.FASTPATH_DIAGNOSIS_SAMPLES``, which were used during
 model development. The evaluated population is variant loci only (truth differs from the reference)
-and one row per emitted quality-metric entry; the printout says so.
+and one row per emitted quality-metric entry; the printout says so. Held-out parquets built with
+``--keep-hom-ref-loci`` also get the all-loci early-warning section (``heldout.all_loci_early_warning``),
+printed after the verdict and not counted in it.
 
 The "previous model" defaults to whichever model is deployed in the local ExpansionHunter-bw2 checkout
 (``$EXPANSIONHUNTER_BW2_REPO/ehunter/data/genotype_quality_model_*.json.gz`` -- i.e. the "should we
@@ -132,9 +134,10 @@ def compare(new_model, prev_model, data_dir, max_alleles):
         prev = heldout.run_eval(paths, prev_model, os.path.join(td, "prev.json"), max_alleles)
         new = heldout.run_eval(paths, new_model, os.path.join(td, "new.json"), max_alleles)
 
-    print("  scope: alleles at loci whose truth genotype differs from the reference (truth hom-ref loci are "
-          "not built into the held-out parquets), and one row per emitted quality-metric entry (the second "
-          "copy of a homozygous call is not scored, so a missed heterozygous allele is not counted).")
+    print("  scope: alleles at loci whose truth genotype differs from the reference (run_eval leaves out truth "
+          "hom-ref loci; the all-loci early-warning section below scores them), and one row per emitted "
+          "quality-metric entry (the second copy of a homozygous call is not scored, so a missed heterozygous "
+          "allele is not counted).")
     print("  verdict: per genotyping regime and motif stratum, the per-sample paired difference in gated MAE "
           "(new - prev) with a %d-resample bootstrap 95%% interval over samples; a stratum is won only when "
           "the interval excludes 0. The other rows are context and are not counted." % BOOTSTRAP_RESAMPLES)
@@ -178,7 +181,27 @@ def compare(new_model, prev_model, data_dir, max_alleles):
     print("\n  VERDICT: %s  (strata won -- new: %d, prev: %d, no clear difference: %d, too few samples "
           "(< %d) to judge: %d)" % (verdict, wins["new"], wins["prev"], wins["tie"], MIN_SAMPLES_FOR_VERDICT,
                                     wins["too few samples"]))
+    _print_all_loci_early_warning(paths, prev_model, new_model)
     print("=" * 108)
+
+
+def _print_all_loci_early_warning(paths, prev_model, new_model):
+    """Prints ``heldout.all_loci_early_warning`` for both models, when the held-out parquets have hom-ref loci."""
+    prev, new = (heldout.all_loci_early_warning(paths, p) for p in (prev_model, new_model))
+    if prev is None:
+        print("\n  all-loci early warning: skipped (no held-out parquet was built with --keep-hom-ref-loci)")
+        return
+    print("\n  ALL-LOCI EARLY WARNING (fast path, %d samples with hom-ref loci; a miss is a reference-length call "
+          "whose truth is more than 2 repeats from the reference)" % len(prev["per_sample"]))
+    print("     %-44s prev %-9.3f new %-9.3f" % ("ROC-AUC of 1 - pOk for misses, mean over samples",
+                                                 prev["auc_miss_mean"], new["auc_miss_mean"]))
+    print("     %-44s prev %-9.3f new %-9.3f" % ("share of fast-path calls below pOk 0.5",
+                                                 prev["share_below_half_mean"], new["share_below_half_mean"]))
+    for subset_name in prev["recall"]:
+        for rate in heldout.EARLY_WARNING_FLAG_RATES:
+            print("     %-44s prev %-9.3f new %-9.3f"
+                  % ("misses in the lowest %d%% of pOk (%s)" % (round(100 * rate), subset_name),
+                     prev["recall"][subset_name][rate], new["recall"][subset_name][rate]))
 
 
 def main():

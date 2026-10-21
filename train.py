@@ -42,11 +42,17 @@ def _reject_nonfinite(tok):
     raise ValueError("model JSON contains non-finite token %r (invalid standard JSON)" % tok)
 
 
-def _default_out():
-    """Returns the default dated output path (today's date)."""
+def _default_out(training_population="variant_loci", direction_label="dir_code"):
+    """Returns the default dated output path (today's date).
+
+    A non-default training population or direction label goes into the name, before the date (which
+    ``compare_models._model_sort_key`` reads), so such a model never overwrites today's default one.
+    """
     today = datetime.date.today().strftime("%Y%m%d")
+    choices = "".join("_" + choice for choice, default in ((training_population, "variant_loci"),
+                                                           (direction_label, "dir_code")) if choice != default)
     return os.path.join(HERE, "model",
-                        "genotype_quality_model_from_HG002_and_CHM1_CHM13.%s.json.gz" % today)
+                        "genotype_quality_model_from_HG002_and_CHM1_CHM13%s.%s.json.gz" % (choices, today))
 
 
 # People who are never held out whole: HG002 is the only source at low coverage (10x/20x) and, with
@@ -205,11 +211,20 @@ def fit_heads(df, train_pool, calib_rows, fold_groups, branch, train_cap, iterat
     return qreg, dmodel, names, Xca
 
 
-def fit_genotyping_regime(genotyping_regime, data_dir, train_cap):
+# Direction labels the direction head can be trained on (columns that dataset.label_and_filter adds):
+# the per-allele label, and the label that judges a homozygous call against both truth alleles.
+DIRECTION_LABEL_COLUMNS = ("dir_code", "dir_code_genotype")
+
+
+def fit_genotyping_regime(genotyping_regime, data_dir, train_cap, parquet_subdir="parquet",
+                          direction_label="dir_code"):
     """Fits the q-median + direction heads for one genotyping_regime on its full real-data pool.
 
     Holds out the calibration rows, mostly whole people (``_calib_mask``), then fits with ``fit_heads``
-    on every chromosome at the regime's ``ITERATIONS_BY_REGIME``.
+    on every chromosome at the regime's ``ITERATIONS_BY_REGIME``. Reads
+    ``data_dir/<parquet_subdir>/<branch>.parquet`` (``dataset.BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION``) and
+    trains the direction head on ``direction_label`` (one of ``DIRECTION_LABEL_COLUMNS``), which also decides
+    which training rows the out-of-fold gate fires on for the q-median head.
 
     Returns:
         ``(qreg, dmodel, branch, feature_names, X_check)`` where ``X_check`` is a
@@ -217,11 +232,16 @@ def fit_genotyping_regime(genotyping_regime, data_dir, train_cap):
     """
     branch = features.GENOTYPING_REGIME_BRANCH[genotyping_regime]
     src = "quick" if genotyping_regime == features.GENOTYPING_REGIME_QUICK else "full"
-    parquet = os.path.join(data_dir, "parquet", "%s.parquet" % src)
+    parquet = os.path.join(data_dir, parquet_subdir, "%s.parquet" % src)
     need = (set(features.FULL_FEATURES) | set(features.ENGINEERED_RAW_INPUTS)
-            | {"t", "dir_code", "chrom", "genotyping_regime", "individual", "representative"})
+            | {"t", direction_label, "chrom", "genotyping_regime", "individual", "representative"})
     cols = [c for c in pq.ParquetFile(parquet).schema.names if c in need]
+    if direction_label not in cols:
+        raise SystemExit("ERROR: %s has no %s column; re-assemble it with %s" % (
+            parquet, direction_label, dataset.command_that_builds_branch_parquets(data_dir, parquet_subdir)))
     df = pd.read_parquet(parquet, columns=cols)
+    # fit_heads trains on "dir_code"; with the genotype-level label, that column holds it.
+    df = df.rename(columns={direction_label: "dir_code"})
     df = df[df["genotyping_regime"] == genotyping_regime]
     print("  [%s] pool rows=%d" % (genotyping_regime, len(df)), flush=True)
 
@@ -252,20 +272,30 @@ def fit_genotyping_regime(genotyping_regime, data_dir, train_cap):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default=os.path.join(HERE, "data"))
-    parser.add_argument("--out", default=_default_out())
+    parser.add_argument("--out", help="default: model/genotype_quality_model_from_HG002_and_CHM1_CHM13.<today>.json.gz, "
+                                      "with any non-default --training-population / --direction-label before the date")
     parser.add_argument("--train-cap", type=int, default=1_000_000,
                         help="max train rows per genotyping_regime fit (0 = no cap)")
+    parser.add_argument("--training-population", choices=sorted(dataset.BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION),
+                        default="variant_loci",
+                        help="which assembled branch parquets to train on (dataset.py --training-population)")
+    parser.add_argument("--direction-label", choices=DIRECTION_LABEL_COLUMNS, default="dir_code",
+                        help="dir_code: per-allele label (today's); dir_code_genotype: a homozygous call is OK only "
+                             "if it is OK against both truth alleles")
     args = parser.parse_args()
+    args.out = args.out or _default_out(args.training_population, args.direction_label)
+    parquet_subdir = dataset.BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION[args.training_population]
 
     # Refuse to train on parquets that are missing or older than their upstream JSON/TSV sources.
-    dataset.assert_parquets_up_to_date(args.data_dir)
+    dataset.assert_parquets_up_to_date(args.data_dir, parquet_subdir=parquet_subdir)
 
     genotyping_regimes_json = {}
     feat_names = {}
     for genotyping_regime in features.GENOTYPING_REGIMES:
         print("==== %s ====" % genotyping_regime, flush=True)
-        qreg, dmodel, branch, names, X_check = fit_genotyping_regime(genotyping_regime, args.data_dir,
-                                                          args.train_cap or None)
+        qreg, dmodel, branch, names, X_check = fit_genotyping_regime(
+            genotyping_regime, args.data_dir, args.train_cap or None, parquet_subdir=parquet_subdir,
+            direction_label=args.direction_label)
         feat_names[branch] = names
         genotyping_regimes_json[genotyping_regime] = M.serialize_genotyping_regime(qreg, dmodel)
         M.verify_genotyping_regime(genotyping_regime, qreg, dmodel, genotyping_regimes_json[genotyping_regime], X_check)

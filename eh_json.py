@@ -39,6 +39,7 @@ _REGION_RE = re.compile(r"^([^:]+):(\d+)-(\d+)$")
 # names are leaf names. Source of truth for the field names is ``extract_variant_rows`` below.
 EH_OUTPUT_FIELDS = [
     ("Coverage", "Per-locus read depth over the locus's two reference flanks."),
+    ("FragmentLength", "Per-locus fragment length estimate (stored as fragment_length; not a model input)."),
     ("RepeatUnit", "Per-variant: the repeat motif; its length is motif_size."),
     ("ReferenceRegion", "Per-variant: the reference repeat interval; gives ref_size_bp and num_repeats_in_reference."),
     ("QuickGenotype", "Per-variant: whether EH's quick genotyping path made the call; selects the quick bucket."),
@@ -142,6 +143,28 @@ def parse_reference_region(s):
     return (m.group(1), int(m.group(2)), int(m.group(3)))
 
 
+def naive_spanning_mode(spanning):
+    """``(size, n_reads)`` with the most spanning reads at the locus, or ``(None, 0)`` without spanning reads.
+
+    Sizes seen in only 1 read are dropped first when any size has 2 or more; ties go to the first listed size.
+    The same definition as ``original/eh_json_features.py`` (``_trim_singletons`` then ``_densest``), stored for
+    later experiments (ALL_LOCI_AND_RELATIVE_TOLERANCE_RETRAIN_PLAN.md step 1 item 4), not a model input.
+    """
+    multi_read_sizes = [(size, n) for size, n in spanning if n >= 2]
+    candidates = multi_read_sizes or spanning
+    return max(candidates, key=lambda size_and_n: size_and_n[1]) if candidates else (None, 0)
+
+
+def other_allele_call(genotype, rank):
+    """The other allele's call for allele ``rank``: the other copy of a two-allele call, the nearest-sized other
+    allele when there are more than 2, and None for a one-allele call (``original/eh_json_features._sister_eh``)."""
+    if len(genotype) <= 1:
+        return None
+    if len(genotype) == 2:
+        return genotype[1 - rank]
+    return min((genotype[j] for j in range(len(genotype)) if j != rank), key=lambda a: abs(a - genotype[rank]))
+
+
 def _sum_at(counts, value):
     return sum(c for size, c in counts if size == value)
 
@@ -211,6 +234,10 @@ def _no_call_rows(locus_result, sample_id, branch, motif_size, reference_repeat_
             "left_flank_norm_depth": None,
             "right_flank_norm_depth": None,
             "inrepeat_total": None,
+            "fragment_length": locus_result.get("FragmentLength"),
+            "eh_minus_spanning_mode_naive": None,
+            "spanning_mode_naive_support": None,
+            "het_gap": None,
         }
 
 
@@ -251,11 +278,13 @@ def extract_variant_rows(variant, locus_result, sample_id):
     flanking_frac = (flanking_total / (flanking_total + spanning_total)) if flanking_total else 0.0
     # Per-locus (not per-allele) read depth, shared by every allele of every variant at the locus.
     coverage = locus_result.get("Coverage")
+    spanning_mode_size, spanning_mode_support = naive_spanning_mode(spanning)
 
     aqm_alleles = (variant.get("AlleleQualityMetrics") or {}).get("Alleles") or []
     aqm_by_number = {a.get("AlleleNumber"): a for a in aqm_alleles}
 
     for rank, eh in enumerate(genotype):
+        other_eh = other_allele_call(genotype, rank)
         ci_lo, ci_hi = cis[rank]
         ci_width = (ci_hi - ci_lo) if (ci_lo is not None and ci_hi is not None) else None
         span_at = _sum_at(spanning, eh)
@@ -301,6 +330,11 @@ def extract_variant_rows(variant, locus_result, sample_id):
             "mean_deleted_bases": aqm.get("MeanDeletedBasesWithinRepeats"),
             "read_repeat_purity": aqm.get("ReadRepeatPurity"),
             "genotyping_branch": branch,
+            # Stored for later experiments, not model inputs (ALL_LOCI_AND_RELATIVE_TOLERANCE_RETRAIN_PLAN.md).
+            "fragment_length": locus_result.get("FragmentLength"),
+            "eh_minus_spanning_mode_naive": (eh - spanning_mode_size) if spanning_mode_size is not None else None,
+            "spanning_mode_naive_support": spanning_mode_support,
+            "het_gap": (eh - other_eh) if other_eh is not None else None,
         }
         if branch == BRANCH_FULL:
             row["left_flank_norm_depth"] = aqm.get("LeftFlankNormalizedDepth")

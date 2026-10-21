@@ -495,12 +495,14 @@ def rebuild_command_for(path):
     The two builders write to different trees and neither can rebuild the other's output, so a
     message that names one command unconditionally sends the reader to a no-op: ``heldout.py`` writes
     only ``<data_eval_43>/real_43/<sample>.parquet``, while the training-combo parquets under
-    ``data/<SOURCE_SUBDIR>/`` come only from ``dataset.py``.
+    ``data/<SOURCE_SUBDIR>/`` come only from ``dataset.py``. A parquet built with the hom-ref loci gets
+    ``--keep-hom-ref-loci``, or the rebuild would replace it with a variant-only one.
     """
+    keep_hom_ref_loci = " --keep-hom-ref-loci" if parquet_keeps_hom_ref_loci(path) else ""
     if os.path.basename(os.path.dirname(os.path.realpath(path))) == "real_43":
-        return ("python3 heldout.py --build-only --force --samples %s"
-                % os.path.splitext(os.path.basename(path))[0])
-    return "python3 dataset.py --force"
+        return ("python3 heldout.py --build-only --force%s --samples %s"
+                % (keep_hom_ref_loci, os.path.splitext(os.path.basename(path))[0]))
+    return "python3 dataset.py --force%s" % keep_hom_ref_loci
 
 
 def parquet_contract_complaint(path):
@@ -806,8 +808,115 @@ def _join_truth(json_df, tsv_df):
                          ).drop(columns=["LocusId"])
 
 
+# Keeping loci where the sample's truth equals the reference (``keep_hom_ref_loci``; see
+# ALL_LOCI_TRAINING_PLAN.md). A hom-ref locus is kept with a probability set by its genotyping branch and the
+# called size of its alleles (bins of QUOTA_SIZE_BINS_BP), so the rare large calls survive while the ~4M short
+# fast-path calls per source are thinned. Measured on HG002 at 10x (v2.1 catalog), scored fast-path alleles per
+# bin: 3.98M / 448k / 71k / 23k / 2.3k / 0 / 0 at hom-ref loci, and ~77k scored full-genotyper alleles there; these
+# rates keep ~125k fast-path and all ~77k full-genotyper ones (parquet rows count both copies of a homozygous
+# call, so about twice that; no-call loci are not kept). The branch's lowest rate is also the rate of the
+# representative sample (``all_loci_representative``), so rates must not decrease with the bin.
+HOM_REF_KEEP_RATE_BY_CALLED_SIZE_BIN = {
+    eh_json.BRANCH_QUICK: (0.02, 0.05, 0.15, 0.5, 1.0, 1.0, 1.0),
+    eh_json.BRANCH_FULL: (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+}
+
+
+def _locus_hash_fraction(locus_id, individual):
+    """A number in [0, 1) fixed for each (individual, LocusId) pair.
+
+    Salting with the individual makes each person contribute different hom-ref loci (with the LocusId alone,
+    every source and held-out sample kept the same ~2% of the catalog), while one person's coverages
+    (HG002 at 10x, 20x and 31x) keep the same loci and every run is reproducible.
+    """
+    return zlib.crc32(("all-loci|%s|%s" % (individual, locus_id)).encode()) / 2.0 ** 32
+
+
+def _locus_keep_and_representative_rates(locus_rows):
+    """``(keep rate, representative rate)`` of one locus from its rows (see HOM_REF_KEEP_RATE_BY_CALLED_SIZE_BIN).
+
+    The keep rate is the highest rate among the locus's called alleles, so a locus with one rare large allele
+    is kept like its rarest allele. The representative rate is the branch's lowest rate, the same for every
+    locus of the branch. A locus with no called allele gets (0, 0): it has no features to train or score on,
+    and eh_json labels a no-call with the full genotyper's branch whatever path it took, so it is left out of
+    the all-loci sample whether or not it is a variant.
+    """
+    keep_rates, representative_rates = [], []
+    for row in locus_rows:
+        if row["eh"] is None or not row["motif_size"]:
+            continue
+        rates = HOM_REF_KEEP_RATE_BY_CALLED_SIZE_BIN[row["genotyping_branch"]]
+        representative_rates.append(rates[0])
+        size_bin = int(np.digitize(row["eh"] * row["motif_size"], QUOTA_SIZE_BINS_BP)) - 1
+        keep_rates.append(rates[min(max(size_bin, 0), len(rates) - 1)])
+    return (max(keep_rates), min(representative_rates)) if keep_rates else (0.0, 0.0)
+
+
+def _load_reference_repeats_and_hom_ref_truth(tsv_path, truth_locus_ids):
+    """Per truth locus (``truth_locus_ids``), its reference repeat count and, for hom-ref loci, their truth.
+
+    A DataFrame indexed by LocusId (no ``chr``) with ``reference_repeats`` (NumRepeatsInReference, the truth
+    TSV's integer count, not the JSON's reference length over the motif size, which can be fractional: the
+    count compare_eh_to_truth.py measures distances from), ``is_hom_ref`` (both truth alleles equal it), and
+    ``purity`` (RepeatPurityShortAllele, used as a hom-ref locus's truth purity, as
+    ``_load_truth_from_genotypes_tsv`` does for variant loci). A second, narrower read of the TSV, so that loader
+    and its contract stay as they are.
+    """
+    columns = ["LocusId", "NumRepeatsInReference", "NumRepeatsShortAllele", "NumRepeatsLongAllele",
+               "RepeatPurityShortAllele"]
+    df = pd.read_csv(tsv_path, sep="\t", compression="gzip", usecols=columns, dtype={"LocusId": str}
+                     ).drop_duplicates("LocusId")
+    df["LocusId"] = df["LocusId"].str.replace(r"^chr", "", regex=True)
+    df = df[df["LocusId"].isin(truth_locus_ids)]
+    # ANALYSIS_OK[imputation]: truth_locus_ids only holds loci with parseable counts, so no NaN survives here.
+    ref = pd.to_numeric(df["NumRepeatsInReference"], errors="coerce")
+    is_hom_ref = ((pd.to_numeric(df["NumRepeatsShortAllele"], errors="coerce") == ref)
+                  & (pd.to_numeric(df["NumRepeatsLongAllele"], errors="coerce") == ref))
+    # ANALYSIS_OK[imputation]: an unparseable purity stays NaN, as in _load_truth_from_genotypes_tsv.
+    purity = pd.to_numeric(df["RepeatPurityShortAllele"], errors="coerce")
+    return pd.DataFrame({"reference_repeats": ref.to_numpy(np.float64), "is_hom_ref": is_hom_ref.to_numpy(bool),
+                         "purity": purity.to_numpy(np.float64)},
+                        index=pd.Index(df["LocusId"].to_numpy(), name="LocusId"))
+
+
+def _kept_rows_of_locus(locus_id, locus_rows, variant_truth_locus_ids, truth_by_locus, individual):
+    """The rows of one locus that ``extract_rows_and_join_truth`` keeps, with the all-loci columns added.
+
+    Without ``truth_by_locus`` (the default extraction): the rows of a variant truth locus, unchanged. With it
+    (``_load_reference_repeats_and_hom_ref_truth``): also the rows of a hom-ref locus whose
+    ``_locus_hash_fraction`` (for this ``individual``) falls below its keep rate, with ``true`` (the reference
+    count) and ``purity`` from ``truth_by_locus``. Every kept row then carries ``variant_locus``,
+    ``truth_reference_repeats``, the locus's ``all_loci_keep_probability``, ``in_all_loci_pool`` (the locus would
+    be kept at that rate whether or not it is a variant, so this subset favors neither) and
+    ``all_loci_representative`` (kept at the branch's lowest rate, an equal-probability sample of all loci).
+    """
+    is_variant_locus = locus_id in variant_truth_locus_ids
+    if truth_by_locus is None:
+        return locus_rows if is_variant_locus else []
+    is_truth_locus = locus_id in truth_by_locus.index
+    if not is_variant_locus and not (is_truth_locus and truth_by_locus.at[locus_id, "is_hom_ref"]):
+        return []
+    keep_rate, representative_rate = _locus_keep_and_representative_rates(locus_rows)
+    hash_fraction = _locus_hash_fraction(locus_id, individual)
+    if not is_variant_locus and hash_fraction >= keep_rate:
+        return []
+    # A variant locus that is not a truth locus (one EH skips for the read length) has no reference count.
+    reference_repeats = truth_by_locus.at[locus_id, "reference_repeats"] if is_truth_locus else np.nan
+    for row in locus_rows:
+        row["variant_locus"] = is_variant_locus
+        row["truth_reference_repeats"] = reference_repeats
+        row["all_loci_keep_probability"] = keep_rate
+        row["in_all_loci_pool"] = hash_fraction < keep_rate
+        row["all_loci_representative"] = hash_fraction < representative_rate
+        if not is_variant_locus:
+            row["true"] = reference_repeats
+            row["purity"] = truth_by_locus.at[locus_id, "purity"]
+            row["is_negative_locus"] = False
+    return locus_rows
+
+
 def extract_rows_and_join_truth(json_paths, genotypes_tsv_path, high_confidence_bed_path, row_sample_id,
-                                source_desc):
+                                source_desc, keep_hom_ref_loci=False):
     """Extracts the EH rows at the sample's variant truth loci and joins their truth.
 
     Shared by the training combos (``build_combo``) and the held-out samples
@@ -823,24 +932,49 @@ def extract_rows_and_join_truth(json_paths, genotypes_tsv_path, high_confidence_
     ``source_desc`` (e.g. ``"HG002 31x"``) names the sample in the catalog-agreement check's message.
     Raises if no JSON row falls on a variant truth locus, which would mean the two disagree on LocusIds,
     or if too many truth loci have no JSON record (``_assert_catalog_agreement``).
+
+    With ``keep_hom_ref_loci``, a sample of the hom-ref truth loci is kept too, and every row gets the
+    all-loci columns (see ``_kept_rows_of_locus`` and ALL_LOCI_TRAINING_PLAN.md). Rows are grouped by locus as
+    they stream, so a locus is kept or dropped whole.
     """
     truth_df, truth_locus_ids = _load_truth_from_genotypes_tsv(
         genotypes_tsv_path, high_confidence_bed_path, eh_json.typical_read_length_in_file(json_paths[0]))
     variant_truth_locus_ids = set(truth_df["LocusId"])
-    chunks, rows, json_locus_ids = [], [], set()
+    truth_by_locus = (_load_reference_repeats_and_hom_ref_truth(genotypes_tsv_path, truth_locus_ids)
+                      if keep_hom_ref_loci else None)
+    if keep_hom_ref_loci and not row_sample_id:
+        raise ValueError("%s: keep_hom_ref_loci needs row_sample_id, which names the individual the hom-ref loci "
+                         "are sampled for" % source_desc)
+    # One person's coverages (HG002_10x / _20x / _31x) sample the same hom-ref loci.
+    individual = _COVERAGE_SUFFIX_RE.sub("", row_sample_id) if keep_hom_ref_loci else None
+    variant_chunks, hom_ref_chunks, json_locus_ids = [], [], set()
+    variant_rows, hom_ref_rows = [], []
+
+    def keep_locus(locus_id, locus_rows):
+        kept = _kept_rows_of_locus(locus_id, locus_rows, variant_truth_locus_ids, truth_by_locus, individual)
+        (variant_rows if locus_id in variant_truth_locus_ids else hom_ref_rows).extend(kept)
+        for rows, chunks in ((variant_rows, variant_chunks), (hom_ref_rows, hom_ref_chunks)):
+            if len(rows) >= _ROWS_PER_CHUNK:
+                chunks.append(pd.DataFrame(rows))
+                rows.clear()
+
     for path in json_paths:
+        locus_id, locus_rows = None, []
         for row in eh_json.extract_rows(path, sample_id=row_sample_id):
-            locus_id = re.sub(r"^chr", "", str(row["locus_id"]))
-            json_locus_ids.add(locus_id)
-            if locus_id in variant_truth_locus_ids:
-                row["locus_id"] = locus_id
-                rows.append(row)
-                if len(rows) == _ROWS_PER_CHUNK:
-                    chunks.append(pd.DataFrame(rows))
-                    rows = []
-    if rows:
-        chunks.append(pd.DataFrame(rows))
-    if not chunks:
+            row_locus_id = re.sub(r"^chr", "", str(row["locus_id"]))
+            if row_locus_id != locus_id:
+                if locus_rows:
+                    keep_locus(locus_id, locus_rows)
+                locus_id, locus_rows = row_locus_id, []
+                json_locus_ids.add(row_locus_id)
+            row["locus_id"] = row_locus_id
+            locus_rows.append(row)
+        if locus_rows:
+            keep_locus(locus_id, locus_rows)
+    for rows, chunks in ((variant_rows, variant_chunks), (hom_ref_rows, hom_ref_chunks)):
+        if rows:
+            chunks.append(pd.DataFrame(rows))
+    if not variant_chunks:
         raise RuntimeError("%s: none of the %d JSON loci is one of the %d variant truth loci (example JSON "
                            "locus %s, example truth locus %s)"
                            % (source_desc, len(json_locus_ids), len(variant_truth_locus_ids),
@@ -849,13 +983,39 @@ def extract_rows_and_join_truth(json_paths, genotypes_tsv_path, high_confidence_
     # HG03688's v2.1 output, that brings the gap from 0.65% overall and 66% in the largest truth-size
     # bin down to 0.02% overall and 0.1% in the worst bin, so a real catalog mismatch now stands out.
     _assert_catalog_agreement(json_locus_ids, truth_locus_ids, truth_df, source_desc)
-    return _join_truth(pd.concat(chunks, ignore_index=True), truth_df)
+    merged = _join_truth(pd.concat(variant_chunks, ignore_index=True), truth_df)
+    if hom_ref_chunks:
+        merged = pd.concat([merged] + hom_ref_chunks, ignore_index=True)
+    return merged
 
 
-def build_combo(subdir, sample, cov_label, sample_label, data_dir, force):
+def lacks_all_loci_columns(parquet_path, keep_hom_ref_loci):
+    """True when an all-loci build (``keep_hom_ref_loci``) finds an existing parquet built without hom-ref loci.
+
+    Such a parquet must be rebuilt rather than reused. The opposite case is fine: an all-loci parquet still
+    holds every variant-locus row, and ``assemble_branch`` keeps only those for the variant-only recipe.
+    """
+    return keep_hom_ref_loci and os.path.exists(parquet_path) and not parquet_keeps_hom_ref_loci(parquet_path)
+
+
+def parquet_keeps_hom_ref_loci(parquet_path):
+    """True when ``parquet_path`` exists and was built with ``keep_hom_ref_loci`` (it has the all-loci columns)."""
+    import pyarrow.parquet as pq  # local, as in parquet_contract_complaint
+    return os.path.exists(parquet_path) and "variant_locus" in pq.ParquetFile(parquet_path).schema.names
+
+
+def variant_locus_rows(df):
+    """The rows the variant-only recipe uses: all of them for a parquet built without hom-ref loci, and only the
+    variant-locus rows of one built with them (``keep_hom_ref_loci``), so today's training and reports come out
+    the same from either kind of parquet."""
+    return df[df["variant_locus"].to_numpy(bool)].reset_index(drop=True) if "variant_locus" in df.columns else df
+
+
+def build_combo(subdir, sample, cov_label, sample_label, data_dir, force, keep_hom_ref_loci=False):
     """Downloads + joins one combo and writes its per-combo parquet (all rows, both branches).
 
-    ``sample_label`` names the combo's ``EH_RESULTS_ROOT`` folder (see ``COMBOS``).
+    ``sample_label`` names the combo's ``EH_RESULTS_ROOT`` folder (see ``COMBOS``). ``keep_hom_ref_loci`` is
+    passed to ``extract_rows_and_join_truth``.
     """
     out_path = os.path.join(data_dir, subdir, "%s_%s.parquet" % (sample, cov_label))
     print("=== %s %s -> %s ===" % (sample, cov_label, out_path))
@@ -874,7 +1034,8 @@ def build_combo(subdir, sample, cov_label, sample_label, data_dir, force):
     json_sources = [("json shard %d" % i, r, l) for i, (r, l) in enumerate(zip(json_remote, json_locals))]
     _check_freshness("%s %s" % (sample, cov_label), json_sources + truth_sources)
 
-    if _parquet_reusable(out_path, json_sources + truth_sources, force):
+    if _parquet_reusable(out_path, json_sources + truth_sources, force or lacks_all_loci_columns(
+            out_path, keep_hom_ref_loci)):
         n = len(pd.read_parquet(out_path, columns=["eh"]))
         print("    parquet up-to-date; skipping (use --force to rebuild)  [%d rows]" % n)
         return n
@@ -889,8 +1050,8 @@ def build_combo(subdir, sample, cov_label, sample_label, data_dir, force):
                             [("json shard %d" % i, p) for i, p in enumerate(json_local)])
 
     merged = extract_rows_and_join_truth(json_local, genotypes_tsv_local, high_confidence_bed_local,
-                                         "%s_%s" % (sample, cov_label),
-                                         "%s %s" % (sample, cov_label)).drop(columns=["sample_id"])
+                                         "%s_%s" % (sample, cov_label), "%s %s" % (sample, cov_label),
+                                         keep_hom_ref_loci=keep_hom_ref_loci).drop(columns=["sample_id"])
     # Feature columns stay float64 all the way to fit(). Downcasting here used to halve the parquet
     # and frame size, but it permanently quantized every value: sklearn's HistGradientBoosting upcasts
     # back to float64 internally (X_DTYPE) and bins to uint8, so the downcast bought nothing at fit
@@ -925,12 +1086,17 @@ def label_and_filter(df):
     eval (purity is available to the report's opt-in stratification pill via ``accuracy_by_size.py``
     instead of being used as a blanket exclusion).
 
+    Also adds ``true_other_allele`` and ``dir_code_genotype`` (see ``_genotype_level_direction_codes``), next to
+    the per-allele ``dir_code``, which stays as it was.
+
     Returns:
         A ``(kept_df, drop_counts)`` tuple. ``kept_df`` has ``chrom`` + the label columns added and
         the heavy ``locus_id`` / ``is_negative_locus`` columns dropped.
     """
     df = df.copy()
     df["chrom"] = _chrom_from_locus(df["locus_id"])
+    # Before the rank-1 rows of homozygous calls are dropped below: they carry the longer truth allele.
+    df["true_other_allele"] = _truth_of_the_other_copy(df)
     # ANALYSIS_OK[imputation]: NaN eh/true/motif drive the missing_eh_or_true/missing_motif_size drops below.
     eh = pd.to_numeric(df["eh"], errors="coerce")
     true = pd.to_numeric(df["true"], errors="coerce")
@@ -964,8 +1130,59 @@ def label_and_filter(df):
 
     df = df[keep].reset_index(drop=True)
     features.add_labels(df)
+    df["dir_code_genotype"] = _genotype_level_direction_codes(df)
     df = df.drop(columns=[c for c in ("locus_id", "is_negative_locus") if c in df.columns])
     return df, drops
+
+
+def _truth_of_the_other_copy(df):
+    """Per row: for the rank-0 row of a homozygous call (two copies, one size), the truth allele its rank-1 twin is
+    matched to; NaN for every other row.
+
+    ExpansionHunter scores a homozygous call once, so only the rank-0 row is trained on, and it is matched to the
+    shorter truth allele. Its twin's truth is the longer one. Needs one row per (locus, rank), i.e. one source per
+    frame, as every caller passes.
+    """
+    if not {"allele_rank", "n_alleles", "n_distinct_alleles"} <= set(df.columns):
+        return pd.Series(np.nan, index=df.index)
+    homozygous = (df["n_alleles"] == 2) & (df["n_distinct_alleles"] == 1)
+    twins = df.loc[homozygous & (df["allele_rank"] == 1), ["locus_id", "true"]]
+    if twins["locus_id"].duplicated().any():
+        raise ValueError("label_and_filter got several rank-1 rows for one LocusId; pass one source at a time")
+    # ANALYSIS_OK[imputation]: NaN marks rows without a twin; _genotype_level_direction_codes falls back to the
+    # row's own per-allele label there.
+    other = df["locus_id"].map(pd.to_numeric(twins.set_index("locus_id")["true"], errors="coerce"))
+    return other.where(homozygous & (df["allele_rank"] == 0))
+
+
+def _genotype_level_direction_codes(df):
+    """The direction label of a call judged against both truth alleles (``dir_code_genotype``).
+
+    A homozygous call is OK only if its size is within tolerance of both truth alleles. If it misses one of them,
+    it takes that allele's direction; if it misses both, the direction of the one it misses by more repeats (the
+    longer one on a tie). Without that, a homozygous reference-length call that misses an expansion on one
+    haplotype is labeled OK, because its scored row is matched to the shorter, reference-length truth allele.
+    Every other row keeps its per-allele ``dir_code``. Uses the same per-allele rule as ``features.add_labels``
+    (``direction_codes`` with ``tol_repeats``), so a change to that rule must be made in both places.
+    """
+    eh = pd.to_numeric(df["eh"], errors="coerce").to_numpy(np.float64)
+    motif = pd.to_numeric(df["motif_size"], errors="coerce").to_numpy(np.float64)
+    own_true = pd.to_numeric(df["true"], errors="coerce").to_numpy(np.float64)
+    other_true = df["true_other_allele"].to_numpy(np.float64)
+    # The rank-0 row is matched to the shorter truth allele, so the other copy's truth is the longer one.
+    has_other = ~np.isnan(other_true)
+    other_true = np.where(has_other, other_true, own_true)
+
+    def tolerance(true):
+        return features.tol_repeats(motif * np.round(true))
+
+    def miss(true):
+        return np.abs(np.round(eh) - np.round(true))
+
+    own_fails, other_fails = miss(own_true) > tolerance(own_true), miss(other_true) > tolerance(other_true)
+    use_other = has_other & other_fails & (~own_fails | (miss(other_true) >= miss(own_true)))
+    return np.where(use_other, features.direction_codes(eh, other_true, tolerance(other_true)),
+                    df["dir_code"].to_numpy()).astype(int)
 
 
 def _assert_parts_share_feature_contract(parts):
@@ -1062,6 +1279,38 @@ def _quota_top_up(motif_size, eh, idx, chosen, cap, seed):
     return np.sort(np.concatenate(extra)) if extra else idx[:0]
 
 
+def _cap_all_loci_rows_per_genotyping_regime(df, cap, seed):
+    """The all-loci counterpart of ``_cap_rows_per_genotyping_regime``, for parquets built with ``keep_hom_ref_loci``.
+
+    Per regime, the representative rows are the ``all_loci_representative`` ones (an equal-probability sample of
+    all loci; a seeded uniform sample of ``cap`` of them when there are more), and the training-only quota
+    top-up comes from the ``in_all_loci_pool`` rows, which favor neither variant nor hom-ref loci. Variant-locus
+    rows outside the pool are left out, so no step of the all-loci recipe draws more from variant loci. They stay
+    in the per-source parquets, and today's sample of them in the ``variant_loci`` population's parquets, so the
+    length head can later take its rows from those (decision D3 in ALL_LOCI_AND_RELATIVE_TOLERANCE_RETRAIN_PLAN.md)
+    without a new extraction. Until then, ``train.py --training-population all_loci`` fits the length head on the
+    rows of this parquet where the out-of-fold gate fires, as today's recipe does on its own population.
+    """
+    motif, eh = df["motif_size"].to_numpy(float), df["eh"].to_numpy(float)
+    in_pool, representative = df["in_all_loci_pool"].to_numpy(bool), df["all_loci_representative"].to_numpy(bool)
+    kept, kept_representative = [], []
+    for regime in sorted(df["genotyping_regime"].unique()):
+        in_regime = (df["genotyping_regime"] == regime).to_numpy()
+        pool, uniform = np.where(in_regime & in_pool)[0], np.where(in_regime & representative)[0]
+        if uniform.size > cap:
+            uniform = np.sort(np.random.default_rng(seed).choice(uniform, cap, replace=False))
+        # A pool within the cap is kept whole, as quota_sample would keep it (_quota_top_up adds nothing then).
+        extra = (np.setdiff1d(pool, uniform) if pool.size <= cap
+                 else _quota_top_up(motif, eh, pool, uniform, cap, seed + 1))
+        kept += [uniform, extra]
+        kept_representative += [np.ones(uniform.size, bool), np.zeros(extra.size, bool)]
+    if not kept:
+        return df.iloc[:0].assign(representative=True)
+    rows = np.concatenate(kept)
+    order = np.argsort(rows, kind="stable")
+    return df.iloc[rows[order]].assign(representative=np.concatenate(kept_representative)[order]).reset_index(drop=True)
+
+
 def _cap_rows_per_genotyping_regime(df, cap, seed):
     """Caps each ``genotyping_regime`` at ``cap`` representative rows plus a training-only quota top-up.
 
@@ -1099,23 +1348,43 @@ def individual_of_part(path):
     return _COVERAGE_SUFFIX_RE.sub("", os.path.splitext(os.path.basename(path))[0])
 
 
-def assemble_branch(data_dir, branch, subdir):
-    """Assembles one branch's per-combo parquets, labels + filters, writes data/parquet/<branch>.
+# Where assemble_branch writes each training population's branch parquets (data/<subdir>/<branch>.parquet).
+# "variant_loci" is today's recipe; "all_loci" needs per-source parquets built with --keep-hom-ref-loci.
+BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION = {"variant_loci": "parquet", "all_loci": "parquet_all_loci"}
+
+
+def assemble_branch(data_dir, branch, subdir, training_population="variant_loci"):
+    """Assembles one branch's per-combo parquets, labels + filters, writes data/<population subdir>/<branch>.
 
     Parts are read, filtered and labeled one at a time, and each keeps a uniform sample of at most
     ``MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME`` representative rows per genotyping regime plus a
     training-only quota top-up of rare cells (``_cap_rows_per_genotyping_regime``): on the 5.65M-locus
     v2.1 catalog one source has ~1.5M allele rows (~590MB in memory), so concatenating all 54 sources
     whole would need ~32GB. The rare regimes stay whole because they rarely reach the cap.
+
+    ``training_population`` "variant_loci" uses only the variant-locus rows (today's recipe, the same from
+    either kind of parquet) and writes ``data/parquet/``; "all_loci" uses the all-loci sample
+    (``_cap_all_loci_rows_per_genotyping_regime``) and writes ``data/parquet_all_loci/``
+    (``BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION``).
     """
     parts = sorted(glob.glob(os.path.join(data_dir, subdir, "*.parquet")))
     if not parts:
         print("\n%s branch: no per-combo parquets in %s/ -- skipping" % (branch, subdir))
         return
     _assert_parts_share_feature_contract(parts)
+    if training_population == "all_loci":
+        without_all_loci_columns = [p for p in parts if lacks_all_loci_columns(p, keep_hom_ref_loci=True)]
+        if without_all_loci_columns:
+            raise RuntimeError("%d per-source parquet(s) were built without hom-ref loci, so the all-loci "
+                               "population cannot be assembled; rebuild with --keep-hom-ref-loci: %s"
+                               % (len(without_all_loci_columns), ", ".join(without_all_loci_columns[:5])))
+    cap_rows = (_cap_all_loci_rows_per_genotyping_regime if training_population == "all_loci"
+                else _cap_rows_per_genotyping_regime)
     kept_parts, drops, n0 = [], {}, 0
     for part in parts:
         part_df = pd.read_parquet(part)
+        if training_population == "variant_loci":
+            part_df = variant_locus_rows(part_df)
         # Both branches are carved from the same optimized-streaming run by genotyping_branch:
         # quick = fast-path QuickGenotype rows; full = full-genotyper fallback rows (the deploy-matched
         # subpopulation the full experts are served).
@@ -1125,13 +1394,14 @@ def assemble_branch(data_dir, branch, subdir):
         for name, count in part_drops.items():
             drops[name] = drops.get(name, 0) + count
         part_df["individual"] = individual_of_part(part)
-        kept_parts.append(_cap_rows_per_genotyping_regime(
+        kept_parts.append(cap_rows(
             part_df, MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME, zlib.crc32(os.path.basename(part).encode())))
         del part_df
     df = pd.concat(kept_parts, ignore_index=True)
     del kept_parts
 
-    out_path = os.path.join(data_dir, "parquet", "%s.parquet" % branch)
+    out_path = os.path.join(data_dir, BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION[training_population],
+                            "%s.parquet" % branch)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     tmp = out_path + ".tmp"
     df.to_parquet(tmp, index=False)
@@ -1148,15 +1418,16 @@ def assemble_branch(data_dir, branch, subdir):
     print("  wrote %d rows -> %s" % (len(df), out_path))
 
 
-def _link_promoted_heldout_samples(data_dir, force):
+def _link_promoted_heldout_samples(data_dir, force, keep_hom_ref_loci=False):
     """Syncs the training subdir's promoted-sample symlinks to ``PROMOTED_HELDOUT_SAMPLES``.
 
     Builds each promoted sample's parquet via ``heldout.build_sample`` under ``data_eval_43/real_43/``
     if it isn't already there (same schema as a per-combo training parquet), then symlinks it into the
     training subdir instead of re-downloading; ``assemble_branch`` picks it up via its ``*.parquet``
     glob. Imports ``heldout`` lazily here (not at module level) since ``heldout`` itself imports
-    ``dataset``. ``force`` is threaded through from ``main()`` so ``--force`` also rebuilds
-    promoted-sample parquets instead of silently reusing stale ones.
+    ``dataset``. ``force`` and ``keep_hom_ref_loci`` are threaded through from ``main()`` so ``--force``
+    also rebuilds promoted-sample parquets instead of silently reusing stale ones, and
+    ``--keep-hom-ref-loci`` reaches these 50 of the 54 training sources too.
 
     Symlinks for samples no longer in the tuple are REMOVED. ``PROMOTED_HELDOUT_SAMPLES`` is a tuning
     knob, and de-promoting a sample puts it back in ``heldout.SAMPLES``; leaving its symlink behind
@@ -1167,7 +1438,8 @@ def _link_promoted_heldout_samples(data_dir, force):
     import heldout
     subdir = os.path.join(data_dir, SOURCE_SUBDIR)
     for sample in PROMOTED_HELDOUT_SAMPLES:
-        src = heldout.build_sample(sample, os.path.join(HERE, "data_eval_43"), force=force)
+        src = heldout.build_sample(sample, os.path.join(HERE, "data_eval_43"), force=force,
+                                   keep_hom_ref_loci=keep_hom_ref_loci)
         dst = os.path.join(subdir, "%s.parquet" % sample)
         if not os.path.exists(dst):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -1209,8 +1481,27 @@ def _upstream_source_files(data_dir):
     return files
 
 
-def assert_parquets_up_to_date(data_dir, branches=("quick", "full")):
-    """Exits nonzero if a branch parquet is missing, older than an upstream JSON/TSV, or off-contract.
+def command_that_builds_branch_parquets(data_dir, parquet_subdir):
+    """The ``dataset.py`` command, in backquotes, that (re)builds ``data_dir/<parquet_subdir>/``.
+
+    No ``--force``: a plain run rebuilds every per-source parquet whose sources changed or that is off-contract
+    (``_parquet_reusable``) and always re-assembles, while ``--force`` would rebuild (and re-download) them all.
+    The command passes ``--keep-hom-ref-loci`` for the all-loci population, and for today's once the per-source
+    parquets keep the hom-ref loci: a rebuild without it would replace them with variant-only parquets.
+    """
+    population = {s: p for p, s in BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION.items()}[parquet_subdir]
+    command = "python3 dataset.py --data-dir %s" % data_dir
+    if population != "variant_loci" or any(
+            parquet_keeps_hom_ref_loci(p) for p in glob.glob(os.path.join(data_dir, SOURCE_SUBDIR, "*.parquet"))):
+        command += " --keep-hom-ref-loci"
+    if population != "variant_loci":
+        command += " --training-population %s" % population
+    return "`%s`" % command
+
+
+def assert_parquets_up_to_date(data_dir, branches=("quick", "full"), parquet_subdir="parquet"):
+    """Exits nonzero if a branch parquet (``data_dir/<parquet_subdir>/<branch>.parquet``) is missing, older than an
+    upstream JSON/TSV, or off-contract.
 
     A guard for the downstream train/report steps, covering two kinds of staleness:
 
@@ -1223,27 +1514,27 @@ def assert_parquets_up_to_date(data_dir, branches=("quick", "full")):
     What it does NOT catch is a changed FORMULA for a column that already exists: editing
     ``eh_json.py``'s ``flanking_frac`` expression touches no upstream file's mtime and no column name,
     so a parquet built by the old code still passes. Re-run ``dataset.py --force`` yourself after
-    changing how an existing feature is computed.
+    changing how an existing feature is computed (with ``--keep-hom-ref-loci`` if the per-source parquets
+    keep the hom-ref loci, or the rebuild drops them).
 
     Raises ``SystemExit`` with an actionable message rather than silently training on stale data.
     """
     upstream = _upstream_source_files(data_dir)
     for branch in branches:
-        parquet = os.path.join(data_dir, "parquet", "%s.parquet" % branch)
+        parquet = os.path.join(data_dir, parquet_subdir, "%s.parquet" % branch)
         if not os.path.exists(parquet):
-            sys.exit("ERROR: %s is missing -- run `python3 dataset.py --data-dir %s` to build the "
-                     "parquets before training/reporting." % (parquet, data_dir))
+            sys.exit("ERROR: %s is missing -- run %s to build the parquets before training/reporting."
+                     % (parquet, command_that_builds_branch_parquets(data_dir, parquet_subdir)))
         pq_mtime = os.path.getmtime(parquet)
         newer = sorted(f for f in upstream if os.path.getmtime(f) > pq_mtime)
         if newer:
             sys.exit("ERROR: %s is STALE -- %d upstream file(s) are newer than it (e.g. %s). "
-                     "Re-run `python3 dataset.py --data-dir %s --force` to rebuild it."
-                     % (parquet, len(newer), newer[0], data_dir))
+                     "Re-run %s to rebuild it."
+                     % (parquet, len(newer), newer[0], command_that_builds_branch_parquets(data_dir, parquet_subdir)))
         complaint = parquet_contract_complaint(parquet)
         if complaint:
-            sys.exit("ERROR: %s does not match the current feature contract -- %s. Re-run "
-                     "`python3 dataset.py --data-dir %s --force` to rebuild it."
-                     % (parquet, complaint, data_dir))
+            sys.exit("ERROR: %s does not match the current feature contract -- %s. Re-run %s to rebuild it."
+                     % (parquet, complaint, command_that_builds_branch_parquets(data_dir, parquet_subdir)))
     print("  parquet freshness OK: %s newer than all %d upstream source file(s)"
           % (", ".join(branches), len(upstream)), flush=True)
 
@@ -1252,13 +1543,28 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default=os.path.join(HERE, "data"))
     parser.add_argument("--force", action="store_true", help="rebuild even if parquets exist")
+    parser.add_argument("--keep-hom-ref-loci", action="store_true",
+                        help="also keep a sample of the loci where the truth equals the reference, with the "
+                             "all-loci columns (see ALL_LOCI_TRAINING_PLAN.md); parquets built without them are "
+                             "rebuilt")
+    parser.add_argument("--training-population", choices=sorted(BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION),
+                        action="append",
+                        help="which branch parquets to assemble: variant_loci (today's recipe, data/parquet/) "
+                             "and/or all_loci (data/parquet_all_loci/, needs --keep-hom-ref-loci parquets); "
+                             "repeatable; default variant_loci")
     args = parser.parse_args()
+    # Checked before building: without the flag, every per-source parquet that needs rebuilding would come out
+    # variant-only, and only the all-loci assembly after that would fail.
+    if "all_loci" in (args.training_population or []) and not args.keep_hom_ref_loci:
+        parser.error("--training-population all_loci needs --keep-hom-ref-loci")
 
     for sample, cov_label, sample_label in COMBOS:
-        build_combo(SOURCE_SUBDIR, sample, cov_label, sample_label, args.data_dir, args.force)
-    _link_promoted_heldout_samples(args.data_dir, args.force)
-    for branch in ("quick", "full"):
-        assemble_branch(args.data_dir, branch, SOURCE_SUBDIR)
+        build_combo(SOURCE_SUBDIR, sample, cov_label, sample_label, args.data_dir, args.force,
+                    keep_hom_ref_loci=args.keep_hom_ref_loci)
+    _link_promoted_heldout_samples(args.data_dir, args.force, keep_hom_ref_loci=args.keep_hom_ref_loci)
+    for training_population in args.training_population or ["variant_loci"]:
+        for branch in ("quick", "full"):
+            assemble_branch(args.data_dir, branch, SOURCE_SUBDIR, training_population=training_population)
 
 
 if __name__ == "__main__":

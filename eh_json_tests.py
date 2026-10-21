@@ -58,6 +58,45 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(eh_json.parse_ci("", 1), [(None, None)])
 
 
+class StoredExperimentColumnsTest(unittest.TestCase):
+    """fragment_length and the spanning-mode / het_gap columns (stored, not model inputs)."""
+
+    def test_naive_spanning_mode(self):
+        mode = eh_json.naive_spanning_mode
+        self.assertEqual(mode([(20, 8), (97, 1)]), (20, 8))
+        self.assertEqual(mode([(20, 1), (21, 1), (97, 2)]), (97, 2))       # one-read sizes dropped
+        self.assertEqual(mode([(20, 1), (21, 1)]), (20, 1))                # all one-read: first listed
+        self.assertEqual(mode([(20, 3), (25, 3)]), (20, 3))                # tie: first listed
+        self.assertEqual(mode([]), (None, 0))
+
+    def test_other_allele_call(self):
+        self.assertEqual(eh_json.other_allele_call([20, 97], 0), 97)
+        self.assertEqual(eh_json.other_allele_call([20, 97], 1), 20)
+        self.assertEqual(eh_json.other_allele_call([20, 20], 0), 20)
+        self.assertIsNone(eh_json.other_allele_call([20], 0))
+        self.assertEqual(eh_json.other_allele_call([10, 20, 30], 2), 20)  # nearest other allele
+
+    def test_rows_carry_the_stored_columns(self):
+        locus = dict(_locus("20/97"), FragmentLength=361)
+        rows = list(eh_json.extract_rows({"LocusResults": {"L": locus}}))
+        self.assertEqual([r["fragment_length"] for r in rows], [361, 361])
+        self.assertEqual([r["eh_minus_spanning_mode_naive"] for r in rows], [0, 77])  # mode 20 (8 reads)
+        self.assertEqual([r["spanning_mode_naive_support"] for r in rows], [8, 8])
+        self.assertEqual([r["het_gap"] for r in rows], [-77, 77])
+        one_allele = list(eh_json.extract_rows({"LocusResults": {"L": dict(_locus("20"), FragmentLength=361)}}))
+        self.assertIsNone(one_allele[0]["het_gap"])
+
+    def test_no_spanning_reads_and_no_calls(self):
+        locus = _locus("20/97")
+        locus["Variants"]["L"]["CountsOfSpanningReads"] = "()"
+        rows = list(eh_json.extract_rows({"LocusResults": {"L": locus}}))
+        self.assertEqual([r["eh_minus_spanning_mode_naive"] for r in rows], [None, None])
+        self.assertEqual([r["spanning_mode_naive_support"] for r in rows], [0, 0])
+        no_call = list(eh_json.extract_rows({"LocusResults": {"L": dict(_locus("./."), FragmentLength=400)}}))
+        self.assertEqual([r["fragment_length"] for r in no_call], [400, 400])
+        self.assertTrue(all(r["het_gap"] is None and r["eh_minus_spanning_mode_naive"] is None for r in no_call))
+
+
 class ExtractTest(unittest.TestCase):
     def test_full_contract(self):
         rows = list(eh_json.extract_rows({"LocusResults": {"x": _locus()}}, sample_id="S"))

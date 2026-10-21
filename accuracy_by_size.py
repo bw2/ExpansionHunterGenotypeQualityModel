@@ -239,7 +239,8 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
     """
     import model as M
     import features
-    df = pd.read_parquet(parquet_path)
+    import dataset
+    df = dataset.variant_locus_rows(pd.read_parquet(parquet_path))
     # ANALYSIS_OK[imputation]: rows with unparseable truth are dropped by the notna() filter below.
     df = df[pd.to_numeric(df["true"], errors="coerce").notna()].reset_index(drop=True)
     eh = pd.to_numeric(df["eh"], errors="coerce").to_numpy(dtype=float)
