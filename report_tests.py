@@ -138,7 +138,7 @@ class TableBuildersTest(unittest.TestCase):
         self.assertIn("coverage", note)
 
     def test_no_stale_warning_when_the_ranking_covers_the_contract(self):
-        full = [(f, 1.0, 0.0) for f in features.FULL_FEATURES]
+        full = [(f, 1.0, 0.0) for f in features.FULL_MODEL_FEATURES]
         quick = [(f, 1.0, 0.0) for f in features.QUICK_FEATURES]
         results = [dict(r, importance=(quick if r["genotyping_regime"] == features.GENOTYPING_REGIME_QUICK
                                        else full))

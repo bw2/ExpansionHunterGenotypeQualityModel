@@ -1329,16 +1329,16 @@ def _img_toggle(excluded_png, homopolymer_png, gid):
 def _feature_glossary(results):
     """Feature definition table: EVERY current feature, ordered by full_nonspanning importance rank.
 
-    Driven by ``features.feature_names`` rather than by the cached ranking. Enumerating the ranking
+    Driven by ``features.FULL_FEATURES`` rather than by the cached ranking. Enumerating the ranking
     instead silently dropped any feature added after ``results.json`` was written -- the published
     report shipped a 24-row table while the contract already had 29 features, with no warning.
-    Features the cached ranking does not cover sort last and show ``#-`` instead of a rank.
+    Features the cached ranking does not cover, including the quick-only ``strand_bias_phred``, sort
+    last and show ``#-`` instead of a rank.
     """
     ranked = {r["genotyping_regime"]: r for r in
               results}[features.GENOTYPING_REGIME_FULL_NONSPANNING]["importance"]
     rank = {feat: i for i, (feat, _, _) in enumerate(ranked, start=1)}
-    branch = features.GENOTYPING_REGIME_BRANCH[features.GENOTYPING_REGIME_FULL_NONSPANNING]
-    names = sorted(features.feature_names(branch), key=lambda f: rank.get(f, len(rank) + 1))
+    names = sorted(features.FULL_FEATURES, key=lambda f: rank.get(f, len(rank) + 1))
     rows = ["<tr><th>rank</th><th>feature</th><th>definition</th></tr>"]
     for feat in names:
         rows.append("<tr><td>%s</td><td><code>%s</code></td><td>%s</td></tr>" % (

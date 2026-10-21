@@ -82,8 +82,14 @@ class BuildMatrixTest(unittest.TestCase):
 
     def test_full_order_and_count(self):
         X, names = features.build_matrix(self._raw_row(), "full")
-        self.assertEqual(names, features.FULL_FEATURES)
-        self.assertEqual(list(X.columns), features.FULL_FEATURES)
+        self.assertEqual(names, features.FULL_MODEL_FEATURES)
+        self.assertEqual(list(X.columns), features.FULL_MODEL_FEATURES)
+
+    def test_only_the_quick_model_uses_strand_bias(self):
+        self.assertEqual(features.FULL_MODEL_FEATURES,
+                         [f for f in features.FULL_FEATURES if f != "strand_bias_phred"])
+        self.assertNotIn("strand_bias_phred", features.feature_names("full"))
+        self.assertIn("strand_bias_phred", features.feature_names("quick"))
 
     def test_quick_order(self):
         _, names = features.build_matrix(self._raw_row(), "quick")

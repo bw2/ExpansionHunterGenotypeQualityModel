@@ -46,6 +46,14 @@ QUICK_FEATURES = [
 # fast path never counts in-repeat reads).
 FULL_FEATURES = QUICK_FEATURES + ["left_flank_norm_depth", "right_flank_norm_depth", "inrepeat_total"]
 
+# The features the full-branch models are trained on: FULL_FEATURES (what ExpansionHunter emits and the parquet
+# stores) without strand_bias_phred. Before ExpansionHunter-bw2 fixed LocusAligner::align on 2026-10-17, the full
+# genotyper in streaming and optimized-streaming modes counted the strand of whichever read of a pair it decoded last
+# instead of read 1. That read is usually the reverse-strand read of a forward-reverse pair, so the training data's
+# values (median 30) reflect how pairs are laid out, while the fixed binary emits a real strand bias (median about 2).
+# The quick branch keeps the feature: the fast path counts strands with its own code, which the fix did not change.
+FULL_MODEL_FEATURES = [f for f in FULL_FEATURES if f != "strand_bias_phred"]
+
 # Raw CI/eh columns the engineered features derive from (NOT present in the parquet
 # as features; the engineered ci_asymmetry/ci_over_eh are rebuilt by ``add_engineered``).
 ENGINEERED_RAW_INPUTS = ("ci_start", "ci_end", "ci_width", "eh")
@@ -74,7 +82,7 @@ FEATURE_DEFINITIONS = {
     "coverage": "Per-locus read depth over the locus's two reference flanks (LocusResults.Coverage), from reads whose alignment starts in a flank. Measured outside the repeat, so unlike the per-allele depth it does not move with the called allele size.",
     "depth": "Per-allele read depth (AlleleQualityMetrics).",
     "hq_unambiguous_reads": "Per-allele high-quality unambiguous read count.",
-    "strand_bias_phred": "Strand-bias binomial Phred score for this allele.",
+    "strand_bias_phred": "Strand-bias binomial Phred score for this allele (quick branch only).",
     "mean_inserted_bases": "Mean inserted bases within the repeat for this allele.",
     "mean_deleted_bases": "Mean deleted bases within the repeat for this allele.",
     "reference_repeat_purity": "Fraction of the reference repeat region matching a perfect motif tiling (0-1).",
@@ -150,10 +158,10 @@ def missing_feature_columns(parquet_paths, names=None):
 
 
 def feature_names(branch):
-    """Returns the ordered feature list for ``branch`` (``"full"`` or ``"quick"``)."""
+    """Returns the ordered list of features a ``branch`` (``"full"`` or ``"quick"``) model is trained on."""
     if branch not in (BRANCH_FULL, BRANCH_QUICK):
         raise ValueError("branch must be 'full' or 'quick'; got %r" % branch)
-    return list(FULL_FEATURES if branch == BRANCH_FULL else QUICK_FEATURES)
+    return list(FULL_MODEL_FEATURES if branch == BRANCH_FULL else QUICK_FEATURES)
 
 
 def build_matrix(df, branch, names=None):
