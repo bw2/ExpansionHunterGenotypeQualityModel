@@ -1184,25 +1184,14 @@ def _genotype_level_direction_codes(df):
     haplotype is labeled OK, because its scored row is matched to the shorter, reference-length truth allele.
     Every other row keeps its per-allele ``dir_code``. Uses the same per-allele rule as ``features.add_labels``
     (``direction_codes`` with ``tol_repeats``), so a change to that rule must be made in both places.
+    ``features.genotype_level_direction_codes`` does the combining, also for change B's label (``train.py``).
     """
     eh = pd.to_numeric(df["eh"], errors="coerce").to_numpy(np.float64)
     motif = pd.to_numeric(df["motif_size"], errors="coerce").to_numpy(np.float64)
     own_true = pd.to_numeric(df["true"], errors="coerce").to_numpy(np.float64)
-    other_true = df["true_other_allele"].to_numpy(np.float64)
-    # The rank-0 row is matched to the shorter truth allele, so the other copy's truth is the longer one.
-    has_other = ~np.isnan(other_true)
-    other_true = np.where(has_other, other_true, own_true)
-
-    def tolerance(true):
-        return features.tol_repeats(motif * np.round(true))
-
-    def miss(true):
-        return np.abs(np.round(eh) - np.round(true))
-
-    own_fails, other_fails = miss(own_true) > tolerance(own_true), miss(other_true) > tolerance(other_true)
-    use_other = has_other & other_fails & (~own_fails | (miss(other_true) >= miss(own_true)))
-    return np.where(use_other, features.direction_codes(eh, other_true, tolerance(other_true)),
-                    df["dir_code"].to_numpy()).astype(int)
+    return features.genotype_level_direction_codes(
+        eh, own_true, df["true_other_allele"].to_numpy(np.float64),
+        lambda true: features.direction_codes(eh, true, features.tol_repeats(motif * np.round(true))))
 
 
 def _assert_parts_share_feature_contract(parts):

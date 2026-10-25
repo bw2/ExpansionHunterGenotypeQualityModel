@@ -158,8 +158,10 @@ def _accumulate(acc, sub, comp, branch, names, sample_name):
     # accuracy_by_size scores it; a continuous eh/LCF would count an LCF of 1.003 on an integer call
     # as helping or hurting although the call does not change.
     true_pred = np.round(eh / lcf)
-    proba = M.round_like_emitted(M.predict_proba_json(comp, X))
-    p_ok = proba[:, 0]
+    # [pOk, pTooLong, pTooShort] as ExpansionHunter reports them (with change B's PAST_LIMIT class, pOk and
+    # pTooShort both include it, so they no longer sum to 1).
+    proba = M.round_like_emitted(M.predict_reported_json(comp, X))
+    p_ok = proba[:, features.OK]
     corrected = np.where(p_ok < 0.5, true_pred, eh)        # gate: correct only low-confidence calls
     d_raw = np.abs(true - eh)
     d_gated = np.abs(true - corrected)
@@ -363,7 +365,7 @@ def _fast_path_loci_of_sample(path, compiled_quick, quick_names):
     pok = np.full(len(df), np.nan)
     if scored.any():
         X, _ = features.build_matrix(df[scored], features.BRANCH_QUICK, names=quick_names)
-        pok[scored] = M.round_like_emitted(M.predict_proba_json(compiled_quick, X))[:, features.OK]
+        pok[scored] = M.round_like_emitted(M.predict_reported_json(compiled_quick, X))[:, features.OK]
     reference = df["truth_reference_repeats"].to_numpy(float)
     per_row = pd.DataFrame({
         "locus_id": df["locus_id"], "pok": pok,

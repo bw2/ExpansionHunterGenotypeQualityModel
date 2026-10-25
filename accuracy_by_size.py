@@ -301,7 +301,7 @@ def categorize_parquet(parquet_path, model_path, corrected_cap=None):
         # Rounded to the 3 decimals ExpansionHunter emits, so the categories describe the deployed
         # binary's output rather than full-precision predictions (model.round_like_emitted).
         lcf[rows] = M.round_like_emitted(M.predict_lcf_json(cg, X))
-        pok[rows] = M.round_like_emitted(M.predict_proba_json(cg, X)[:, 0])
+        pok[rows] = M.round_like_emitted(M.predict_reported_json(cg, X)[:, features.OK])
     non_spanning = np.zeros(len(df), dtype=bool)
     non_spanning[sub["_row"].to_numpy()] = (
         sub["_regime"].to_numpy() == features.GENOTYPING_REGIME_FULL_NONSPANNING)

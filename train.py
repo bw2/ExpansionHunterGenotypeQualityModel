@@ -5,7 +5,9 @@ each a q-median LCF head + a 3-class direction head with per-class isotonic
 calibration, on the full real-data pool, serializes them into the schema the EH C++
 parses (``GenotypeQualityModel.cpp``, ``format_version == 2``), round-trip-verifies
 that the serialized trees/softmax/isotonic reproduce sklearn's predictions, and
-writes the gzipped JSON.
+writes the gzipped JSON. ``--relative-tolerance`` trains change B's 4-class direction head instead
+(``features.relative_tolerance_direction_codes``), written as ``format_version == 3``, which ExpansionHunter
+does not read yet.
 
 Each genotyping_regime reads its branch parquet (``quick`` reads ``data/parquet/quick.parquet``;
 the two full genotyping_regimes read ``data/parquet/full.parquet``) and is restricted to its
@@ -35,6 +37,9 @@ import model as M
 HERE = os.path.dirname(os.path.abspath(__file__))
 SEED = 20260616
 FORMAT_VERSION = 2
+# Change B's models: a direction head with a 4th class, PAST_LIMIT, the eh_bp_over_fragment_length input, and the
+# relative tolerance they were trained with.
+RELATIVE_TOLERANCE_FORMAT_VERSION = 3
 
 
 def _reject_nonfinite(tok):
@@ -42,15 +47,17 @@ def _reject_nonfinite(tok):
     raise ValueError("model JSON contains non-finite token %r (invalid standard JSON)" % tok)
 
 
-def _default_out(training_population="variant_loci", direction_label="dir_code"):
+def _default_out(training_population="variant_loci", direction_label="dir_code", relative_tolerance=None):
     """Returns the default dated output path (today's date).
 
-    A non-default training population or direction label goes into the name, before the date (which
-    ``compare_models._model_sort_key`` reads), so such a model never overwrites today's default one.
+    A non-default training population, direction label or relative tolerance goes into the name, before the date
+    (which ``compare_models._model_sort_key`` reads), so such a model never overwrites today's default one.
     """
     today = datetime.date.today().strftime("%Y%m%d")
     choices = "".join("_" + choice for choice, default in ((training_population, "variant_loci"),
                                                            (direction_label, "dir_code")) if choice != default)
+    if relative_tolerance is not None:
+        choices += "_relative_tolerance_%gpct" % (100 * relative_tolerance)
     return os.path.join(HERE, "model",
                         "genotype_quality_model_from_HG002_and_CHM1_CHM13%s.%s.json.gz" % (choices, today))
 
@@ -129,20 +136,24 @@ GATING_DIRECTION_ITERATIONS = 500
 _PREDICT_CHUNK_ROWS = 500_000
 
 
-def _predict_p_ok_in_chunks(dmodel, df, idx, branch):
-    """Returns the deployed-rounding pOk for rows ``idx`` of ``df``, building the matrix in chunks."""
+def _predict_p_ok_in_chunks(dmodel, df, idx, branch, names=None):
+    """Returns the deployed-rounding reported pOk (``model.reported_probabilities``) for rows ``idx`` of ``df``,
+    building the matrix (``names``, default the branch's features) in chunks."""
     return np.concatenate([
-        M.round_like_emitted(M.predict_proba(dmodel, features.build_matrix(df.iloc[idx[i:i + _PREDICT_CHUNK_ROWS]],
-                                                                          branch)[0])[:, 0])
+        M.round_like_emitted(M.predict_reported(
+            dmodel, features.build_matrix(df.iloc[idx[i:i + _PREDICT_CHUNK_ROWS]], branch, names)[0])[:, features.OK])
         for i in range(0, idx.size, _PREDICT_CHUNK_ROWS)])
 
 
-def _out_of_fold_gate_fires(df, train_pool, fold_groups, branch, train_cap, X_calib, y_calib):
+def _out_of_fold_gate_fires(df, train_pool, fold_groups, branch, train_cap, X_calib, y_calib, names=None,
+                            n_classes=M.N_CLASSES):
     """Returns, for each row of ``train_pool``, whether the gate (pOk < 0.5) fires on it out of fold.
 
     The pool's groups (``fold_groups``: people for the exported model, with HG002 and CHM1_CHM13 split
     by chromosome; chromosomes for the report's cross-validation) are split into two seeded halves; a
     direction head fit on one half predicts the other, so no row is scored by a model that saw it.
+    ``names`` and ``n_classes`` are the head's feature list (default the branch's) and class count, as in
+    ``fit_heads``.
     """
     groups = np.asarray(fold_groups, dtype=object)
     pool_groups = np.array(sorted(set(groups[train_pool].tolist())))
@@ -152,10 +163,10 @@ def _out_of_fold_gate_fires(df, train_pool, fold_groups, branch, train_cap, X_ca
     fires = np.zeros(train_pool.size, dtype=bool)
     for fit_mask in (in_half, ~in_half):
         fit_rows = dataset.quota_sample(motif, eh, train_pool[fit_mask], train_cap, SEED + 5)
-        Xfit, _ = features.build_matrix(df.iloc[fit_rows], branch)
+        Xfit, _ = features.build_matrix(df.iloc[fit_rows], branch, names)
         dmodel = M.train_direction(Xfit, df["dir_code"].to_numpy(int)[fit_rows], X_calib, y_calib,
-                                   n_iter=GATING_DIRECTION_ITERATIONS)
-        fires[~fit_mask] = _predict_p_ok_in_chunks(dmodel, df, train_pool[~fit_mask], branch) < 0.5
+                                   n_iter=GATING_DIRECTION_ITERATIONS, n_classes=n_classes)
+        fires[~fit_mask] = _predict_p_ok_in_chunks(dmodel, df, train_pool[~fit_mask], branch, names) < 0.5
     return fires
 
 
@@ -165,7 +176,8 @@ def direction_training_rows(df, train_pool, train_cap):
                                 train_cap, SEED)
 
 
-def fit_heads(df, train_pool, calib_rows, fold_groups, branch, train_cap, iterations, label):
+def fit_heads(df, train_pool, calib_rows, fold_groups, branch, train_cap, iterations, label, names=None,
+              n_classes=M.N_CLASSES):
     """Fits one genotyping regime's direction + q-median heads with the shipped recipe.
 
     Shared by ``fit_genotyping_regime`` (the exported model) and ``report.collect_oof`` (its
@@ -187,6 +199,9 @@ def fit_heads(df, train_pool, calib_rows, fold_groups, branch, train_cap, iterat
         train_cap: Max rows per head fit (None = no cap).
         iterations: ``(direction iterations, q-median iterations)``, e.g. ``ITERATIONS_BY_REGIME[regime]``.
         label: Prefix for progress lines.
+        names: Feature list (default: the branch's, ``features.feature_names``).
+        n_classes: Direction classes: 3, or 4 for change B's label in ``dir_code`` (then the gate uses the reported
+            pOk, ``model.reported_probabilities``).
 
     Returns:
         ``(qreg, dmodel, feature_names, X_calib)``.
@@ -195,18 +210,18 @@ def fit_heads(df, train_pool, calib_rows, fold_groups, branch, train_cap, iterat
     t, y = df["t"].to_numpy(float), df["dir_code"].to_numpy(int)
     tr = direction_training_rows(df, train_pool, train_cap)
     ca = calib_rows
-    Xca, _ = features.build_matrix(df.iloc[ca], branch)
-    print("  [%s] fit direction (%d iterations) on %d train (%.0f%% homopolymer) / %d calib ..."
-          % (label, iterations[0], tr.size, 100 * (motif[tr] == 1).mean(), ca.size), flush=True)
-    Xtr, names = features.build_matrix(df.iloc[tr], branch)
-    dmodel = M.train_direction(Xtr, y[tr], Xca, y[ca], n_iter=iterations[0])
+    Xca, _ = features.build_matrix(df.iloc[ca], branch, names)
+    print("  [%s] fit direction (%d iterations, %d classes) on %d train (%.0f%% homopolymer) / %d calib ..."
+          % (label, iterations[0], n_classes, tr.size, 100 * (motif[tr] == 1).mean(), ca.size), flush=True)
+    Xtr, names = features.build_matrix(df.iloc[tr], branch, names)
+    dmodel = M.train_direction(Xtr, y[tr], Xca, y[ca], n_iter=iterations[0], n_classes=n_classes)
     del Xtr
 
-    fires = _out_of_fold_gate_fires(df, train_pool, fold_groups, branch, train_cap, Xca, y[ca])
+    fires = _out_of_fold_gate_fires(df, train_pool, fold_groups, branch, train_cap, Xca, y[ca], names, n_classes)
     qtr = dataset.quota_sample(motif, eh, train_pool[fires], train_cap, SEED + 6)
     print("  [%s] fit q-median (%d iterations) on %d train rows the gate fires on (%d of %d pool rows fire) ..."
           % (label, iterations[1], qtr.size, int(fires.sum()), train_pool.size), flush=True)
-    Xq, _ = features.build_matrix(df.iloc[qtr], branch)
+    Xq, _ = features.build_matrix(df.iloc[qtr], branch, names)
     qreg = M.train_q_median(Xq, t[qtr], n_iter=iterations[1])
     return qreg, dmodel, names, Xca
 
@@ -215,16 +230,41 @@ def fit_heads(df, train_pool, calib_rows, fold_groups, branch, train_cap, iterat
 # the per-allele label, and the label that judges a homozygous call against both truth alleles.
 DIRECTION_LABEL_COLUMNS = ("dir_code", "dir_code_genotype")
 
+# Columns change B's label is computed from (``relative_tolerance_direction_labels``), plus the other truth allele of
+# homozygous calls for the genotype-level version.
+RELATIVE_TOLERANCE_LABEL_INPUTS = ("eh", "true", "motif_size", "fragment_length")
+
+
+def relative_tolerance_direction_labels(df, direction_label, relative_tolerance):
+    """Returns change B's 4-class label of each row of ``df`` (``features.relative_tolerance_direction_codes``).
+
+    With ``direction_label`` "dir_code_genotype", a homozygous call is judged against both truth alleles
+    (``features.genotype_level_direction_codes``), as ``dir_code_genotype`` does with the 3-class label.
+    """
+    eh, motif = df["eh"].to_numpy(float), df["motif_size"].to_numpy(float)
+    fragment_length = df["fragment_length"].to_numpy(float)
+
+    def codes_against(true):
+        return features.relative_tolerance_direction_codes(eh, true, motif, fragment_length, relative_tolerance)
+
+    true = df["true"].to_numpy(float)
+    if direction_label == "dir_code":
+        return codes_against(true)
+    return features.genotype_level_direction_codes(eh, true, df["true_other_allele"].to_numpy(float), codes_against)
+
 
 def fit_genotyping_regime(genotyping_regime, data_dir, train_cap, parquet_subdir="parquet",
-                          direction_label="dir_code"):
+                          direction_label="dir_code", relative_tolerance=None):
     """Fits the q-median + direction heads for one genotyping_regime on its full real-data pool.
 
     Holds out the calibration rows, mostly whole people (``_calib_mask``), then fits with ``fit_heads``
     on every chromosome at the regime's ``ITERATIONS_BY_REGIME``. Reads
     ``data_dir/<parquet_subdir>/<branch>.parquet`` (``dataset.BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION``) and
     trains the direction head on ``direction_label`` (one of ``DIRECTION_LABEL_COLUMNS``), which also decides
-    which training rows the out-of-fold gate fires on for the q-median head.
+    which training rows the out-of-fold gate fires on for the q-median head. With ``relative_tolerance`` (change B,
+    a fraction such as 0.10) the direction head has 4 classes instead, labeled by
+    ``relative_tolerance_direction_labels`` from the stored columns, and gets ``eh_bp_over_fragment_length`` as an
+    extra input.
 
     Returns:
         ``(qreg, dmodel, branch, feature_names, X_check)`` where ``X_check`` is a
@@ -233,16 +273,30 @@ def fit_genotyping_regime(genotyping_regime, data_dir, train_cap, parquet_subdir
     branch = features.GENOTYPING_REGIME_BRANCH[genotyping_regime]
     src = "quick" if genotyping_regime == features.GENOTYPING_REGIME_QUICK else "full"
     parquet = os.path.join(data_dir, parquet_subdir, "%s.parquet" % src)
-    need = (set(features.FULL_FEATURES) | set(features.ENGINEERED_RAW_INPUTS)
-            | {"t", direction_label, "chrom", "genotyping_regime", "individual", "representative"})
+    if relative_tolerance is None:
+        label_inputs = {direction_label}
+    else:
+        label_inputs = set(RELATIVE_TOLERANCE_LABEL_INPUTS) | (
+            {"true_other_allele"} if direction_label == "dir_code_genotype" else set())
+    need = (set(features.FULL_FEATURES) | set(features.ENGINEERED_RAW_INPUTS) | label_inputs
+            | {"t", "chrom", "genotyping_regime", "individual", "representative"})
     cols = [c for c in pq.ParquetFile(parquet).schema.names if c in need]
-    if direction_label not in cols:
-        raise SystemExit("ERROR: %s has no %s column; re-assemble it with %s" % (
-            parquet, direction_label, dataset.command_that_builds_branch_parquets(data_dir, parquet_subdir)))
+    missing_label_inputs = sorted(label_inputs - set(cols))
+    if missing_label_inputs:
+        raise SystemExit("ERROR: %s has no %s column(s); re-assemble it with %s" % (
+            parquet, ", ".join(missing_label_inputs),
+            dataset.command_that_builds_branch_parquets(data_dir, parquet_subdir)))
     df = pd.read_parquet(parquet, columns=cols)
-    # fit_heads trains on "dir_code"; with the genotype-level label, that column holds it.
-    df = df.rename(columns={direction_label: "dir_code"})
     df = df[df["genotyping_regime"] == genotyping_regime]
+    if relative_tolerance is None:
+        # fit_heads trains on "dir_code"; with the genotype-level label, that column holds it.
+        df = df.rename(columns={direction_label: "dir_code"})
+    else:
+        df = df.assign(dir_code=relative_tolerance_direction_labels(df, direction_label, relative_tolerance))
+        print("  [%s] relative-tolerance labels (x = %g): %s" % (
+            genotyping_regime, relative_tolerance,
+            {features.RELATIVE_TOLERANCE_DIR_CLASS_NAMES[c]: int(n)
+             for c, n in zip(*np.unique(df["dir_code"], return_counts=True))}), flush=True)
     print("  [%s] pool rows=%d" % (genotyping_regime, len(df)), flush=True)
 
     df = df.reset_index(drop=True)
@@ -263,7 +317,9 @@ def fit_genotyping_regime(genotyping_regime, data_dir, train_cap, parquet_subdir
     fold_groups = np.where(always, individual + "|" + chrom, individual)
     qreg, dmodel, names, Xca = fit_heads(
         df, np.where(~calib)[0], _cap(np.where(calib & representative)[0], held_cap, SEED + 2), fold_groups,
-        branch, train_cap, ITERATIONS_BY_REGIME[genotyping_regime], genotyping_regime)
+        branch, train_cap, ITERATIONS_BY_REGIME[genotyping_regime], genotyping_regime,
+        names=features.feature_names(branch, with_fragment_length_ratio=relative_tolerance is not None),
+        n_classes=M.N_CLASSES if relative_tolerance is None else len(features.RELATIVE_TOLERANCE_DIR_CLASS_NAMES))
     # A seeded sample spans the calibration people and chromosomes; the first rows would be one
     # person's first loci and exercise few tree paths.
     return qreg, dmodel, branch, names, Xca.sample(min(5000, len(Xca)), random_state=SEED)
@@ -273,7 +329,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default=os.path.join(HERE, "data"))
     parser.add_argument("--out", help="default: model/genotype_quality_model_from_HG002_and_CHM1_CHM13.<today>.json.gz, "
-                                      "with any non-default --training-population / --direction-label before the date")
+                                      "with any non-default --training-population / --direction-label / "
+                                      "--relative-tolerance before the date")
     parser.add_argument("--train-cap", type=int, default=1_000_000,
                         help="max train rows per genotyping_regime fit (0 = no cap)")
     parser.add_argument("--training-population", choices=sorted(dataset.BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION),
@@ -282,8 +339,15 @@ def main():
     parser.add_argument("--direction-label", choices=DIRECTION_LABEL_COLUMNS, default="dir_code",
                         help="dir_code: per-allele label (today's); dir_code_genotype: a homozygous call is OK only "
                              "if it is OK against both truth alleles")
+    parser.add_argument("--relative-tolerance", type=float,
+                        help="train change B's 4-class direction head (OK, TOO_LONG, TOO_SHORT, PAST_LIMIT) with this "
+                             "tolerance, a fraction such as 0.10 (features.relative_tolerance_direction_codes), with "
+                             "--direction-label choosing the per-allele or genotype-level version; writes "
+                             "format_version 3, which ExpansionHunter does not read yet")
     args = parser.parse_args()
-    args.out = args.out or _default_out(args.training_population, args.direction_label)
+    if args.relative_tolerance is not None and not 0 < args.relative_tolerance < 1:
+        parser.error("--relative-tolerance must be a fraction between 0 and 1, such as 0.10")
+    args.out = args.out or _default_out(args.training_population, args.direction_label, args.relative_tolerance)
     parquet_subdir = dataset.BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION[args.training_population]
 
     # Refuse to train on parquets that are missing or older than their upstream JSON/TSV sources.
@@ -295,7 +359,7 @@ def main():
         print("==== %s ====" % genotyping_regime, flush=True)
         qreg, dmodel, branch, names, X_check = fit_genotyping_regime(
             genotyping_regime, args.data_dir, args.train_cap or None, parquet_subdir=parquet_subdir,
-            direction_label=args.direction_label)
+            direction_label=args.direction_label, relative_tolerance=args.relative_tolerance)
         feat_names[branch] = names
         genotyping_regimes_json[genotyping_regime] = M.serialize_genotyping_regime(qreg, dmodel)
         M.verify_genotyping_regime(genotyping_regime, qreg, dmodel, genotyping_regimes_json[genotyping_regime], X_check)
@@ -306,6 +370,8 @@ def main():
     model = {"format_version": FORMAT_VERSION,
              "feature_names": {"quick": feat_names["quick"], "full": feat_names["full"]},
              "genotyping_regimes": genotyping_regimes_json}
+    if args.relative_tolerance is not None:
+        model.update(format_version=RELATIVE_TOLERANCE_FORMAT_VERSION, relative_tolerance=args.relative_tolerance)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     # allow_nan=False => raise rather than emit non-standard Infinity/NaN tokens (the serializer

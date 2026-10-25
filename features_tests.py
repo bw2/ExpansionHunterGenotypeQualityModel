@@ -176,5 +176,99 @@ class AddLabelsTest(unittest.TestCase):
         self.assertEqual(df["genotyping_regime"].iloc[1], features.GENOTYPING_REGIME_FULL_NONSPANNING)
 
 
+class RelativeToleranceDirectionCodesTest(unittest.TestCase):
+    """Change B's label: relative tolerance below the fragment length, the one-sided rule at or above it."""
+
+    @staticmethod
+    def _codes(eh, true, motif_size, fragment_length, x=0.10):
+        n = len(eh)
+        return features.relative_tolerance_direction_codes(
+            eh, np.broadcast_to(true, n), np.broadcast_to(motif_size, n), np.broadcast_to(fragment_length, n),
+            x).tolist()
+
+    def test_within_the_limit_the_tolerance_is_a_fraction_of_the_true_size(self):
+        # true 20 repeats (60 bp < 500 bp): tolerance max(1, 2) = 2 repeats.
+        self.assertEqual(self._codes([22, 23, 18, 17], 20, 3, 500),
+                         [features.OK, features.TOO_LONG, features.OK, features.TOO_SHORT])
+        # x = 15%: tolerance 3 repeats.
+        self.assertEqual(self._codes([23, 24], 20, 3, 500, x=0.15), [features.OK, features.TOO_LONG])
+
+    def test_short_alleles_keep_a_one_repeat_tolerance(self):
+        # true 5 repeats: 10% is 0.5, so the 1-repeat floor applies.
+        self.assertEqual(self._codes([6, 7, 4, 3], 5, 3, 500),
+                         [features.OK, features.TOO_LONG, features.OK, features.TOO_SHORT])
+
+    def test_past_the_limit_only_a_clear_over_call_or_a_call_short_of_the_limit_is_wrong(self):
+        # true 200 repeats x 5 bp = 1000 bp >= 500 bp: TOO_LONG above 220 repeats, TOO_SHORT below 450 bp (90 repeats).
+        self.assertEqual(self._codes([221, 220, 90, 89], 200, 5, 500),
+                         [features.TOO_LONG, features.PAST_LIMIT, features.PAST_LIMIT, features.TOO_SHORT])
+
+    def test_a_true_allele_exactly_at_the_fragment_length_is_past_the_limit(self):
+        # 100 repeats x 5 bp = 500 bp: a 95-repeat call is PAST_LIMIT, not OK as the within-limit rule would say.
+        self.assertEqual(self._codes([95], 100, 5, 500), [features.PAST_LIMIT])
+        self.assertEqual(self._codes([95], 100, 5, 501), [features.OK])
+
+    def test_without_a_fragment_length_there_is_no_limit(self):
+        for fragment_length in (np.nan, 0.0):
+            self.assertEqual(self._codes([100], 200, 5, fragment_length), [features.TOO_SHORT])
+        self.assertEqual(self._codes([100], 200, 5, 500), [features.PAST_LIMIT])
+
+
+class GenotypeLevelDirectionCodesTest(unittest.TestCase):
+    """``genotype_level_direction_codes`` with change B's label (FL 500 bp, 5 bp motif, x = 10%)."""
+
+    @staticmethod
+    def _codes(eh, true, true_other_allele):
+        eh = np.asarray(eh, dtype=float)
+
+        def codes_against(truth):
+            return features.relative_tolerance_direction_codes(eh, truth, np.full(eh.size, 5.0),
+                                                               np.full(eh.size, 500.0), 0.10)
+        return features.genotype_level_direction_codes(eh, true, true_other_allele, codes_against).tolist()
+
+    def test_a_missed_long_allele_makes_a_matching_call_too_short(self):
+        # truths 100 and 1000 bp, call 100 bp: OK against the short allele, TOO_SHORT against the long one.
+        self.assertEqual(self._codes([20], [20], [200]), [features.TOO_SHORT])
+
+    def test_when_both_are_missed_the_bigger_miss_wins(self):
+        # call 300 bp: TOO_LONG by 40 repeats against 100 bp, TOO_SHORT by 140 repeats against 1000 bp.
+        self.assertEqual(self._codes([60], [20], [200]), [features.TOO_SHORT])
+        # call 40 repeats: TOO_LONG by 20 against 20 repeats, TOO_SHORT by 10 against 50 repeats.
+        self.assertEqual(self._codes([40], [20], [50]), [features.TOO_LONG])
+
+    def test_ok_against_one_allele_and_past_the_limit_against_the_other_is_past_limit(self):
+        # truths 480 and 900 bp, call 470 bp.
+        self.assertEqual(self._codes([94], [96], [180]), [features.PAST_LIMIT])
+
+    def test_a_row_without_a_second_truth_allele_keeps_its_own_label(self):
+        self.assertEqual(self._codes([60, 20], [20, 20], [np.nan, np.nan]), [features.TOO_LONG, features.OK])
+
+
+class FragmentLengthRatioFeatureTest(unittest.TestCase):
+    def test_called_size_in_bp_over_the_fragment_length_and_empty_without_one(self):
+        df = pd.DataFrame({"eh": [10.4, 10.0, 10.0], "motif_size": [5, 5, 5], "fragment_length": [500.0, 0.0, np.nan],
+                           "ci_start": [9, 9, 9], "ci_end": [11, 11, 11], "ci_width": [2, 2, 2]})
+        ratio = features.add_engineered(df)[features.FRAGMENT_LENGTH_RATIO_FEATURE].tolist()
+        self.assertAlmostEqual(ratio[0], 0.1)   # round(10.4) * 5 / 500
+        self.assertTrue(np.isnan(ratio[1]) and np.isnan(ratio[2]))
+
+    def test_only_the_relative_tolerance_feature_lists_have_it(self):
+        self.assertNotIn(features.FRAGMENT_LENGTH_RATIO_FEATURE, features.add_engineered(
+            pd.DataFrame({"eh": [10.0], "ci_start": [9], "ci_end": [11], "ci_width": [2]})).columns)
+        for branch in (features.BRANCH_QUICK, features.BRANCH_FULL):
+            self.assertEqual(features.feature_names(branch, with_fragment_length_ratio=True),
+                             features.feature_names(branch) + [features.FRAGMENT_LENGTH_RATIO_FEATURE])
+
+    def test_a_parquet_must_supply_the_fragment_length_the_ratio_is_computed_from(self):
+        import tempfile
+        names = features.feature_names(features.BRANCH_QUICK, with_fragment_length_ratio=True)
+        stored = {c: [1.0] for c in features.QUICK_FEATURES if c not in features.ENGINEERED_FEATURES}
+        with tempfile.TemporaryDirectory() as d:
+            without, with_ = os.path.join(d, "without.parquet"), os.path.join(d, "with.parquet")
+            pd.DataFrame(stored).to_parquet(without)
+            pd.DataFrame(dict(stored, fragment_length=[500.0])).to_parquet(with_)
+            self.assertEqual(features.missing_feature_columns([without, with_], names), {without: ["fragment_length"]})
+
+
 if __name__ == "__main__":
     unittest.main()

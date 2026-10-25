@@ -81,6 +81,59 @@ class DirectionLabelOptionTest(unittest.TestCase):
             self.assertTrue(name.endswith(".%s.json.gz" % date), name)
 
 
+class RelativeToleranceOptionTest(unittest.TestCase):
+    """fit_genotyping_regime with --relative-tolerance: change B's label, 4 classes and the fragment-length input."""
+
+    def _fit(self, direction_label, with_fragment_length=True):
+        people = ["HG002", "CHM1_CHM13"] + ["S%02d" % i for i in range(8)]
+        rows = []
+        for person in people:
+            for chrom in ("1", "2"):
+                row = {c: 1.0 for c in features.FULL_FEATURES if c not in features.ENGINEERED_FEATURES}
+                # A homozygous 100 bp call: OK against its own 100 bp truth allele, TOO_SHORT against the other
+                # 1000 bp one (past the 500 bp fragment length).
+                row.update({"eh": 20.0, "motif_size": 5.0, "true": 20.0, "true_other_allele": 200.0,
+                            "ci_start": 19.0, "ci_end": 21.0, "t": 0.0, "dir_code": features.TOO_LONG,
+                            "dir_code_genotype": features.TOO_LONG, "chrom": chrom, "genotyping_regime": "quick",
+                            "individual": person, "representative": True})
+                if with_fragment_length:
+                    row["fragment_length"] = 500.0
+                rows.append(row)
+        captured = {}
+
+        def fake_fit_heads(df, *args, **kwargs):
+            captured.update(dir_code=df["dir_code"].unique().tolist(), **kwargs)
+            raise StopIteration  # stop before serialization; only what fit_heads gets matters here
+
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "parquet_all_loci"))
+            pd.DataFrame(rows).to_parquet(os.path.join(d, "parquet_all_loci", "quick.parquet"))
+            with mock.patch.object(train, "fit_heads", side_effect=fake_fit_heads), self.assertRaises(StopIteration):
+                train.fit_genotyping_regime("quick", d, None, parquet_subdir="parquet_all_loci",
+                                            direction_label=direction_label, relative_tolerance=0.10)
+        return captured
+
+    def test_labels_are_computed_from_the_stored_columns_not_read(self):
+        self.assertEqual(self._fit("dir_code")["dir_code"], [features.OK])
+        self.assertEqual(self._fit("dir_code_genotype")["dir_code"], [features.TOO_SHORT])
+
+    def test_the_head_gets_four_classes_and_the_fragment_length_ratio(self):
+        captured = self._fit("dir_code")
+        self.assertEqual(captured["n_classes"], 4)
+        self.assertEqual(captured["names"], features.feature_names(features.BRANCH_QUICK, with_fragment_length_ratio=True))
+
+    def test_a_table_without_fragment_length_is_refused(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._fit("dir_code", with_fragment_length=False)
+        self.assertIn("fragment_length", str(ctx.exception))
+
+    def test_each_tolerance_gets_its_own_default_output_name(self):
+        names = {train._default_out("all_loci", "dir_code_genotype", x) for x in (None, 0.10, 0.15)}
+        self.assertEqual(len(names), 3)
+        self.assertTrue(any(name.endswith("_all_loci_dir_code_genotype_relative_tolerance_10pct.%s.json.gz"
+                                          % os.path.basename(train._default_out()).split(".")[1]) for name in names))
+
+
 class IterationsByRegimeTest(unittest.TestCase):
     def test_every_regime_has_positive_direction_and_q_median_sizes(self):
         self.assertEqual(set(train.ITERATIONS_BY_REGIME), set(features.GENOTYPING_REGIMES))

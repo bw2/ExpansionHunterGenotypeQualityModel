@@ -8,7 +8,8 @@ consumer assembles features in the exact same order):
   ``inrepeat_total``.
 
 ``ci_asymmetry`` and ``ci_over_eh`` are engineered here (next to the feature list)
-from the raw CI columns. ``build_matrix`` returns a float DataFrame with exactly
+from the raw CI columns, and ``eh_bp_over_fragment_length`` (change B's relative-tolerance models only) from
+the call and the locus's FragmentLength. ``build_matrix`` returns a float DataFrame with exactly
 the branch's feature columns, NaN preserved for ``HistGradientBoosting`` to handle.
 
 The label helpers turn a joined ``(eh, true)`` frame into the training targets:
@@ -46,9 +47,17 @@ QUICK_FEATURES = [
 # fast path never counts in-repeat reads).
 FULL_FEATURES = QUICK_FEATURES + ["left_flank_norm_depth", "right_flank_norm_depth", "inrepeat_total"]
 
-# Raw CI/eh columns the engineered features derive from (NOT present in the parquet
-# as features; the engineered ci_asymmetry/ci_over_eh are rebuilt by ``add_engineered``).
-ENGINEERED_RAW_INPUTS = ("ci_start", "ci_end", "ci_width", "eh")
+# Change B's extra input (ALL_LOCI_AND_RELATIVE_TOLERANCE_RETRAIN_PLAN.md): the called size over the locus's
+# FragmentLength, so the relative-tolerance models can tell how close a call is to the size limit of the library
+# they score. Only those models declare it (``feature_names(..., with_fragment_length_ratio=True)``).
+FRAGMENT_LENGTH_RATIO_FEATURE = "eh_bp_over_fragment_length"
+
+# Features ``add_engineered`` computes, so they are never stored in the parquets.
+ENGINEERED_FEATURES = ("ci_asymmetry", "ci_over_eh", FRAGMENT_LENGTH_RATIO_FEATURE)
+
+# Raw columns the engineered features derive from (NOT present in the parquet as features; the engineered
+# columns are rebuilt by ``add_engineered``).
+ENGINEERED_RAW_INPUTS = ("ci_start", "ci_end", "ci_width", "eh", "fragment_length")
 
 # Human-readable definition of every model feature (for the report's glossary).
 FEATURE_DEFINITIONS = {
@@ -82,11 +91,16 @@ FEATURE_DEFINITIONS = {
     "left_flank_norm_depth": "Left-flank-normalized depth (full branch only).",
     "right_flank_norm_depth": "Right-flank-normalized depth (full branch only).",
     "inrepeat_total": "Reads lying entirely inside the repeat at the locus, summed over CountsOfInrepeatReads (full branch only).",
+    FRAGMENT_LENGTH_RATIO_FEATURE: "Engineered: called allele size in bp (motif_size * round(eh)) over the locus's "
+                                   "FragmentLength; empty where FragmentLength is missing or 0 (relative-tolerance "
+                                   "models only).",
 }
 
-# Direction class coding -- also the output column order of every probability vector.
-OK, TOO_LONG, TOO_SHORT = 0, 1, 2
+# Direction class coding -- also the output column order of every probability vector. PAST_LIMIT is the 4th class of
+# change B's relative-tolerance label (``relative_tolerance_direction_codes``); the 3-class models never use it.
+OK, TOO_LONG, TOO_SHORT, PAST_LIMIT = 0, 1, 2, 3
 DIR_CLASS_NAMES = ["OK", "TOO_LONG", "TOO_SHORT"]
+RELATIVE_TOLERANCE_DIR_CLASS_NAMES = DIR_CLASS_NAMES + ["PAST_LIMIT"]
 
 # Genotyping branches (feature contracts) and genotyping_regimes (one model-set each).
 BRANCH_QUICK = "quick"
@@ -107,11 +121,13 @@ GENOTYPING_REGIME_DISPLAY = {GENOTYPING_REGIME_QUICK: "quick", GENOTYPING_REGIME
 
 
 def add_engineered(df):
-    """Returns a copy of ``df`` with the engineered CI columns added.
+    """Returns a copy of ``df`` with the engineered columns added.
 
     ``ci_asymmetry = ((ci_end - eh) - (eh - ci_start)) / (ci_width + 1)`` and
     ``ci_over_eh = ci_width / (eh + 1)``, each set to 0 wherever its raw inputs are
-    missing (legitimate negatives/zeros are kept).
+    missing (legitimate negatives/zeros are kept). Where ``df`` has ``fragment_length``, also
+    ``eh_bp_over_fragment_length = motif_size * round(eh) / fragment_length``, left empty where the fragment
+    length is missing or 0 (a locus without a measured fragment length has no size limit).
     """
     df = df.copy()
     # ANALYSIS_OK[imputation]: NaN ci_*/eh are set to 0 below (ci_missing), per this docstring above.
@@ -122,6 +138,10 @@ def add_engineered(df):
     ci_missing = ci_start.isna() | ci_end.isna() | ci_width.isna()
     df["ci_asymmetry"] = (((ci_end - eh) - (eh - ci_start)) / (ci_width + 1)).where(~ci_missing, 0.0)
     df["ci_over_eh"] = (ci_width / (eh + 1)).where(~(ci_width.isna() | eh.isna()), 0.0)
+    if "fragment_length" in df.columns:
+        fragment_length = pd.to_numeric(df["fragment_length"], errors="coerce")
+        eh_bp = pd.to_numeric(df["motif_size"], errors="coerce") * eh.round()
+        df[FRAGMENT_LENGTH_RATIO_FEATURE] = (eh_bp / fragment_length).where(fragment_length > 0)
     return df
 
 
@@ -136,11 +156,15 @@ def missing_feature_columns(parquet_paths, names=None):
     columns, so they are never stored. Only paths with at least one missing column are returned.
 
     ``names`` defaults to ``FULL_FEATURES`` (the current contract); pass a MODEL's declared feature
-    list to ask instead whether the parquets can supply what that particular model needs.
+    list to ask instead whether the parquets can supply what that particular model needs. A list with
+    ``eh_bp_over_fragment_length`` needs the ``fragment_length`` column it is computed from.
     """
     import pyarrow.parquet as pq  # local: only the parquet-facing callers need this dependency
 
-    required = set(FULL_FEATURES if names is None else names) - {"ci_asymmetry", "ci_over_eh"}
+    required = set(FULL_FEATURES if names is None else names)
+    if FRAGMENT_LENGTH_RATIO_FEATURE in required:
+        required.add("fragment_length")
+    required -= set(ENGINEERED_FEATURES)
     out = {}
     for path in parquet_paths:
         missing = sorted(required - set(pq.ParquetFile(path).schema.names))
@@ -149,11 +173,15 @@ def missing_feature_columns(parquet_paths, names=None):
     return out
 
 
-def feature_names(branch):
-    """Returns the ordered feature list for ``branch`` (``"full"`` or ``"quick"``)."""
+def feature_names(branch, with_fragment_length_ratio=False):
+    """Returns the ordered feature list for ``branch`` (``"full"`` or ``"quick"``).
+
+    ``with_fragment_length_ratio`` appends ``eh_bp_over_fragment_length``, the relative-tolerance models' extra input.
+    """
     if branch not in (BRANCH_FULL, BRANCH_QUICK):
         raise ValueError("branch must be 'full' or 'quick'; got %r" % branch)
-    return list(FULL_FEATURES if branch == BRANCH_FULL else QUICK_FEATURES)
+    names = list(FULL_FEATURES if branch == BRANCH_FULL else QUICK_FEATURES)
+    return names + [FRAGMENT_LENGTH_RATIO_FEATURE] if with_fragment_length_ratio else names
 
 
 def build_matrix(df, branch, names=None):
@@ -216,6 +244,55 @@ def direction_codes(eh, true, tol):
     dr = np.round(np.asarray(eh, dtype=float)) - np.round(np.asarray(true, dtype=float))
     tol = np.asarray(tol, dtype=float)
     return np.where(dr > tol, TOO_LONG, np.where(dr < -tol, TOO_SHORT, OK)).astype(int)
+
+
+def relative_tolerance_direction_codes(eh, true, motif_size, fragment_length, tolerance_fraction):
+    """Returns change B's label, ``{OK=0, TOO_LONG=1, TOO_SHORT=2, PAST_LIMIT=3}`` per allele.
+
+    With ``x = tolerance_fraction``, ``true_bp = motif_size * round(true)``, ``eh_bp = motif_size * round(eh)`` and
+    ``dr = round(eh) - round(true)``:
+
+    - a true allele shorter than the locus's fragment length is OK if ``|dr| <= max(1, x * round(true))``, TOO_LONG
+      above that and TOO_SHORT below it;
+    - a true allele at least the fragment length is TOO_LONG if ``eh > (1 + x) * true``, TOO_SHORT if
+      ``eh_bp < (1 - x) * fragment_length``, and otherwise PAST_LIMIT: the call is as long as ExpansionHunter can
+      measure, so it is right that the allele is long but its size is unknown.
+
+    A missing or 0 fragment length has no limit, so the first rule applies.
+    """
+    eh, true = np.asarray(eh, dtype=float), np.asarray(true, dtype=float)
+    motif_size, fragment_length = np.asarray(motif_size, dtype=float), np.asarray(fragment_length, dtype=float)
+    dr = np.round(eh) - np.round(true)
+    tol = np.maximum(1.0, tolerance_fraction * np.round(true))
+    within_limit = np.where(dr > tol, TOO_LONG, np.where(dr < -tol, TOO_SHORT, OK))
+    past_limit = np.where(eh > (1 + tolerance_fraction) * true, TOO_LONG,
+                          np.where(motif_size * np.round(eh) < (1 - tolerance_fraction) * fragment_length,
+                                   TOO_SHORT, PAST_LIMIT))
+    # NaN compares False, so a missing fragment length stays within the limit.
+    is_past_limit = (fragment_length > 0) & (motif_size * np.round(true) >= fragment_length)
+    return np.where(is_past_limit, past_limit, within_limit).astype(int)
+
+
+def genotype_level_direction_codes(eh, true, true_other_allele, direction_codes_against):
+    """Returns the label of each call judged against both truth alleles where it has two (homozygous calls).
+
+    ``direction_codes_against(truth)`` labels the calls ``eh`` against a truth size per row (the per-allele rule).
+    A call is labeled against ``true`` (its own truth allele, the shorter one for a homozygous call) and, where
+    ``true_other_allele`` is set, against the other truth allele too. If only the other one is missed (TOO_LONG or
+    TOO_SHORT), it takes that label; if both are missed, the label of the one missed by more repeats (the other one
+    on a tie). With change B's labels, a call that misses neither but is PAST_LIMIT against the other allele is
+    PAST_LIMIT: the genotype has an allele too long to measure. Every other row keeps its own label.
+    """
+    eh, true = np.asarray(eh, dtype=float), np.asarray(true, dtype=float)
+    true_other_allele = np.asarray(true_other_allele, dtype=float)
+    has_other = ~np.isnan(true_other_allele)
+    other_true = np.where(has_other, true_other_allele, true)
+    own, other = direction_codes_against(true), direction_codes_against(other_true)
+    own_missed, other_missed = np.isin(own, (TOO_LONG, TOO_SHORT)), np.isin(other, (TOO_LONG, TOO_SHORT))
+    miss_own, miss_other = np.abs(np.round(eh) - np.round(true)), np.abs(np.round(eh) - np.round(other_true))
+    use_other = has_other & ((other_missed & (~own_missed | (miss_other >= miss_own)))
+                             | (~own_missed & (other == PAST_LIMIT)))
+    return np.where(use_other, other, own).astype(int)
 
 
 def genotyping_regime_of(genotyping_branch, spanning_at_called):
