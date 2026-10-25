@@ -9,7 +9,8 @@ Training pipeline for the per-allele **genotype-quality model** used by the bw2 
 
 The trained model serializes to a gzipped JSON (`format_version: 2`) that the EH binary compiles in
 (`ehunter/genotype_quality/GenotypeQualityModel.cpp` parses it). The downstream rule is "apply the LCF
-only when `pOk < 0.5`" — EH emits the raw fields and does no thresholding itself.
+only when `pOk < 0.5`". EH applies that rule to the LCF it writes (1 wherever the written `pOk` is 0.5 or more) but
+never changes a call itself; this repository's evaluations apply the same rule to the model's own predictions.
 
 ## One command
 
