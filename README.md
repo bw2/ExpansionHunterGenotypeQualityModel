@@ -28,8 +28,9 @@ pip install -r requirements.txt
    `model/genotype_quality_model_from_HG002_and_CHM1_CHM13.<date>.json.gz`, round-trip-verifying that
    the serialized trees/softmax/isotonic reproduce sklearn's predictions.
 3. **`report.py`** — 5-fold chromosome-clean cross-validation, then `report/model_report.<model date>_model.html`
-   (e.g. `model_report.2026-10-08_model.html`, named after the `--model` file so reports of different models
-   don't overwrite each other) with the
+   (e.g. `model_report.2026-10-24_all_loci_model.html` for `..._CHM1_CHM13_all_loci.20261024.json.gz`: the
+   `--model` file's date, then whatever its name has between `CHM1_CHM13` and the date, so reports of different
+   models don't overwrite each other) with the
    raw-EH-vs-gated-LCF MAE chart, per-genotyping_regime held-out accuracy, and — separately for each of
    the two heads — a relative-feature-importance panel and an add-one-feature ablation curve (see
    [Feature importance and ablation](#feature-importance-and-ablation)).

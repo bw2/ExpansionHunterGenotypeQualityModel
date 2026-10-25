@@ -62,7 +62,9 @@ import features
 # folder per sample label, written by tandem-repeat-explorer's
 # data-prep/expansion_hunter_genotype_quality/run_expansion_hunter_on_selected_samples.py from
 # short_read_samples_with_truth_data.tsv: {EH_RESULTS_ROOT}/{sample_label}/json/<catalog name>.json.gz.
-EH_RESULTS_ROOT = "gs://tandem-repeat-explorer/tool_genotype_quality/expansion_hunter_v2.1"
+# Re-genotyped on 2026-10-22 with ExpansionHunter-bw2 e90307c (Hail batches 8450427 and 8450428). The tables of the
+# 2026-10-17 model and earlier came from EH b1fbc23 outputs in .../tool_genotype_quality/expansion_hunter_v2.1.
+EH_RESULTS_ROOT = "gs://tandem-repeat-explorer/tool_genotype_quality/expansion_hunter_v2.1_eh_e90307c"
 # Tool-independent truth on the same catalog, built directly from the dipcall/long-read-assembly
 # pipeline (run_truth_genotyping_on_selected_samples.py in the same folder), one file per sample (not
 # per sample+coverage -- truth doesn't depend on short-read coverage). Never tied to a specific EH run,
@@ -1011,6 +1013,31 @@ def variant_locus_rows(df):
     return df[df["variant_locus"].to_numpy(bool)].reset_index(drop=True) if "variant_locus" in df.columns else df
 
 
+def write_per_source_parquet(out_path, json_local, genotypes_tsv_local, high_confidence_bed_local, row_sample_id,
+                             source_desc, keep_hom_ref_loci, sources, cloud_versions):
+    """Extracts one source's rows, joins their truth and writes its per-source parquet to ``out_path``, then records
+    what it was built from and deletes the downloads (``_record_sources_and_remove_downloads``).
+
+    Shared by the training combos (``build_combo``), the held-out samples (``heldout.build_sample``) and the Hail Batch
+    jobs of ``build_per_source_parquets_on_hail_batch.py``, so a parquet comes out the same wherever it is built.
+    ``row_sample_id``, ``source_desc`` and ``keep_hom_ref_loci`` are passed to ``extract_rows_and_join_truth``;
+    ``sources`` and ``cloud_versions`` to ``_record_sources_and_remove_downloads``.
+
+    Returns:
+        The rows written, as a DataFrame.
+    """
+    merged = extract_rows_and_join_truth(json_local, genotypes_tsv_local, high_confidence_bed_local, row_sample_id,
+                                         source_desc, keep_hom_ref_loci=keep_hom_ref_loci).drop(columns=["sample_id"])
+    # Feature columns stay float64 all the way to fit(). Downcasting here used to halve the parquet
+    # and frame size, but it permanently quantized every value: sklearn's HistGradientBoosting upcasts
+    # back to float64 internally (X_DTYPE) and bins to uint8, so the downcast bought nothing at fit
+    # time while forcing the C++ scorer to reproduce it exactly. See features.build_matrix.
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    merged.to_parquet(out_path, index=False)
+    _record_sources_and_remove_downloads(out_path, sources, cloud_versions)
+    return merged
+
+
 def build_combo(subdir, sample, cov_label, sample_label, data_dir, force, keep_hom_ref_loci=False):
     """Downloads + joins one combo and writes its per-combo parquet (all rows, both branches).
 
@@ -1049,17 +1076,9 @@ def build_combo(subdir, sample, cov_label, sample_label, data_dir, force, keep_h
     assert_eh_build_matches("%s %s" % (sample, cov_label),
                             [("json shard %d" % i, p) for i, p in enumerate(json_local)])
 
-    merged = extract_rows_and_join_truth(json_local, genotypes_tsv_local, high_confidence_bed_local,
-                                         "%s_%s" % (sample, cov_label), "%s %s" % (sample, cov_label),
-                                         keep_hom_ref_loci=keep_hom_ref_loci).drop(columns=["sample_id"])
-    # Feature columns stay float64 all the way to fit(). Downcasting here used to halve the parquet
-    # and frame size, but it permanently quantized every value: sklearn's HistGradientBoosting upcasts
-    # back to float64 internally (X_DTYPE) and bins to uint8, so the downcast bought nothing at fit
-    # time while forcing the C++ scorer to reproduce it exactly. See features.build_matrix.
-
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    merged.to_parquet(out_path, index=False)
-    _record_sources_and_remove_downloads(out_path, json_sources + truth_sources, cloud_versions)
+    merged = write_per_source_parquet(out_path, json_local, genotypes_tsv_local, high_confidence_bed_local,
+                                      "%s_%s" % (sample, cov_label), "%s %s" % (sample, cov_label), keep_hom_ref_loci,
+                                      json_sources + truth_sources, cloud_versions)
     matched = int(merged["true"].notna().sum())
     print("    %d rows, %d matched truth (%.4f), %d quick / %d full"
           % (len(merged), matched, matched / max(len(merged), 1),
@@ -1091,7 +1110,8 @@ def label_and_filter(df):
 
     Returns:
         A ``(kept_df, drop_counts)`` tuple. ``kept_df`` has ``chrom`` + the label columns added and
-        the heavy ``locus_id`` / ``is_negative_locus`` columns dropped.
+        the ``is_negative_locus`` column dropped. ``locus_id`` stays, so the assembled branch tables can be
+        joined per locus.
     """
     df = df.copy()
     df["chrom"] = _chrom_from_locus(df["locus_id"])
@@ -1131,7 +1151,7 @@ def label_and_filter(df):
     df = df[keep].reset_index(drop=True)
     features.add_labels(df)
     df["dir_code_genotype"] = _genotype_level_direction_codes(df)
-    df = df.drop(columns=[c for c in ("locus_id", "is_negative_locus") if c in df.columns])
+    df = df.drop(columns=[c for c in ("is_negative_locus",) if c in df.columns])
     return df, drops
 
 

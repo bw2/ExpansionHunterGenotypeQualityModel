@@ -21,7 +21,10 @@ TRAIN_CAP="${TRAIN_CAP:-1000000}"
 CV_TRAIN_CAP="${CV_TRAIN_CAP:-400000}"
 
 echo "==== [1/4] download + build parquet ===================================="
-"$PYTHON" dataset.py --data-dir "$DATA_DIR"
+# --keep-hom-ref-loci here and for the held-out samples below: the per-source parquets keep a sample of the loci
+# where the truth equals the reference (today's recipe uses only their variant-locus rows), and a rebuild without
+# the flag would replace them with variant-only ones.
+"$PYTHON" dataset.py --data-dir "$DATA_DIR" --keep-hom-ref-loci
 
 echo "==== [2/4] train + export model ======================================="
 "$PYTHON" train.py --data-dir "$DATA_DIR" --out "$MODEL_OUT" --train-cap "$TRAIN_CAP"
@@ -33,7 +36,7 @@ echo "==== [2/4] train + export model ======================================="
 # (no extra gen_datasets.py step) -- pass --skip-heldout-samples to opt out.
 if [ "${RUN_HELDOUT_SAMPLES:-0}" = "1" ]; then
   echo "==== build held-out per-sample parquets (heldout.SAMPLES) ============="
-  "$PYTHON" heldout.py --model "$MODEL_OUT" --build-only
+  "$PYTHON" heldout.py --model "$MODEL_OUT" --build-only --keep-hom-ref-loci
 fi
 
 echo "==== [3/4] evaluate (5-fold CV) + HTML report ========================="

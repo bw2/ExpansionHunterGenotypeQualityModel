@@ -159,7 +159,7 @@
           <br><b>Dataset regeneration (default-on):</b> before rendering the dataset sections, <span class="file">report.py</span> calls <span class="file">gen_datasets.generate</span> for every dataset (held-out HPRC, HG002 genome) to refresh its eval/stacked artifacts from the locally-built parquets (no download), and drops any artifact recorded for a different model than <span class="file">--model</span>. Pass <span class="file">--skip-heldout-samples</span> to opt out; a dataset whose parquets haven't been built is skipped.</li>
       </ol>
       <p class="kicker">Outputs</p>
-      <ul><li><span class="file">report/results.json</span>, <span class="file">report/dir_oof.npz</span>, the PNG charts, and the final <span class="file">report/model_report.&lt;model date&gt;_model.html</span> (e.g. <span class="file">model_report.2026-10-08_model.html</span>, named after the <code>--model</code> file).</li></ul>
+      <ul><li><span class="file">report/results.json</span>, <span class="file">report/dir_oof.npz</span>, the PNG charts, and the final <span class="file">report/model_report.&lt;model date&gt;_model.html</span> (e.g. <span class="file">model_report.2026-10-24_all_loci_model.html</span>, named after the <code>--model</code> file: its date, then whatever its name has between <code>CHM1_CHM13</code> and the date).</li></ul>
     </div>
   </li>
 

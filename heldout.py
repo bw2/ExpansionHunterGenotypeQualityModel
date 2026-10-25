@@ -93,16 +93,9 @@ def build_sample(sample, data_dir, force, keep_hom_ref_loci=False):
     dataset.assert_eh_build_matches(
         sample, [("json shard %d" % i, p) for i, p in enumerate(json_local)])
 
-    merged = dataset.extract_rows_and_join_truth(
-        json_local, genotypes_tsv_local, high_confidence_bed_local, sample, sample,
-        keep_hom_ref_loci=keep_hom_ref_loci).drop(columns=["sample_id"])
-    # Feature columns stay float64 all the way to fit(). Downcasting here used to halve the parquet
-    # and frame size, but it permanently quantized every value: sklearn's HistGradientBoosting upcasts
-    # back to float64 internally (X_DTYPE) and bins to uint8, so the downcast bought nothing at fit
-    # time while forcing the C++ scorer to reproduce it exactly. See features.build_matrix.
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    merged.to_parquet(out_path, index=False)
-    dataset._record_sources_and_remove_downloads(out_path, json_sources + truth_sources, cloud_versions)
+    merged = dataset.write_per_source_parquet(out_path, json_local, genotypes_tsv_local, high_confidence_bed_local,
+                                              sample, sample, keep_hom_ref_loci, json_sources + truth_sources,
+                                              cloud_versions)
     print("    %d rows (%d matched truth)" % (len(merged), int(merged["true"].notna().sum())), flush=True)
     return out_path
 

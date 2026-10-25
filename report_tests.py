@@ -7,6 +7,7 @@ assertions beyond "a PNG got written", which would just re-test matplotlib itsel
 """
 
 import base64
+import datetime
 import io
 import os
 import tempfile
@@ -138,7 +139,7 @@ class TableBuildersTest(unittest.TestCase):
         self.assertIn("coverage", note)
 
     def test_no_stale_warning_when_the_ranking_covers_the_contract(self):
-        full = [(f, 1.0, 0.0) for f in features.FULL_MODEL_FEATURES]
+        full = [(f, 1.0, 0.0) for f in features.FULL_FEATURES]
         quick = [(f, 1.0, 0.0) for f in features.QUICK_FEATURES]
         results = [dict(r, importance=(quick if r["genotyping_regime"] == features.GENOTYPING_REGIME_QUICK
                                        else full))
@@ -199,8 +200,21 @@ class ImgTest(unittest.TestCase):
 class ReportHtmlNameTest(unittest.TestCase):
     def test_dated_model_gets_its_date(self):
         self.assertEqual(
-            R.report_html_name("/m/genotype_quality_model_from_HG002_and_CHM1_CHM13_plus50.20261008.json.gz"),
+            R.report_html_name("/m/genotype_quality_model_from_HG002_and_CHM1_CHM13.20261008.json.gz"),
             "model_report.2026-10-08_model.html")
+
+    def test_what_the_name_has_before_the_date_follows_the_date(self):
+        self.assertEqual(
+            R.report_html_name("/m/genotype_quality_model_from_HG002_and_CHM1_CHM13_plus50.20261017.json.gz"),
+            "model_report.2026-10-17_plus50_model.html")
+
+    def test_same_day_models_of_different_training_choices_get_different_names(self):
+        paths = [R.train._default_out(population, label)
+                 for population in ("variant_loci", "all_loci") for label in ("dir_code", "dir_code_genotype")]
+        names = [R.report_html_name(path) for path in paths]
+        self.assertEqual(len(set(names)), len(paths))
+        self.assertEqual(R.report_html_name(R.train._default_out("all_loci", "dir_code")),
+                         "model_report.%s_all_loci_model.html" % datetime.date.today().isoformat())
 
     def test_model_name_not_ending_in_a_date_is_used_whole(self):
         self.assertEqual(R.report_html_name("model/q_plus50.20261006.quick500.json.gz"),

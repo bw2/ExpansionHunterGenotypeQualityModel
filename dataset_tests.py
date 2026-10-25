@@ -329,7 +329,7 @@ class LabelAndFilterTest(unittest.TestCase):
                                  "missing_eh_or_true": 1, "nonpositive_eh_or_true": 1,
                                  "missing_motif_size": 1, "no_own_quality_metrics": 0})
         self.assertEqual(len(kept), 2)
-        self.assertNotIn("locus_id", kept.columns)
+        self.assertEqual(sorted(kept["locus_id"]), ["1-9-10-A", "2-1-2-A"])
         self.assertNotIn("is_negative_locus", kept.columns)
         quick_row = kept[kept["genotyping_branch"] == "quick"].iloc[0]
         self.assertEqual(quick_row["chrom"], "1")

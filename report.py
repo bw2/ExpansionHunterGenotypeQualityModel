@@ -1329,16 +1329,16 @@ def _img_toggle(excluded_png, homopolymer_png, gid):
 def _feature_glossary(results):
     """Feature definition table: EVERY current feature, ordered by full_nonspanning importance rank.
 
-    Driven by ``features.FULL_FEATURES`` rather than by the cached ranking. Enumerating the ranking
+    Driven by ``features.feature_names`` rather than by the cached ranking. Enumerating the ranking
     instead silently dropped any feature added after ``results.json`` was written -- the published
     report shipped a 24-row table while the contract already had 29 features, with no warning.
-    Features the cached ranking does not cover, including the quick-only ``strand_bias_phred``, sort
-    last and show ``#-`` instead of a rank.
+    Features the cached ranking does not cover sort last and show ``#-`` instead of a rank.
     """
     ranked = {r["genotyping_regime"]: r for r in
               results}[features.GENOTYPING_REGIME_FULL_NONSPANNING]["importance"]
     rank = {feat: i for i, (feat, _, _) in enumerate(ranked, start=1)}
-    names = sorted(features.FULL_FEATURES, key=lambda f: rank.get(f, len(rank) + 1))
+    branch = features.GENOTYPING_REGIME_BRANCH[features.GENOTYPING_REGIME_FULL_NONSPANNING]
+    names = sorted(features.feature_names(branch), key=lambda f: rank.get(f, len(rank) + 1))
     rows = ["<tr><th>rank</th><th>feature</th><th>definition</th></tr>"]
     for feat in names:
         rows.append("<tr><td>%s</td><td><code>%s</code></td><td>%s</td></tr>" % (
@@ -1741,7 +1741,12 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
 
 def report_html_name(model_path):
     """Returns the report's file name, suffixed with the model it describes so that one model's report
-    never overwrites another's: ``..._plus50.20261008.json.gz`` -> ``model_report.2026-10-08_model.html``.
+    never overwrites another's: the model's date, then whatever its name has between ``CHM1_CHM13`` and the
+    date, which is where ``train._default_out`` puts a non-default training population or direction label:
+
+    - ``..._CHM1_CHM13.20261024.json.gz`` -> ``model_report.2026-10-24_model.html``
+    - ``..._CHM1_CHM13_all_loci.20261024.json.gz`` -> ``model_report.2026-10-24_all_loci_model.html``
+    - ``..._CHM1_CHM13_plus50.20261017.json.gz`` -> ``model_report.2026-10-17_plus50_model.html``
 
     A model file name that does not end in an 8-digit date (e.g. ``....20261006.quick500.json.gz``) is
     used whole, minus ``.json.gz``, as the suffix. Without a model the name is ``model_report.html``.
@@ -1752,9 +1757,11 @@ def report_html_name(model_path):
     for extension in (".gz", ".json"):
         if stem.endswith(extension):
             stem = stem[:-len(extension)]
-    date = stem.rsplit(".", 1)[-1]
+    name, _, date = stem.rpartition(".")
     if len(date) == 8 and date.isdigit():
-        return "model_report.%s-%s-%s_model.html" % (date[:4], date[4:6], date[6:])
+        variant = name.partition("CHM1_CHM13")[2].strip("_")
+        return "model_report.%s-%s-%s%s_model.html" % (date[:4], date[4:6], date[6:],
+                                                       "_" + variant if variant else "")
     return "model_report.%s_model.html" % stem
 
 
