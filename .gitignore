@@ -25,4 +25,4 @@ __pycache__/
 
 # Legacy reference code + local code-review artifacts (not committed)
 original/
-.code_review_local/
+.code_review/
