@@ -39,7 +39,6 @@ _REGION_RE = re.compile(r"^([^:]+):(\d+)-(\d+)$")
 # names are leaf names. Source of truth for the field names is ``extract_variant_rows`` below.
 EH_OUTPUT_FIELDS = [
     ("Coverage", "Per-locus read depth over the locus's two reference flanks."),
-    ("FragmentLength", "Per-locus fragment length estimate (stored as fragment_length; not a model input)."),
     ("RepeatUnit", "Per-variant: the repeat motif; its length is motif_size."),
     ("ReferenceRegion", "Per-variant: the reference repeat interval; gives ref_size_bp and num_repeats_in_reference."),
     ("QuickGenotype", "Per-variant: whether EH's quick genotyping path made the call; selects the quick bucket."),
@@ -234,7 +233,6 @@ def _no_call_rows(locus_result, sample_id, branch, motif_size, reference_repeat_
             "left_flank_norm_depth": None,
             "right_flank_norm_depth": None,
             "inrepeat_total": None,
-            "fragment_length": locus_result.get("FragmentLength"),
             "eh_minus_spanning_mode_naive": None,
             "spanning_mode_naive_support": None,
             "het_gap": None,
@@ -331,7 +329,6 @@ def extract_variant_rows(variant, locus_result, sample_id):
             "read_repeat_purity": aqm.get("ReadRepeatPurity"),
             "genotyping_branch": branch,
             # Stored for later experiments, not model inputs (ALL_LOCI_AND_RELATIVE_TOLERANCE_RETRAIN_PLAN.md).
-            "fragment_length": locus_result.get("FragmentLength"),
             "eh_minus_spanning_mode_naive": (eh - spanning_mode_size) if spanning_mode_size is not None else None,
             "spanning_mode_naive_support": spanning_mode_support,
             "het_gap": (eh - other_eh) if other_eh is not None else None,

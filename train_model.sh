@@ -24,6 +24,12 @@ echo "==== [1/4] download + build parquet ===================================="
 # --keep-hom-ref-loci here and for the held-out samples below: the per-source parquets keep a sample of the loci
 # where the truth equals the reference (today's recipe uses only their variant-locus rows), and a rebuild without
 # the flag would replace them with variant-only ones.
+"$PYTHON" dataset.py --data-dir "$DATA_DIR" --keep-hom-ref-loci --build-only
+# Marks the truth labels the training people's own short reads contradict, which the assembly below leaves out; the
+# measuring jobs (check_truth_genotypes_against_short_reads.py --no-wait) must have run on Hail Batch first.
+# compare_models.py also scores the held-out samples without such rows once they are marked (--mark without
+# --training-people-only).
+"$PYTHON" check_truth_genotypes_against_short_reads.py --mark --training-people-only --data-dir "$DATA_DIR"
 "$PYTHON" dataset.py --data-dir "$DATA_DIR" --keep-hom-ref-loci
 
 echo "==== [2/4] train + export model ======================================="

@@ -68,14 +68,23 @@ def load_regime(data_dir, regime):
 
 
 def split(df):
-    """Returns ``(validation, unseen, calib)`` boolean masks over ``df``'s rows (seeded)."""
+    """Returns ``(validation, unseen, calib)`` boolean masks over ``df``'s rows (seeded).
+
+    The calibration people are drawn from the whole table, as train.py draws them (``train._calibration_people``), and
+    the validation people from the rest, never a person with spiked samples, so a validation person's reads (spiked
+    samples included, ``train._persons_of_samples``) never also train the heads.
+    """
     individual = df["individual"].to_numpy().astype(object)
     chrom = df["chrom"].astype(str).to_numpy().astype(object)
-    candidates = sorted(set(individual.tolist()) - set(train.ALWAYS_TRAIN_INDIVIDUALS))
-    validation = np.isin(individual, np.random.default_rng(SEED + 100).choice(
+    people = train._calibration_people(individual, chrom, SEED)
+    person = train._persons_of_samples(individual)
+    people_with_spiked_samples = set(person[individual != person].tolist())
+    candidates = sorted(set(person.tolist()) - set(train.ALWAYS_TRAIN_INDIVIDUALS) - set(people[0])
+                        - people_with_spiked_samples)
+    validation = np.isin(person, np.random.default_rng(SEED + 100).choice(
         candidates, N_VALIDATION_PEOPLE, replace=False).tolist())
     calib = np.zeros(len(df), dtype=bool)
-    calib[~validation] = train._calib_mask(individual[~validation], chrom[~validation], SEED)
+    calib[~validation] = train._calib_mask(individual[~validation], chrom[~validation], SEED, people)
     return validation, np.isin(chrom, UNSEEN_CHROMS), calib
 
 
@@ -112,11 +121,10 @@ def curves_for_regime(data_dir, regime, direction_iterations, q_median_iteration
     rep = df["representative"].to_numpy(bool)
     individual = df["individual"].to_numpy().astype(object)
     chrom = df["chrom"].astype(str).to_numpy().astype(object)
-    always = np.isin(individual, train.ALWAYS_TRAIN_INDIVIDUALS)
     train_pool = np.where(~validation & ~calib & ~unseen)[0]
     calib_rows = train._cap(np.where(calib & ~unseen & rep)[0], CALIB_CAP, SEED + 2)
     qreg, dmodel, _, Xca = train.fit_heads(
-        df, train_pool, calib_rows, np.where(always, individual + "|" + chrom, individual), branch, TRAIN_CAP,
+        df, train_pool, calib_rows, train._fold_groups(individual, chrom), branch, TRAIN_CAP,
         (direction_iterations, q_median_iterations), "%s curves" % regime)
     checkpoints = [k for k in CHECKPOINTS if k <= direction_iterations and 2 * k <= q_median_iterations]
     rng = np.random.default_rng(SEED + 7)

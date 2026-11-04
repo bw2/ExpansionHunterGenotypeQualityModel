@@ -59,7 +59,7 @@ class ParseTest(unittest.TestCase):
 
 
 class StoredExperimentColumnsTest(unittest.TestCase):
-    """fragment_length and the spanning-mode / het_gap columns (stored, not model inputs)."""
+    """The spanning-mode and het_gap columns (stored, not model inputs)."""
 
     def test_naive_spanning_mode(self):
         mode = eh_json.naive_spanning_mode
@@ -77,13 +77,11 @@ class StoredExperimentColumnsTest(unittest.TestCase):
         self.assertEqual(eh_json.other_allele_call([10, 20, 30], 2), 20)  # nearest other allele
 
     def test_rows_carry_the_stored_columns(self):
-        locus = dict(_locus("20/97"), FragmentLength=361)
-        rows = list(eh_json.extract_rows({"LocusResults": {"L": locus}}))
-        self.assertEqual([r["fragment_length"] for r in rows], [361, 361])
+        rows = list(eh_json.extract_rows({"LocusResults": {"L": _locus("20/97")}}))
         self.assertEqual([r["eh_minus_spanning_mode_naive"] for r in rows], [0, 77])  # mode 20 (8 reads)
         self.assertEqual([r["spanning_mode_naive_support"] for r in rows], [8, 8])
         self.assertEqual([r["het_gap"] for r in rows], [-77, 77])
-        one_allele = list(eh_json.extract_rows({"LocusResults": {"L": dict(_locus("20"), FragmentLength=361)}}))
+        one_allele = list(eh_json.extract_rows({"LocusResults": {"L": _locus("20")}}))
         self.assertIsNone(one_allele[0]["het_gap"])
 
     def test_no_spanning_reads_and_no_calls(self):
@@ -92,8 +90,8 @@ class StoredExperimentColumnsTest(unittest.TestCase):
         rows = list(eh_json.extract_rows({"LocusResults": {"L": locus}}))
         self.assertEqual([r["eh_minus_spanning_mode_naive"] for r in rows], [None, None])
         self.assertEqual([r["spanning_mode_naive_support"] for r in rows], [0, 0])
-        no_call = list(eh_json.extract_rows({"LocusResults": {"L": dict(_locus("./."), FragmentLength=400)}}))
-        self.assertEqual([r["fragment_length"] for r in no_call], [400, 400])
+        no_call = list(eh_json.extract_rows({"LocusResults": {"L": _locus("./.")}}))
+        self.assertEqual(len(no_call), 2)
         self.assertTrue(all(r["het_gap"] is None and r["eh_minus_spanning_mode_naive"] is None for r in no_call))
 
 

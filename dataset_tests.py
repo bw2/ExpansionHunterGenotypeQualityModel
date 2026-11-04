@@ -82,6 +82,21 @@ class QuotaSampleTest(unittest.TestCase):
         self.assertTrue(np.all(np.diff(out) > 0))   # sorted, no duplicates
         np.testing.assert_array_equal(out, dataset.quota_sample(motif, eh, idx, 300, 1))
 
+    def test_motif_size_categories_give_each_motif_size_its_own_cells(self):
+        # Called at the same size (60 bp, one size bin): 600 homopolymer, 300 dinucleotide, 100 hexanucleotide rows.
+        motif = np.array([1] * 600 + [2] * 300 + [6] * 100, dtype=float)
+        eh = 60 / motif
+        idx = np.arange(1000)
+        default = dataset.quota_sample(motif, eh, idx, 300, 1)
+        by_category = dataset.quota_sample(motif, eh, idx, 300, 1, by_motif_size_category=True)
+        # Default: homopolymer or not, so two cells of 150 and the hexanucleotides share the non-homopolymer cell.
+        self.assertEqual(int((motif[default] == 1).sum()), 150)
+        # By category: three cells of 100, the hexanucleotide cell whole.
+        self.assertEqual([int((motif[by_category] == m).sum()) for m in (1, 2, 6)], [100, 100, 100])
+        cells = dataset.quota_cells(motif, eh, idx, by_motif_size_category=True)
+        self.assertEqual(len(np.unique(cells)), 3)
+        np.testing.assert_array_equal(dataset.quota_cells(motif, eh, idx), dataset.quota_cells(motif, eh, idx, False))
+
     def test_no_cap_or_small_pool_returns_the_pool(self):
         motif, eh, idx = np.ones(10), np.full(10, 5.0), np.arange(10)
         np.testing.assert_array_equal(dataset.quota_sample(motif, eh, idx, None, 1), idx)
@@ -327,7 +342,8 @@ class LabelAndFilterTest(unittest.TestCase):
         kept, drops = dataset.label_and_filter(df)
         self.assertEqual(drops, {"chrM_or_unknown_contig": 1, "negative_control_locus": 1,
                                  "missing_eh_or_true": 1, "nonpositive_eh_or_true": 1,
-                                 "missing_motif_size": 1, "no_own_quality_metrics": 0})
+                                 "missing_motif_size": 1, "no_own_quality_metrics": 0,
+                                 "truth_contradicted_by_short_reads": 0})
         self.assertEqual(len(kept), 2)
         self.assertEqual(sorted(kept["locus_id"]), ["1-9-10-A", "2-1-2-A"])
         self.assertNotIn("is_negative_locus", kept.columns)
@@ -368,73 +384,65 @@ class LabelAndFilterTest(unittest.TestCase):
         self.assertEqual(drops["no_own_quality_metrics"], 0)
         self.assertEqual(len(kept), 2)
 
+    def test_drops_rows_whose_truth_the_short_reads_contradict_only_when_asked(self):
+        df = self._hom_pair([True, True])
+        df[dataset.TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN] = [True, False]
+        kept, drops = dataset.label_and_filter(df)
+        self.assertEqual((len(kept), drops["truth_contradicted_by_short_reads"]), (2, 0))
+        kept, drops = dataset.label_and_filter(df, drop_truth_contradicted_by_short_reads=True)
+        self.assertEqual(drops["truth_contradicted_by_short_reads"], 1)
+        self.assertEqual(list(kept["allele_rank"]), [1])
+        # A frame without the column loses nothing; callers that require the check verify the column first.
+        kept, drops = dataset.label_and_filter(self._hom_pair([True, True]), drop_truth_contradicted_by_short_reads=True)
+        self.assertEqual((len(kept), drops["truth_contradicted_by_short_reads"]), (2, 0))
 
-class GenotypeLevelLabelTest(unittest.TestCase):
-    """``dir_code_genotype``: a homozygous call is OK only if it is OK against both truth alleles."""
 
-    def _call(self, eh, true_short, true_long, n_alleles=2, n_distinct=1, motif_size=3):
-        rows = [{"locus_id": "1-9-10-A", "is_negative_locus": False, "eh": eh, "true": true_short,
-                 "motif_size": motif_size, "genotyping_branch": "quick", "spanning_at_called": 5,
-                 "allele_rank": 0, "n_alleles": n_alleles, "n_distinct_alleles": n_distinct,
-                 "has_own_quality_metrics": True}]
-        if n_alleles == 2:
-            rows.append(dict(rows[0], allele_rank=1, true=true_long, has_own_quality_metrics=n_distinct == 2))
-        kept, _ = dataset.label_and_filter(pd.DataFrame(rows))
-        return kept
+class SampleWithNoVariantTruthLocusTest(unittest.TestCase):
+    """``allow_sample_with_no_variant_truth_loci``: a truth file whose every locus is hom-ref, which happens for a
+    matched control of the simulated expansions when its person carries the reference allele at all of its loci."""
 
-    def test_reference_call_that_misses_an_expansion_is_too_short(self):
-        kept = self._call(eh=10.0, true_short=10.0, true_long=15.0)
-        self.assertEqual(len(kept), 1)  # the rank-1 twin is still dropped
-        self.assertEqual(kept["dir_code"].iloc[0], features.OK)  # per allele: matched to the short truth
-        self.assertEqual(kept["true_other_allele"].iloc[0], 15.0)
-        self.assertEqual(kept["dir_code_genotype"].iloc[0], features.TOO_SHORT)
+    EMPTY_TRUTH_DF = pd.DataFrame({"LocusId": [], "allele_rank": [], "true": [], "purity": [],
+                                   "is_negative_locus": []})
+    TRUTH_BY_LOCUS = pd.DataFrame({"reference_repeats": [4.0], "is_hom_ref": [True], "purity": [1.0]},
+                                  index=pd.Index(["1-5-6-A"], name="LocusId"))
 
-    def test_reference_call_that_misses_a_contraction_stays_too_long(self):
-        kept = self._call(eh=10.0, true_short=5.0, true_long=10.0)
-        self.assertEqual(kept["dir_code"].iloc[0], features.TOO_LONG)
-        self.assertEqual(kept["dir_code_genotype"].iloc[0], features.TOO_LONG)
+    def _run(self, hash_fraction, allow, truth_df=None):
+        rows = [KeepHomRefLociTest._row("chr1-5-6-A", 0, 4.0), KeepHomRefLociTest._row("chr1-5-6-A", 1, 4.0)]
+        truth_df = self.EMPTY_TRUTH_DF if truth_df is None else truth_df
+        with mock.patch.object(dataset.eh_json, "extract_rows", return_value=rows), \
+             mock.patch.object(dataset.eh_json, "typical_read_length_in_file", return_value=150), \
+             mock.patch.object(dataset, "_load_truth_from_genotypes_tsv",
+                               return_value=(truth_df.copy(), {"1-5-6-A"})), \
+             mock.patch.object(dataset, "_load_reference_repeats_and_hom_ref_truth",
+                               return_value=self.TRUTH_BY_LOCUS), \
+             mock.patch.object(dataset, "_locus_hash_fraction", return_value=hash_fraction), \
+             mock.patch.object(dataset, "_assert_catalog_agreement"):
+            return dataset.extract_rows_and_join_truth(
+                ["a.json.gz"], "t.tsv.gz", "t.bed.gz", "HG00408_spiked_200015", "unit", keep_hom_ref_loci=True,
+                allow_sample_with_no_variant_truth_loci=allow)
 
-    def test_call_right_for_both_alleles_is_ok(self):
-        kept = self._call(eh=10.0, true_short=10.0, true_long=10.0)
-        self.assertEqual(kept["dir_code_genotype"].iloc[0], features.OK)
+    def test_raises_unless_the_sample_is_allowed_to_have_none(self):
+        with self.assertRaises(RuntimeError):
+            self._run(0.01, allow=False)
 
-    def test_the_larger_miss_wins_and_a_tie_goes_to_the_longer_allele(self):
-        larger_long_miss = self._call(eh=10.0, true_short=8.0, true_long=15.0)
-        self.assertEqual(larger_long_miss["dir_code_genotype"].iloc[0], features.TOO_SHORT)
-        larger_short_miss = self._call(eh=10.0, true_short=4.0, true_long=12.0)
-        self.assertEqual(larger_short_miss["dir_code_genotype"].iloc[0], features.TOO_LONG)
-        tie = self._call(eh=10.0, true_short=7.0, true_long=13.0)
-        self.assertEqual(tie["dir_code_genotype"].iloc[0], features.TOO_SHORT)
+    def test_allowing_it_still_raises_when_the_truth_lists_a_variant_locus_the_json_lacks(self):
+        # The option is only about a truth with no variant locus at all. A truth that lists one the JSON has no row
+        # for means the two disagree on LocusIds, which must still raise.
+        truth_of_another_locus = pd.DataFrame({"LocusId": ["1-9-9-A"], "allele_rank": [0], "true": [30.0],
+                                               "purity": [1.0], "is_negative_locus": [False]})
+        with self.assertRaises(RuntimeError):
+            self._run(0.01, allow=True, truth_df=truth_of_another_locus)
 
-    def test_when_both_alleles_are_missed_the_larger_miss_in_repeats_wins(self):
-        # HG002 10x, locus 2-59086030-59086114 (36 bp motif): call 9/9, truth 5/14. Tolerances are 2 repeats
-        # (180 bp) and 4 repeats (504 bp); the misses are 4 and 5 repeats, so the long allele's miss is larger
-        # although it is smaller once each tolerance is subtracted.
-        kept = self._call(eh=9.0, true_short=5.0, true_long=14.0, motif_size=36)
-        self.assertEqual(kept["dir_code"].iloc[0], features.TOO_LONG)
-        self.assertEqual(kept["dir_code_genotype"].iloc[0], features.TOO_SHORT)
+    def test_allowed_returns_the_kept_hom_ref_rows_with_the_columns_the_truth_join_adds(self):
+        merged = self._run(0.01, allow=True)  # below the quick branch's keep rate for this size, so it is kept
+        self.assertEqual(list(merged["locus_id"]), ["1-5-6-A", "1-5-6-A"])
+        self.assertEqual(list(merged["true"]), [4.0, 4.0])
+        self.assertEqual(list(merged["purity"]), [1.0, 1.0])
+        self.assertEqual(list(merged["is_negative_locus"]), [False, False])
+        self.assertEqual(list(merged["variant_locus"]), [False, False])
 
-    def test_tolerance_comes_from_each_truth_allele_size(self):
-        # 20 repeats x 3 bp = 60 bp -> +-1 repeat; the 10-repeat (30 bp) short allele needs an exact match.
-        kept = self._call(eh=10.0, true_short=10.0, true_long=21.0)
-        self.assertEqual(kept["dir_code_genotype"].iloc[0], features.TOO_SHORT)
-        within = self._call(eh=20.0, true_short=20.0, true_long=21.0)
-        self.assertEqual(within["dir_code_genotype"].iloc[0], features.OK)
-
-    def test_heterozygous_and_one_allele_calls_keep_their_per_allele_label(self):
-        het = self._call(eh=10.0, true_short=10.0, true_long=15.0, n_distinct=2)
-        self.assertEqual(list(het["dir_code_genotype"]), list(het["dir_code"]))
-        self.assertTrue(het["true_other_allele"].isna().all())
-        one_allele = self._call(eh=10.0, true_short=15.0, true_long=15.0, n_alleles=1)
-        self.assertEqual(list(one_allele["dir_code_genotype"]), [features.TOO_SHORT])
-        self.assertTrue(one_allele["true_other_allele"].isna().all())
-
-    def test_two_sources_in_one_frame_are_refused(self):
-        rows = [{"locus_id": "1-9-10-A", "is_negative_locus": False, "eh": 10.0, "true": 10.0, "motif_size": 3,
-                 "genotyping_branch": "quick", "spanning_at_called": 5, "allele_rank": rank, "n_alleles": 2,
-                 "n_distinct_alleles": 1, "has_own_quality_metrics": rank == 0} for rank in (0, 1, 0, 1)]
-        with self.assertRaises(ValueError):
-            dataset.label_and_filter(pd.DataFrame(rows))
+    def test_allowed_returns_nothing_when_no_hom_ref_locus_is_sampled(self):
+        self.assertTrue(self._run(0.99, allow=True).empty)
 
 
 class KeepHomRefLociTest(unittest.TestCase):
@@ -658,6 +666,14 @@ class ListJsonInputsTest(unittest.TestCase):
                   "gs://x/json/a.json.gz")
         with mock.patch.object(dataset.subprocess, "run", return_value=SimpleNamespace(stdout=stdout, returncode=0, stderr="")):
             self.assertEqual(dataset._list_json_inputs("S"), ["gs://x/json/a.json.gz"])
+
+    def test_lists_under_the_given_run_or_else_eh_results_root(self):
+        result = SimpleNamespace(stdout="gs://x/json/a.json.gz", returncode=0, stderr="")
+        with mock.patch.object(dataset.subprocess, "run", return_value=result) as run:
+            dataset._list_json_inputs("S", "gs://other/run")
+            dataset._list_json_inputs("S")
+        self.assertEqual([c.args[0][-1] for c in run.call_args_list],
+                         ["gs://other/run/S/json/", "%s/S/json/" % dataset.EH_RESULTS_ROOT])
 
     def test_falls_back_to_shards(self):
         stdout = "gs://x/json/a.shard000_of_002.json.gz gs://x/json/a.shard001_of_002.json.gz"
@@ -888,6 +904,7 @@ class AssembleBranchTest(unittest.TestCase):
             base = {c: 1.0 for c in features.FULL_FEATURES
                     if c not in ("ci_asymmetry", "ci_over_eh")}
             base["has_own_quality_metrics"] = True  # part of the contract, though not a feature
+            base[dataset.TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN] = False  # checked against short reads
             pd.DataFrame([
                 dict(base, **{"locus_id": "1-1-2-A", "is_negative_locus": False, "eh": 10.0,
                               "true": 10.0, "motif_size": 3, "genotyping_branch": "quick",
@@ -915,7 +932,8 @@ class AssembleBranchTest(unittest.TestCase):
             os.makedirs(src_dir)
             base = {c: 1.0 for c in features.FULL_FEATURES if c not in ("ci_asymmetry", "ci_over_eh")}
             base.update({"has_own_quality_metrics": True, "is_negative_locus": False, "true": 10.0,
-                         "motif_size": 3, "genotyping_branch": "quick", "spanning_at_called": 5})
+                         "motif_size": 3, "genotyping_branch": "quick", "spanning_at_called": 5,
+                         dataset.TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN: False})
             for name in ("a", "b"):
                 pd.DataFrame([dict(base, locus_id="1-%d-%d-A" % (i, i + 1), eh=10.0 + i) for i in range(5)]
                              ).to_parquet(os.path.join(src_dir, "%s.parquet" % name))
@@ -944,7 +962,7 @@ class AssembleBranchTest(unittest.TestCase):
         base = {c: 1.0 for c in features.FULL_FEATURES if c not in ("ci_asymmetry", "ci_over_eh")}
         base.update({"has_own_quality_metrics": True, "is_negative_locus": False, "true": 10.0, "eh": 10.0,
                      "motif_size": 3, "genotyping_branch": "quick", "spanning_at_called": 5,
-                     "all_loci_keep_probability": 0.5})
+                     "all_loci_keep_probability": 0.5, dataset.TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN: False})
         rows = [dict(base, locus_id="1-1-2-A", variant_locus=False, in_all_loci_pool=True, all_loci_representative=True),
                 dict(base, locus_id="1-3-4-A", variant_locus=False, in_all_loci_pool=True, all_loci_representative=True),
                 dict(base, locus_id="1-5-6-A", variant_locus=False, in_all_loci_pool=True, all_loci_representative=False),
@@ -984,8 +1002,36 @@ class AssembleBranchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, "src"))
             write_contract_parquet(os.path.join(d, "src", "old.parquet"))
-            with self.assertRaises(RuntimeError):
-                dataset.assemble_branch(d, "quick", "src", training_population="all_loci")
+            with self.assertRaisesRegex(RuntimeError, "without hom-ref loci"):
+                dataset.assemble_branch(d, "quick", "src", training_population="all_loci",
+                                        drop_truth_contradicted_by_short_reads=False)
+
+    def _part_with_one_contradicted_locus(self, path, with_the_column=True):
+        base = {c: 1.0 for c in features.FULL_FEATURES if c not in ("ci_asymmetry", "ci_over_eh")}
+        base.update({"has_own_quality_metrics": True, "is_negative_locus": False, "true": 10.0, "eh": 12.0,
+                     "motif_size": 3, "genotyping_branch": "quick", "spanning_at_called": 5})
+        df = pd.DataFrame([dict(base, locus_id="1-1-2-A"), dict(base, locus_id="1-3-4-A")])
+        if with_the_column:
+            df[dataset.TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN] = [True, False]
+        df.to_parquet(path)
+
+    def test_leaves_out_rows_whose_truth_the_short_reads_contradict(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "src"))
+            self._part_with_one_contradicted_locus(os.path.join(d, "src", "a.parquet"))
+            dataset.assemble_branch(d, "quick", "src")
+            self.assertEqual(list(pd.read_parquet(os.path.join(d, "parquet", "quick.parquet"))["locus_id"]),
+                             ["1-3-4-A"])
+            dataset.assemble_branch(d, "quick", "src", drop_truth_contradicted_by_short_reads=False)
+            self.assertEqual(len(pd.read_parquet(os.path.join(d, "parquet", "quick.parquet"))), 2)
+
+    def test_refuses_parts_never_checked_against_short_reads(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "src"))
+            self._part_with_one_contradicted_locus(os.path.join(d, "src", "a.parquet"), with_the_column=False)
+            with self.assertRaisesRegex(RuntimeError, "check_truth_genotypes_against_short_reads.py --mark"):
+                dataset.assemble_branch(d, "quick", "src")
+            dataset.assemble_branch(d, "quick", "src", drop_truth_contradicted_by_short_reads=False)  # must not raise
 
 
 class LinkPromotedHeldoutSamplesTest(unittest.TestCase):
@@ -1068,6 +1114,35 @@ class AssertParquetsUpToDateTest(unittest.TestCase):
             write_contract_parquet(part).assign(variant_locus=True).to_parquet(part, index=False)
             self.assertEqual(dataset.command_that_builds_branch_parquets(d, "parquet"),
                              "`python3 dataset.py --data-dir %s --keep-hom-ref-loci`" % d)
+
+    def test_a_folder_with_spiked_samples_is_rebuilt_by_add_to_training_tables_not_dataset_py(self):
+        # Its per-source parquets are links into another data folder, which a dataset.py rebuild would overwrite.
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, dataset.SOURCE_SUBDIR))
+            write_contract_parquet(os.path.join(d, dataset.SOURCE_SUBDIR, "HG01106.parquet"))
+            self.assertFalse(dataset.holds_spiked_samples(d))
+            write_contract_parquet(os.path.join(d, dataset.SOURCE_SUBDIR, "HG01106_spiked_0.parquet"))
+            self.assertTrue(dataset.holds_spiked_samples(d))
+            self.assertIn("simulated_expansions/add_to_training_tables.py",
+                          dataset.command_that_builds_branch_parquets(d, "parquet"))
+            self.assertNotIn("--training-population", dataset.command_that_builds_branch_parquets(d, "parquet"))
+            self.assertIn("--training-population all_loci",
+                          dataset.command_that_builds_branch_parquets(d, "parquet_all_loci"))
+            # An off-contract spiked part is rebuilt by the spike step's tables command.
+            self.assertIn("spike_in_expansions.py tables", dataset.rebuild_command_for(
+                os.path.join(d, dataset.SOURCE_SUBDIR, "HG01106_spiked_0.parquet")))
+            # A link to a spiked parquet that a later run removed makes the tables stale instead of crashing the check.
+            os.makedirs(os.path.join(d, "parquet"))
+            for branch in ("quick", "full"):
+                write_contract_parquet(os.path.join(d, "parquet", "%s.parquet" % branch))
+            os.symlink(os.path.join(d, "removed.parquet"), os.path.join(d, dataset.SOURCE_SUBDIR, "P_spiked_1.parquet"))
+            with mock.patch.object(dataset, "PROMOTED_HELDOUT_SAMPLES", ()), self.assertRaises(SystemExit) as raised:
+                dataset.assert_parquets_up_to_date(d)
+            self.assertIn("STALE", str(raised.exception))
+            with mock.patch("sys.argv", ["dataset.py", "--data-dir", d]), mock.patch("sys.stderr"), \
+                    self.assertRaises(SystemExit), mock.patch.object(dataset, "build_combo") as build_combo:
+                dataset.main()
+            build_combo.assert_not_called()
 
     def test_stale_parquet_exits(self):
         with tempfile.TemporaryDirectory() as d, \
@@ -1272,7 +1347,40 @@ class AssertEhBuildMatchesTest(unittest.TestCase):
         diff = ("--- a/ehunter/io/JsonWriter.cpp\n+++ b/ehunter/io/JsonWriter.cpp\n@@ -224 +224 @@\n"
                 '+    record_["NewField"] = 1;\n')
         with mock.patch.object(dataset.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=diff)):
-            self.assertFalse(dataset._json_writer_change_only_feeds_the_model("b1fbc23"))
+            self.assertFalse(dataset._json_writer_change_leaves_the_eh_json_fields_unchanged(
+                "b1fbc23", "ehunter/io/JsonWriter.cpp"))
+
+    def test_older_build_with_only_the_model_annotation_change_since_passes(self):
+        # ExpansionHunter-bw2 fd71238: the length correction factor is written as 1 where pOk >= 0.5, plus comments.
+        cpp_diff = ("--- a/ehunter/io/JsonWriter.cpp\n+++ b/ehunter/io/JsonWriter.cpp\n@@ -363,2 +363,8 @@\n"
+                    '-                alleleRecord["PredictedLengthCorrectionFactor"] = '
+                    "round3(pred.lengthCorrectionFactor);\n"
+                    '-                alleleRecord["pOk"] = round3(pred.pOk);\n'
+                    "+                // The length correction is meant only for calls the model doubts (pOk < 0.5).\n"
+                    "+                const double writtenPOk = round3(pred.pOk);\n"
+                    '+                alleleRecord["PredictedLengthCorrectionFactor"]\n'
+                    "+                    = writtenPOk < 0.5 ? round3(pred.lengthCorrectionFactor) : 1.0;\n"
+                    '+                alleleRecord["pOk"] = writtenPOk;\n')
+        hh_diff = ("--- a/ehunter/io/JsonWriter.hh\n+++ b/ehunter/io/JsonWriter.hh\n@@ -45,0 +46 @@\n"
+                   "+    // PredictedLengthCorrectionFactor is written as 1 where the written pOk is 0.5 or more.\n")
+
+        def git_diff(command, **kwargs):
+            return mock.Mock(returncode=0, stdout=cpp_diff if command[-1].endswith(".cpp") else hh_diff)
+
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="feed123"), \
+             mock.patch.object(dataset, "_bw2_files_changed_since",
+                               return_value=["ehunter/io/JsonWriter.cpp", "ehunter/io/JsonWriter.hh"]), \
+             mock.patch.object(dataset.subprocess, "run", side_effect=git_diff):
+            p = self._json(os.path.join(d, "a.json.gz"), "b1fbc23")
+            dataset.assert_eh_build_matches("combo", [("json shard 0", p)])  # must not raise
+
+    def test_json_writer_header_change_beyond_comments_counts(self):
+        diff = ("--- a/ehunter/io/JsonWriter.hh\n+++ b/ehunter/io/JsonWriter.hh\n@@ -45,0 +46 @@\n"
+                "+    void writeNewField();\n")
+        with mock.patch.object(dataset.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=diff)):
+            self.assertFalse(dataset._json_writer_change_leaves_the_eh_json_fields_unchanged(
+                "b1fbc23", "ehunter/io/JsonWriter.hh"))
 
     def test_changed_lines_keep_source_lines_that_look_like_file_headers(self):
         stdout = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -3 +3 @@\n---i;\n+++i;\n"

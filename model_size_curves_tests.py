@@ -35,6 +35,21 @@ class SplitTest(unittest.TestCase):
         self.assertFalse(np.isin(df["individual"][validation], train.ALWAYS_TRAIN_INDIVIDUALS).any())
         self.assertEqual(set(df["chrom"][unseen]), set(C.UNSEEN_CHROMS))
 
+    def test_people_with_spiked_samples_are_never_validation_people(self):
+        people = ["HG002", "CHM1_CHM13"] + ["S%02d" % i for i in range(25)]
+        chroms = [str(c) for c in range(1, 23)]
+        held, _ = train._calibration_people(np.array([p for p in people for _ in chroms], dtype=object),
+                                            np.array([c for _ in people for c in chroms], dtype=object), C.SEED)
+        spiked_people = [p for p in people[2:] if p not in held][:6]
+        samples = people + ["%s_spiked_0" % p for p in spiked_people]
+        df = pd.DataFrame({"individual": [s for s in samples for _ in chroms],
+                           "chrom": [c for _ in samples for c in chroms]})
+        validation, _, calib = C.split(df)
+        validated = set(df["individual"][validation])
+        self.assertEqual(len(validated), C.N_VALIDATION_PEOPLE)
+        self.assertFalse(validated & set(spiked_people))
+        self.assertFalse((validation & calib).any())
+
 
 if __name__ == "__main__":
     unittest.main()

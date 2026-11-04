@@ -209,11 +209,11 @@ class ReportHtmlNameTest(unittest.TestCase):
             "model_report.2026-10-17_plus50_model.html")
 
     def test_same_day_models_of_different_training_choices_get_different_names(self):
-        paths = [R.train._default_out(population, label)
-                 for population in ("variant_loci", "all_loci") for label in ("dir_code", "dir_code_genotype")]
+        paths = [R.train._default_out(population, quota_by_motif_size_category=by_category)
+                 for population in ("variant_loci", "all_loci") for by_category in (False, True)]
         names = [R.report_html_name(path) for path in paths]
         self.assertEqual(len(set(names)), len(paths))
-        self.assertEqual(R.report_html_name(R.train._default_out("all_loci", "dir_code")),
+        self.assertEqual(R.report_html_name(R.train._default_out("all_loci")),
                          "model_report.%s_all_loci_model.html" % datetime.date.today().isoformat())
 
     def test_model_name_not_ending_in_a_date_is_used_whole(self):

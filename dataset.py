@@ -59,29 +59,33 @@ import eh_json
 import features
 
 # ExpansionHunter-bw2 (optimized-streaming) results on the TRExplorer v2.1 catalog (5.65M loci), one
-# folder per sample label, written by tandem-repeat-explorer's
-# data-prep/expansion_hunter_genotype_quality/run_expansion_hunter_on_selected_samples.py from
+# folder per sample label, written by
+# expansion_hunter_runs_and_truth_comparisons/run_expansion_hunter_on_selected_samples.py from
 # short_read_samples_with_truth_data.tsv: {EH_RESULTS_ROOT}/{sample_label}/json/<catalog name>.json.gz.
 # Re-genotyped on 2026-10-22 with ExpansionHunter-bw2 e90307c (Hail batches 8450427 and 8450428). The tables of the
 # 2026-10-17 model and earlier came from EH b1fbc23 outputs in .../tool_genotype_quality/expansion_hunter_v2.1.
 EH_RESULTS_ROOT = "gs://tandem-repeat-explorer/tool_genotype_quality/expansion_hunter_v2.1_eh_e90307c"
 # Tool-independent truth on the same catalog, built directly from the dipcall/long-read-assembly
-# pipeline (run_truth_genotyping_on_selected_samples.py in the same folder), one file per sample (not
-# per sample+coverage -- truth doesn't depend on short-read coverage). Never tied to a specific EH run,
-# so it cannot go stale relative to one. Unlike the earlier per-catalog truth files it lists nearly
-# every catalog locus (5,657,793 of 5,657,854 for HG01993), hom-ref ones included. See
-# `_load_truth_from_genotypes_tsv`. Built with str-analysis bd68a2a, which counts a repeat insertion that
-# DipCall's left-alignment placed up to one motif length before a locus (as at FXN, NOP56 and C9ORF72);
-# the earlier truth_genotypes_v2.1/ folder reported the reference length there.
+# pipeline, one file per sample (not per sample+coverage -- truth doesn't depend on short-read coverage).
+# Never tied to a specific EH run, so it cannot go stale relative to one. It is a copy of the
+# str-truth-set-v2 truth pipeline's genotypes on this catalog (filter_vcfs_v2/run_filter_vcf_to_tandem_repeats.py
+# with --genotype-catalog-name TRExplorer_v2_1_catalog, str-analysis d32b0ee; the folder's README.txt has the
+# details), so the model and the str-truth-set-v2 tool comparisons share one truth pipeline. It lists the
+# catalog loci fully inside the sample's DipCall high-confidence regions (5,420,390 for HG00438), hom-ref ones
+# included, and leaves out loci overlapping a CenSat region other than ct. A locus is a no call when an
+# insertion or deletion at its edge could equally be placed inside or outside it and that would change a
+# repeat count. See `_load_truth_from_genotypes_tsv`. The earlier
+# truth_genotypes_v2.1_with_upstream_repeat_insertions/ folder (run_truth_genotyping_on_selected_samples.py,
+# str-analysis bd68a2a) has neither filter nor those no calls; at loci called in both, HG00438's genotypes agree.
 TRUTH_GENOTYPES_ROOT = ("gs://tandem-repeat-explorer/tool_genotype_quality/"
-                        "truth_genotypes_v2.1_with_upstream_repeat_insertions")
+                        "truth_genotypes_v2.1_with_censat_filter_and_boundary_indel_no_calls")
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The truth genotyper reports the reference length both for a locus that matches the reference and for
 # one DipCall could not call, so a truth genotype only counts inside the sample's DipCall
 # high-confidence regions (the truth run leaves that filter to its readers, as compare_eh_to_truth.py
 # does). This table maps each sample_id to its DipCall BED. It is a copy, made on 2026-10-02, of the
-# sample_id / high_confidence_bed_path columns of tandem-repeat-explorer's
-# data-prep/expansion_hunter_genotype_quality/short_read_samples_with_truth_data.tsv, the table the EH
+# sample_id / high_confidence_bed_path columns of
+# expansion_hunter_runs_and_truth_comparisons/short_read_samples_with_truth_data.tsv, the table the EH
 # and truth runs were launched from; re-copy it if that table changes.
 HIGH_CONFIDENCE_BEDS_TSV = os.path.join(HERE, "high_confidence_beds.tsv")
 # Local checkout used only to compare a downloaded EH JSON's stamped build version against the
@@ -118,13 +122,21 @@ _EH_COMMITS_THAT_CHANGE_NO_FIELD_EH_JSON_READS = (
     "19ccdeb",  # --sample-id capped at 10,000 characters
     "95979d6",  # the per-contig JSON merge reads one fixed 64 KB window at each end of a temp file
 )
-# JsonWriter.cpp also writes the JSON, so it is excused only when every changed line is one of these,
-# which hand the model its inputs (the in-repeat read count, 2026-10-05) and change no emitted field.
-_EH_JSON_WRITER_FILE = "ehunter/io/JsonWriter.cpp"
-_JSON_WRITER_LINES_THAT_ONLY_FEED_THE_MODEL = {
+# JsonWriter.cpp and JsonWriter.hh also write the JSON, so they are excused only when every changed line is blank,
+# a // comment, or one of these, none of which changes a field eh_json reads: lines that hand the model its inputs
+# (the in-repeat read count, 2026-10-05), and lines that only write the model's pOk / PredictedLengthCorrectionFactor
+# annotations (the factor written as 1 where pOk is 0.5 or more, ExpansionHunter-bw2 fd71238).
+_EH_JSON_WRITER_FILES = ("ehunter/io/JsonWriter.cpp", "ehunter/io/JsonWriter.hh")
+_JSON_WRITER_LINES_THAT_CHANGE_NO_FIELD_EH_JSON_READS = {
     ".numDistinctAlleles = numDistinctAlleles};",
     ".numDistinctAlleles = numDistinctAlleles,",
     ".inrepeatReads = &repeatFindings.countsOfInrepeatReads()};",
+    'alleleRecord["PredictedLengthCorrectionFactor"] = round3(pred.lengthCorrectionFactor);',
+    'alleleRecord["pOk"] = round3(pred.pOk);',
+    "const double writtenPOk = round3(pred.pOk);",
+    'alleleRecord["PredictedLengthCorrectionFactor"]',
+    "= writtenPOk < 0.5 ? round3(pred.lengthCorrectionFactor) : 1.0;",
+    'alleleRecord["pOk"] = writtenPOk;',
 }
 
 # Single source: the optimized-streaming run deployed in production. Its QuickGenotype rows feed the
@@ -219,9 +231,10 @@ def _truth_sources(sample, dl_dir):
     return [(label, remote, os.path.join(dl_dir, os.path.basename(remote))) for label, remote in remotes]
 
 
-def _list_json_inputs(sample_label):
-    """Lists the sample label's JSON shard paths (prefers a single combined file if present)."""
-    listing = subprocess.run(["gsutil", "ls", "%s/%s/json/" % (EH_RESULTS_ROOT, sample_label)],
+def _list_json_inputs(sample_label, eh_results_root=None):
+    """Lists the sample label's JSON shard paths (prefers a single combined file if present), under
+    ``eh_results_root`` (default ``EH_RESULTS_ROOT``)."""
+    listing = subprocess.run(["gsutil", "ls", "%s/%s/json/" % (eh_results_root or EH_RESULTS_ROOT, sample_label)],
                              capture_output=True, text=True, check=True).stdout.split()
     jsons = [p for p in listing if p.endswith(".json") or p.endswith(".json.gz")]
     combined = sorted(p for p in jsons if ".shard" not in os.path.basename(p))
@@ -328,7 +341,7 @@ def _eh_build_is_current(version, head):
         return False
     return all(_FILES_THAT_DO_NOT_AFFECT_THE_EH_JSON_RE.search(f)
                or (f == _EH_CMAKE_FILE and _cmake_change_only_swaps_the_embedded_model(version))
-               or (f == _EH_JSON_WRITER_FILE and _json_writer_change_only_feeds_the_model(version))
+               or (f in _EH_JSON_WRITER_FILES and _json_writer_change_leaves_the_eh_json_fields_unchanged(version, f))
                or _file_changed_only_by_commits_that_change_no_eh_json_field(version, f)
                for f in changed)
 
@@ -395,12 +408,14 @@ def _cmake_change_only_swaps_the_embedded_model(sha):
         line.strip().startswith("set(GQ_MODEL_FILE ") for line in changed_lines)
 
 
-def _json_writer_change_only_feeds_the_model(sha):
-    """Returns True iff every line of ehunter/io/JsonWriter.cpp changed between ExpansionHunter-bw2
-    commit ``sha`` and HEAD is in ``_JSON_WRITER_LINES_THAT_ONLY_FEED_THE_MODEL``."""
-    changed_lines = _changed_lines_since(sha, _EH_JSON_WRITER_FILE)
+def _json_writer_change_leaves_the_eh_json_fields_unchanged(sha, path):
+    """Returns True iff every line of ``path`` (one of ``_EH_JSON_WRITER_FILES``) changed between
+    ExpansionHunter-bw2 commit ``sha`` and HEAD is blank, a ``//`` comment, or in
+    ``_JSON_WRITER_LINES_THAT_CHANGE_NO_FIELD_EH_JSON_READS``."""
+    changed_lines = _changed_lines_since(sha, path)
     return changed_lines is not None and all(
-        line.strip() in _JSON_WRITER_LINES_THAT_ONLY_FEED_THE_MODEL for line in changed_lines)
+        not line.strip() or line.strip().startswith("//")
+        or line.strip() in _JSON_WRITER_LINES_THAT_CHANGE_NO_FIELD_EH_JSON_READS for line in changed_lines)
 
 
 def _json_eh_version(path):
@@ -519,9 +534,13 @@ def rebuild_command_for(path):
     message that names one command unconditionally sends the reader to a no-op: ``heldout.py`` writes
     only ``<data_eval_43>/real_43/<sample>.parquet``, while the training-combo parquets under
     ``data/<SOURCE_SUBDIR>/`` come only from ``dataset.py``. A parquet built with the hom-ref loci gets
-    ``--keep-hom-ref-loci``, or the rebuild would replace it with a variant-only one.
+    ``--keep-hom-ref-loci``, or the rebuild would replace it with a variant-only one. A spiked sample's parquet
+    (``is_spiked_sample``) comes from ``simulated_expansions/spike_in_expansions.py tables``.
     """
     keep_hom_ref_loci = " --keep-hom-ref-loci" if parquet_keeps_hom_ref_loci(path) else ""
+    if is_spiked_sample(os.path.splitext(os.path.basename(path))[0]):
+        return ("python3 simulated_expansions/spike_in_expansions.py tables, then "
+                "simulated_expansions/add_to_training_tables.py")
     if os.path.basename(os.path.dirname(os.path.realpath(path))) == "real_43":
         return ("python3 heldout.py --build-only --force%s --samples %s"
                 % (keep_hom_ref_loci, os.path.splitext(os.path.basename(path))[0]))
@@ -654,7 +673,7 @@ def _parquet_reusable(out_path, sources, force):
 def _inside_high_confidence_regions(chrom, start_0based, end, bed_path):
     """Returns a boolean array: is each interval wholly inside a single region of ``bed_path``?
 
-    Same rule as tandem-repeat-explorer's compare_eh_to_truth.is_fully_callable: DipCall's regions are
+    Same rule as expansion_hunter_runs_and_truth_comparisons/compare_eh_to_truth.is_fully_callable: DipCall's regions are
     disjoint, so it is enough to find the last region starting at or before the interval and check that
     it also covers the interval's end. ``chrom`` must use the BED's naming (both use ``chr``).
     """
@@ -678,6 +697,12 @@ def _loci_eh_skips_for_read_length(start_0based, end, motif, read_length):
     half the read length.
     """
     return ((end - start_0based) > 2 * read_length) | (motif.str.len() > read_length / 2)
+
+
+# The columns of a truth-genotypes TSV (TRUTH_GENOTYPES_ROOT) that _load_truth_from_genotypes_tsv reads.
+TRUTH_GENOTYPES_TSV_COLUMNS = ["LocusId", "Chrom", "Start0Based", "End", "Motif", "NumRepeatsInReference",
+                               "NumRepeatsShortAllele", "NumRepeatsLongAllele",
+                               "RepeatPurityShortAllele", "RepeatPurityLongAllele"]
 
 
 def _load_truth_from_genotypes_tsv(tsv_path, high_confidence_bed_path, eh_read_length=None):
@@ -709,10 +734,7 @@ def _load_truth_from_genotypes_tsv(tsv_path, high_confidence_bed_path, eh_read_l
         ``{LocusId, allele_rank, true, purity, is_negative_locus}`` contract ``_join_truth`` expects;
         ``truth_locus_ids`` is the set of LocusIds passing filter (a), hom-ref loci included.
     """
-    cols = ["LocusId", "Chrom", "Start0Based", "End", "Motif", "NumRepeatsInReference",
-           "NumRepeatsShortAllele", "NumRepeatsLongAllele",
-           "RepeatPurityShortAllele", "RepeatPurityLongAllele"]
-    df = pd.read_csv(tsv_path, sep="\t", compression="gzip", usecols=cols,
+    df = pd.read_csv(tsv_path, sep="\t", compression="gzip", usecols=TRUTH_GENOTYPES_TSV_COLUMNS,
                      dtype={"LocusId": str, "Chrom": str}).drop_duplicates("LocusId")
     df["LocusId"] = df["LocusId"].str.replace(r"^chr", "", regex=True)
 
@@ -939,7 +961,8 @@ def _kept_rows_of_locus(locus_id, locus_rows, variant_truth_locus_ids, truth_by_
 
 
 def extract_rows_and_join_truth(json_paths, genotypes_tsv_path, high_confidence_bed_path, row_sample_id,
-                                source_desc, keep_hom_ref_loci=False):
+                                source_desc, keep_hom_ref_loci=False,
+                                allow_sample_with_no_variant_truth_loci=False):
     """Extracts the EH rows at the sample's variant truth loci and joins their truth.
 
     Shared by the training combos (``build_combo``) and the held-out samples
@@ -959,6 +982,12 @@ def extract_rows_and_join_truth(json_paths, genotypes_tsv_path, high_confidence_
     With ``keep_hom_ref_loci``, a sample of the hom-ref truth loci is kept too, and every row gets the
     all-loci columns (see ``_kept_rows_of_locus`` and ALL_LOCI_TRAINING_PLAN.md). Rows are grouped by locus as
     they stream, so a locus is kept or dropped whole.
+
+    ``allow_sample_with_no_variant_truth_loci`` turns a truth file with no variant locus at all from an error into
+    whatever rows the sample does have (its kept hom-ref loci, or none). A whole-genome truth file lists millions of
+    loci and a person is never hom-ref at all of them, so for those samples an empty variant truth means a broken
+    truth file and the default keeps raising. It is for a sample whose truth covers a handful of loci, where being
+    hom-ref at every one of them is ordinary (the simulated expansions' matched controls).
     """
     truth_df, truth_locus_ids = _load_truth_from_genotypes_tsv(
         genotypes_tsv_path, high_confidence_bed_path, eh_json.typical_read_length_in_file(json_paths[0]))
@@ -997,7 +1026,7 @@ def extract_rows_and_join_truth(json_paths, genotypes_tsv_path, high_confidence_
     for rows, chunks in ((variant_rows, variant_chunks), (hom_ref_rows, hom_ref_chunks)):
         if rows:
             chunks.append(pd.DataFrame(rows))
-    if not variant_chunks:
+    if not variant_chunks and not (allow_sample_with_no_variant_truth_loci and not variant_truth_locus_ids):
         raise RuntimeError("%s: none of the %d JSON loci is one of the %d variant truth loci (example JSON "
                            "locus %s, example truth locus %s)"
                            % (source_desc, len(json_locus_ids), len(variant_truth_locus_ids),
@@ -1006,6 +1035,10 @@ def extract_rows_and_join_truth(json_paths, genotypes_tsv_path, high_confidence_
     # HG03688's v2.1 output, that brings the gap from 0.65% overall and 66% in the largest truth-size
     # bin down to 0.02% overall and 0.1% in the worst bin, so a real catalog mismatch now stands out.
     _assert_catalog_agreement(json_locus_ids, truth_locus_ids, truth_df, source_desc)
+    if not variant_chunks:
+        # Nothing to join truth onto: every locus of this sample is hom-ref. The hom-ref rows already carry the
+        # columns the join adds ("true", "purity", "is_negative_locus"), so the table matches the other samples'.
+        return pd.concat(hom_ref_chunks, ignore_index=True) if hom_ref_chunks else pd.DataFrame()
     merged = _join_truth(pd.concat(variant_chunks, ignore_index=True), truth_df)
     if hom_ref_chunks:
         merged = pd.concat([merged] + hom_ref_chunks, ignore_index=True)
@@ -1114,7 +1147,38 @@ def _chrom_from_locus(locus_id):
     return chrom.where(chrom.isin(VALID_CHROMS))
 
 
-def label_and_filter(df):
+# Written into the per-source parquets by check_truth_genotypes_against_short_reads.py --mark: True on every row of a
+# locus where the person's own short reads clearly contradict the truth genotype (at loci where EH disagrees with it).
+TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN = "truth_contradicted_by_short_reads"
+
+
+def parquets_without_the_short_read_truth_check(paths):
+    """Returns the parquets in ``paths`` that lack ``TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN``."""
+    import pyarrow.parquet as pq  # local: only the parquet-facing callers need this dependency
+    return [p for p in paths if TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN not in pq.ParquetFile(p).schema_arrow.names]
+
+
+def assert_parquets_were_checked_against_short_reads(paths):
+    """Raises if any parquet in ``paths`` lacks ``TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN``, naming them and the
+    commands that mark them.
+
+    Raises:
+        RuntimeError: if a parquet was never marked by ``check_truth_genotypes_against_short_reads.py --mark`` (or was
+            rebuilt since).
+    """
+    unmarked = parquets_without_the_short_read_truth_check(paths)
+    if unmarked:
+        raise RuntimeError(
+            "%d per-source parquet(s) lack the %s column (never marked, or rebuilt since): %s. Mark them with "
+            "`python3 check_truth_genotypes_against_short_reads.py --mark` (first launch the measuring jobs without "
+            "--mark if it reports people as not measured), or keep every truth label (dataset.py "
+            "--keep-truth-labels-contradicted-by-short-reads; for heldout.py, leave out "
+            "--drop-truth-labels-contradicted-by-short-reads)."
+            % (len(unmarked), TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN,
+               ", ".join(sorted(unmarked)[:5]) + (" ..." if len(unmarked) > 5 else "")))
+
+
+def label_and_filter(df, drop_truth_contradicted_by_short_reads=False):
     """Adds ``chrom`` + the q/direction labels and drops unusable rows.
 
     Drops chrM/unknown contigs, negative-control loci, missing/non-positive ``eh``/``true``, missing
@@ -1126,8 +1190,10 @@ def label_and_filter(df):
     eval (purity is available to the report's opt-in stratification pill via ``accuracy_by_size.py``
     instead of being used as a blanket exclusion).
 
-    Also adds ``true_other_allele`` and ``dir_code_genotype`` (see ``_genotype_level_direction_codes``), next to
-    the per-allele ``dir_code``, which stays as it was.
+    With ``drop_truth_contradicted_by_short_reads``, also drops the rows marked in
+    ``TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN`` (loci whose truth genotype the person's own short reads contradict);
+    a frame without that column loses nothing, so callers that require the check verify the column first
+    (``parquets_without_the_short_read_truth_check``).
 
     Returns:
         A ``(kept_df, drop_counts)`` tuple. ``kept_df`` has ``chrom`` + the label columns added and
@@ -1136,8 +1202,6 @@ def label_and_filter(df):
     """
     df = df.copy()
     df["chrom"] = _chrom_from_locus(df["locus_id"])
-    # Before the rank-1 rows of homozygous calls are dropped below: they carry the longer truth allele.
-    df["true_other_allele"] = _truth_of_the_other_copy(df)
     # ANALYSIS_OK[imputation]: NaN eh/true/motif drive the missing_eh_or_true/missing_motif_size drops below.
     eh = pd.to_numeric(df["eh"], errors="coerce")
     true = pd.to_numeric(df["true"], errors="coerce")
@@ -1157,6 +1221,10 @@ def label_and_filter(df):
                       if "has_own_quality_metrics" in df.columns
                       else pd.Series(False, index=df.index))
 
+    truth_contradicted = (df[TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN].to_numpy(bool)
+                          if drop_truth_contradicted_by_short_reads and TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN in df.columns
+                          else np.zeros(len(df), bool))
+
     keep = pd.Series(True, index=df.index)
     drops = {}
     for name, bad in (("chrM_or_unknown_contig", df["chrom"].isna()),
@@ -1164,55 +1232,16 @@ def label_and_filter(df):
                       ("missing_eh_or_true", eh.isna() | true.isna()),
                       ("nonpositive_eh_or_true", (eh <= 0) | (true <= 0)),
                       ("missing_motif_size", motif.isna() | (motif <= 0)),
-                      ("no_own_quality_metrics", no_own_metrics)):
+                      ("no_own_quality_metrics", no_own_metrics),
+                      ("truth_contradicted_by_short_reads", pd.Series(truth_contradicted, index=df.index))):
         bad = bad & keep
         drops[name] = int(bad.sum())
         keep &= ~bad
 
     df = df[keep].reset_index(drop=True)
     features.add_labels(df)
-    df["dir_code_genotype"] = _genotype_level_direction_codes(df)
     df = df.drop(columns=[c for c in ("is_negative_locus",) if c in df.columns])
     return df, drops
-
-
-def _truth_of_the_other_copy(df):
-    """Per row: for the rank-0 row of a homozygous call (two copies, one size), the truth allele its rank-1 twin is
-    matched to; NaN for every other row.
-
-    ExpansionHunter scores a homozygous call once, so only the rank-0 row is trained on, and it is matched to the
-    shorter truth allele. Its twin's truth is the longer one. Needs one row per (locus, rank), i.e. one source per
-    frame, as every caller passes.
-    """
-    if not {"allele_rank", "n_alleles", "n_distinct_alleles"} <= set(df.columns):
-        return pd.Series(np.nan, index=df.index)
-    homozygous = (df["n_alleles"] == 2) & (df["n_distinct_alleles"] == 1)
-    twins = df.loc[homozygous & (df["allele_rank"] == 1), ["locus_id", "true"]]
-    if twins["locus_id"].duplicated().any():
-        raise ValueError("label_and_filter got several rank-1 rows for one LocusId; pass one source at a time")
-    # ANALYSIS_OK[imputation]: NaN marks rows without a twin; _genotype_level_direction_codes falls back to the
-    # row's own per-allele label there.
-    other = df["locus_id"].map(pd.to_numeric(twins.set_index("locus_id")["true"], errors="coerce"))
-    return other.where(homozygous & (df["allele_rank"] == 0))
-
-
-def _genotype_level_direction_codes(df):
-    """The direction label of a call judged against both truth alleles (``dir_code_genotype``).
-
-    A homozygous call is OK only if its size is within tolerance of both truth alleles. If it misses one of them,
-    it takes that allele's direction; if it misses both, the direction of the one it misses by more repeats (the
-    longer one on a tie). Without that, a homozygous reference-length call that misses an expansion on one
-    haplotype is labeled OK, because its scored row is matched to the shorter, reference-length truth allele.
-    Every other row keeps its per-allele ``dir_code``. Uses the same per-allele rule as ``features.add_labels``
-    (``direction_codes`` with ``tol_repeats``), so a change to that rule must be made in both places.
-    ``features.genotype_level_direction_codes`` does the combining, also for change B's label (``train.py``).
-    """
-    eh = pd.to_numeric(df["eh"], errors="coerce").to_numpy(np.float64)
-    motif = pd.to_numeric(df["motif_size"], errors="coerce").to_numpy(np.float64)
-    own_true = pd.to_numeric(df["true"], errors="coerce").to_numpy(np.float64)
-    return features.genotype_level_direction_codes(
-        eh, own_true, df["true_other_allele"].to_numpy(np.float64),
-        lambda true: features.direction_codes(eh, true, features.tol_repeats(motif * np.round(true))))
 
 
 def _assert_parts_share_feature_contract(parts):
@@ -1241,13 +1270,19 @@ def _assert_parts_share_feature_contract(parts):
 QUOTA_SIZE_BINS_BP = [0, 20, 40, 60, 100, 150, 300, np.inf]
 
 
-def quota_sample(motif_size, eh, idx, cap, seed):
+def quota_sample(motif_size, eh, idx, cap, seed, by_motif_size_category=False):
     """Seeded subsample of ``idx`` down to ``cap`` rows, spread evenly over quota cells.
 
-    A cell is (homopolymer or not) x (called allele size in bp, ``QUOTA_SIZE_BINS_BP``). Every cell
-    gets the same quota, and a cell smaller than the quota keeps all its rows, with the unused share
-    going to the other cells. Without this, a uniform subsample is ~60% homopolymers and leaves few
-    large non-homopolymer alleles. The cells are built from features (motif size and the CALLED size),
+    A cell is (homopolymer or not) x (called allele size in bp, ``QUOTA_SIZE_BINS_BP``), or with
+    ``by_motif_size_category`` (motif-size category, ``features.MOTIF_SIZE_CATEGORY_LABELS``) x (called
+    size bin). Every cell gets the same quota, and a cell smaller than the quota keeps all its rows, with
+    the unused share going to the other cells. Without this, a uniform subsample is ~60% homopolymers and
+    leaves few large non-homopolymer alleles. With only two motif groups, a growth of large homopolymer
+    calls takes quota from every non-homopolymer size bin; with the nine categories, each motif size gets
+    its own quota. A category can still fall short of it: the assembled branch tables were capped per source
+    with a top-up chosen by the two default groups (``_cap_rows_per_genotyping_regime``), so a rare category
+    inside a common default cell (e.g. motifs of 16 bp or more) has only the rows the uniform sample kept.
+    The cells are built from features (motif size and the CALLED size),
     never from the truth, so the conditional distribution of the targets given the features is
     unchanged; only how many examples each region of feature space gets moves. That makes a quota
     sample fine for TRAINING rows but not for rows that estimate frequencies (early stopping,
@@ -1259,24 +1294,28 @@ def quota_sample(motif_size, eh, idx, cap, seed):
         idx: Row indices to sample from.
         cap: Number of rows to keep (None or 0 = keep all).
         seed: RNG seed.
+        by_motif_size_category: Use the nine motif-size categories instead of homopolymer or not.
     """
     if not cap or idx.size <= cap:
         return idx
-    cell, cells, counts, level = _quota_cells_and_level(motif_size, eh, idx, cap)
+    cell, cells, counts, level = _quota_cells_and_level(motif_size, eh, idx, cap, by_motif_size_category)
     rng = np.random.default_rng(seed)
     return np.sort(np.concatenate([rng.choice(idx[cell == c], min(n, level), replace=False)
                                    for c, n in zip(cells, counts)]))
 
 
-def quota_cells(motif_size, eh, idx):
-    """Returns the quota cell (homopolymer or not x called size bin) of each row in ``idx``."""
+def quota_cells(motif_size, eh, idx, by_motif_size_category=False):
+    """Returns the quota cell (homopolymer or not, or with ``by_motif_size_category`` the motif-size category,
+    x called size bin) of each row in ``idx``."""
     called_bp = eh[idx] * motif_size[idx]
-    return (motif_size[idx] == 1).astype(int) * len(QUOTA_SIZE_BINS_BP) + np.digitize(called_bp, QUOTA_SIZE_BINS_BP)
+    motif_group = (features.motif_size_category(motif_size[idx]) if by_motif_size_category
+                   else (motif_size[idx] == 1).astype(int))
+    return motif_group * len(QUOTA_SIZE_BINS_BP) + np.digitize(called_bp, QUOTA_SIZE_BINS_BP)
 
 
-def _quota_cells_and_level(motif_size, eh, idx, cap):
+def _quota_cells_and_level(motif_size, eh, idx, cap, by_motif_size_category=False):
     """Returns ``(per-row cell of idx, cells, cell counts, per-cell quota)`` for a cap of ``cap`` rows."""
-    cell = quota_cells(motif_size, eh, idx)
+    cell = quota_cells(motif_size, eh, idx, by_motif_size_category)
     cells, counts = np.unique(cell, return_counts=True)
     # Largest per-cell quota whose total stays within cap.
     lo, hi = 0, int(counts.max())
@@ -1347,8 +1386,9 @@ def _cap_rows_per_genotyping_regime(df, cap, seed):
     Keeps a seeded uniform sample of at most ``cap`` rows per regime, marked ``representative`` True:
     early stopping, isotonic calibration and the report's CV test rows draw only from these, so the
     frequencies they estimate match what ExpansionHunter scores. It then adds the rows ``quota_sample``
-    would have kept but the uniform sample missed (``_quota_top_up``, mostly rare large alleles),
-    marked ``representative`` False, which only ever join training rows.
+    would have kept with its default cells (homopolymer or not x called size bin) but the uniform sample
+    missed (``_quota_top_up``, mostly rare large alleles), marked ``representative`` False, which only ever
+    join training rows. ``quota_sample``'s motif-size categories are not topped up this way.
     """
     motif, eh = df["motif_size"].to_numpy(float), df["eh"].to_numpy(float)
     kept, representative = [], []
@@ -1367,6 +1407,27 @@ def _cap_rows_per_genotyping_regime(df, cap, seed):
 
 
 _COVERAGE_SUFFIX_RE = re.compile(r"_\d+x$")
+# The spiked samples of simulated_expansions/spike_in_expansions.py are named <person>_spiked_<k>: a real person's reads
+# with simulated expanded alleles added, so never a person to hold out (train._calibration_people).
+_SPIKED_SAMPLE_RE = re.compile(r"_spiked_\d+$")
+
+
+def is_spiked_sample(individual):
+    """True for a spiked sample (simulated expansions added to a real person's reads, ``_SPIKED_SAMPLE_RE``)."""
+    return bool(_SPIKED_SAMPLE_RE.search(str(individual)))
+
+
+def person_of_sample(individual):
+    """The real person whose reads a sample holds: a spiked sample's person, else the sample itself."""
+    return _SPIKED_SAMPLE_RE.sub("", str(individual))
+
+
+def holds_spiked_samples(data_dir):
+    """True when ``data_dir/real_quick/`` holds spiked samples' parquets, i.e. it was built by
+    ``simulated_expansions/add_to_training_tables.py`` from links to another data folder's per-source parquets, which
+    a rebuild here would overwrite through the links."""
+    return any(is_spiked_sample(os.path.basename(path)[:-len(".parquet")])
+               for path in glob.glob(os.path.join(data_dir, SOURCE_SUBDIR, "*.parquet")))
 
 
 def individual_of_part(path):
@@ -1383,8 +1444,14 @@ def individual_of_part(path):
 BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION = {"variant_loci": "parquet", "all_loci": "parquet_all_loci"}
 
 
-def assemble_branch(data_dir, branch, subdir, training_population="variant_loci"):
+def assemble_branch(data_dir, branch, subdir, training_population="variant_loci",
+                    drop_truth_contradicted_by_short_reads=True):
     """Assembles one branch's per-combo parquets, labels + filters, writes data/<population subdir>/<branch>.
+
+    With ``drop_truth_contradicted_by_short_reads`` (the default), the rows whose truth genotype the person's own short
+    reads contradict are left out (``label_and_filter``), and every part must have been marked by
+    ``check_truth_genotypes_against_short_reads.py --mark``; a part without the column raises instead of silently
+    training on those labels.
 
     Parts are read, filtered and labeled one at a time, and each keeps a uniform sample of at most
     ``MAX_ALLELES_PER_SOURCE_PER_GENOTYPING_REGIME`` representative rows per genotyping regime plus a
@@ -1402,6 +1469,8 @@ def assemble_branch(data_dir, branch, subdir, training_population="variant_loci"
         print("\n%s branch: no per-combo parquets in %s/ -- skipping" % (branch, subdir))
         return
     _assert_parts_share_feature_contract(parts)
+    if drop_truth_contradicted_by_short_reads:
+        assert_parquets_were_checked_against_short_reads(parts)
     if training_population == "all_loci":
         without_all_loci_columns = [p for p in parts if lacks_all_loci_columns(p, keep_hom_ref_loci=True)]
         if without_all_loci_columns:
@@ -1420,7 +1489,8 @@ def assemble_branch(data_dir, branch, subdir, training_population="variant_loci"
         # subpopulation the full experts are served).
         part_df = part_df[part_df["genotyping_branch"] == ("quick" if branch == "quick" else "full")].reset_index(drop=True)
         n0 += len(part_df)
-        part_df, part_drops = label_and_filter(part_df)
+        part_df, part_drops = label_and_filter(
+            part_df, drop_truth_contradicted_by_short_reads=drop_truth_contradicted_by_short_reads)
         for name, count in part_drops.items():
             drops[name] = drops.get(name, 0) + count
         part_df["individual"] = individual_of_part(part)
@@ -1517,9 +1587,16 @@ def command_that_builds_branch_parquets(data_dir, parquet_subdir):
     No ``--force``: a plain run rebuilds every per-source parquet whose sources changed or that is off-contract
     (``_parquet_reusable``) and always re-assembles, while ``--force`` would rebuild (and re-download) them all.
     The command passes ``--keep-hom-ref-loci`` for the all-loci population, and for today's once the per-source
-    parquets keep the hom-ref loci: a rebuild without it would replace them with variant-only parquets.
+    parquets keep the hom-ref loci: a rebuild without it would replace them with variant-only parquets. A folder that
+    holds spiked samples (``holds_spiked_samples``) is rebuilt by ``simulated_expansions/add_to_training_tables.py``.
     """
     population = {s: p for p, s in BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION.items()}[parquet_subdir]
+    if holds_spiked_samples(data_dir):
+        command = ("python3 simulated_expansions/add_to_training_tables.py --base-data-dir <the data folder its "
+                   "per-source parquets link to> --out-data-dir %s" % data_dir)
+        if population != "variant_loci":
+            command += " --training-population %s" % population
+        return "`%s`" % command
     command = "python3 dataset.py --data-dir %s" % data_dir
     if population != "variant_loci" or any(
             parquet_keeps_hom_ref_loci(p) for p in glob.glob(os.path.join(data_dir, SOURCE_SUBDIR, "*.parquet"))):
@@ -1556,7 +1633,8 @@ def assert_parquets_up_to_date(data_dir, branches=("quick", "full"), parquet_sub
             sys.exit("ERROR: %s is missing -- run %s to build the parquets before training/reporting."
                      % (parquet, command_that_builds_branch_parquets(data_dir, parquet_subdir)))
         pq_mtime = os.path.getmtime(parquet)
-        newer = sorted(f for f in upstream if os.path.getmtime(f) > pq_mtime)
+        # A link to a per-source parquet that has since been removed counts as stale, so it gets the rebuild command.
+        newer = sorted(f for f in upstream if not os.path.exists(f) or os.path.getmtime(f) > pq_mtime)
         if newer:
             sys.exit("ERROR: %s is STALE -- %d upstream file(s) are newer than it (e.g. %s). "
                      "Re-run %s to rebuild it."
@@ -1582,7 +1660,21 @@ def main():
                         help="which branch parquets to assemble: variant_loci (today's recipe, data/parquet/) "
                              "and/or all_loci (data/parquet_all_loci/, needs --keep-hom-ref-loci parquets); "
                              "repeatable; default variant_loci")
+    parser.add_argument("--keep-truth-labels-contradicted-by-short-reads", action="store_true",
+                        help="train on every truth label, including those at loci where the person's own short reads "
+                             "contradict the truth genotype (check_truth_genotypes_against_short_reads.py); by default "
+                             "they are left out and every per-source parquet must have been checked")
+    parser.add_argument("--build-only", action="store_true",
+                        help="only download + build the per-source parquets, so they can be marked by "
+                             "check_truth_genotypes_against_short_reads.py --mark before the assembly")
     args = parser.parse_args()
+    if holds_spiked_samples(args.data_dir):
+        parser.error("%s holds spiked samples' parquets: rebuild it with %s, as building here would write through its "
+                     "links into the data folder they point to"
+                     % (args.data_dir, " and ".join(
+                         command_that_builds_branch_parquets(args.data_dir,
+                                                             BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION[population])
+                         for population in args.training_population or ["variant_loci"])))
     # Checked before building: without the flag, every per-source parquet that needs rebuilding would come out
     # variant-only, and only the all-loci assembly after that would fail.
     if "all_loci" in (args.training_population or []) and not args.keep_hom_ref_loci:
@@ -1592,9 +1684,12 @@ def main():
         build_combo(SOURCE_SUBDIR, sample, cov_label, sample_label, args.data_dir, args.force,
                     keep_hom_ref_loci=args.keep_hom_ref_loci)
     _link_promoted_heldout_samples(args.data_dir, args.force, keep_hom_ref_loci=args.keep_hom_ref_loci)
+    if args.build_only:
+        return
     for training_population in args.training_population or ["variant_loci"]:
         for branch in ("quick", "full"):
-            assemble_branch(args.data_dir, branch, SOURCE_SUBDIR, training_population=training_population)
+            assemble_branch(args.data_dir, branch, SOURCE_SUBDIR, training_population=training_population,
+                            drop_truth_contradicted_by_short_reads=not args.keep_truth_labels_contradicted_by_short_reads)
 
 
 if __name__ == "__main__":

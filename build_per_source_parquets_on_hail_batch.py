@@ -14,7 +14,8 @@ the 4 training combos (``dataset.build_combo``), ``data_eval_43/real_43/`` for t
 reuse them without extracting again, because ``dataset._parquet_reusable`` accepts a parquet whose record matches the
 current cloud versions of its sources and whose EH build still counts as current against ExpansionHunter-bw2 HEAD. The
 cloud versions are read here, before the jobs read the files, so a source that changes after that is rebuilt locally
-rather than trusted.
+rather than trusted. A downloaded parquet replaces the local one, so it has to be marked again by
+``check_truth_genotypes_against_short_reads.py --mark`` before ``dataset.py`` assembles the training tables.
 
 Outputs already in --output-dir are not built again (step_pipeline skips a job whose outputs exist). After a change to
 the extraction code, pass ``--force-build-step`` to rebuild them.
@@ -24,6 +25,18 @@ Usage:
     python3 build_per_source_parquets_on_hail_batch.py --no-wait -s HG00738   # one source first
     python3 build_per_source_parquets_on_hail_batch.py --no-wait
     python3 build_per_source_parquets_on_hail_batch.py --download
+
+``--eh-results-root`` builds from another run's JSONs instead of ``dataset.EH_RESULTS_ROOT``'s; with it,
+``--download`` requires ``--data-dir`` and ``--heldout-data-dir`` folders of their own, so the current parquets stay.
+``dataset.py`` and ``heldout.py`` don't reuse such parquets (their records name the other run's JSONs). For
+example, today's extraction of the EH b1fbc23 run, for the homopolymer hand-off fix (ALL_LOCI_AND_RELATIVE_TOLERANCE_
+RETRAIN_PLAN.md step 8):
+    python3 build_per_source_parquets_on_hail_batch.py --no-wait \\
+        --eh-results-root gs://tandem-repeat-explorer/tool_genotype_quality/expansion_hunter_v2.1
+    python3 build_per_source_parquets_on_hail_batch.py --download \\
+        --eh-results-root gs://tandem-repeat-explorer/tool_genotype_quality/expansion_hunter_v2.1 \\
+        --data-dir data.eh_b1fbc23_jsons_extracted_with_todays_code \\
+        --heldout-data-dir data_eval_43.eh_b1fbc23_jsons_extracted_with_todays_code
 
 Coding rules: no type hints, Google docstrings, ``print()``.
 """
@@ -60,11 +73,11 @@ JOB_OUTPUT_DIR = "/io"
 PARALLEL_CLOUD_VERSION_READS = 8
 
 
-def default_output_dir():
-    """Returns the cloud folder for the parquets built from ``dataset.EH_RESULTS_ROOT``'s JSONs: a sibling of that
+def default_output_dir(eh_results_root):
+    """Returns the cloud folder for the parquets built from the JSONs under ``eh_results_root``: a sibling of that
     folder, named after it."""
-    return "%s/genotype_quality_model_parquets_from_%s" % (os.path.dirname(dataset.EH_RESULTS_ROOT),
-                                                            os.path.basename(dataset.EH_RESULTS_ROOT))
+    return "%s/genotype_quality_model_parquets_from_%s" % (os.path.dirname(eh_results_root),
+                                                            os.path.basename(eh_results_root))
 
 
 def sources_to_build(data_dir, heldout_data_dir):
@@ -91,11 +104,11 @@ def sources_to_build(data_dir, heldout_data_dir):
     return sources
 
 
-def cloud_sources_and_versions(source):
+def cloud_sources_and_versions(source, eh_results_root):
     """Returns ``(sources, cloud_versions)`` for one source, as the local builders compute them: ``sources`` is the
-    ``(label, remote)`` list of its JSON shards, truth-genotypes TSV and high-confidence BED, and ``cloud_versions`` is
-    ``{remote: [md5, mtime]}`` (``dataset._cloud_versions``)."""
-    json_remotes = dataset._list_json_inputs(source["sample_label"])
+    ``(label, remote)`` list of its JSON shards (under ``eh_results_root``), truth-genotypes TSV and high-confidence
+    BED, and ``cloud_versions`` is ``{remote: [md5, mtime]}`` (``dataset._cloud_versions``)."""
+    json_remotes = dataset._list_json_inputs(source["sample_label"], eh_results_root)
     sources = ([("json shard %d" % i, remote) for i, remote in enumerate(json_remotes)]
                + [(label, remote) for label, remote, _ in dataset._truth_sources(source["sample"], "")])
     return sources, dataset._cloud_versions([(label, remote, None) for label, remote in sources])
@@ -228,8 +241,11 @@ def launch_or_download():
     bp = pipeline("build_per_source_parquets_on_hail_batch", backend=Backend.HAIL_BATCH_SERVICE,
                   config_file_path="~/.step_pipeline")
     parser = bp.get_config_arg_parser()
-    parser.add_argument("--output-dir", default=default_output_dir(),
-                        help="cloud folder for the parquets and their records (default: %(default)s)")
+    parser.add_argument("--eh-results-root", default=dataset.EH_RESULTS_ROOT,
+                        help="cloud folder of the ExpansionHunter run whose JSONs to build from (default: %(default)s)")
+    parser.add_argument("--output-dir",
+                        help="cloud folder for the parquets and their records (default: a sibling of "
+                             "--eh-results-root named genotype_quality_model_parquets_from_<its name>)")
     parser.add_argument("--data-dir", default=os.path.join(HERE, "data"),
                         help="dataset.py's --data-dir, which holds the training combos' parquets")
     parser.add_argument("--heldout-data-dir", default=os.path.join(HERE, "data_eval_43"),
@@ -242,6 +258,12 @@ def launch_or_download():
     parser.add_argument("--download", action="store_true",
                         help="copy the built parquets and records to their local paths instead of launching jobs")
     args = bp.parse_known_args()
+    args.output_dir = args.output_dir or default_output_dir(args.eh_results_root)
+    another_run = args.eh_results_root != dataset.EH_RESULTS_ROOT
+    if args.download and another_run and (os.path.abspath(args.data_dir) == os.path.join(HERE, "data")
+                                          or os.path.abspath(args.heldout_data_dir) == os.path.join(HERE, "data_eval_43")):
+        parser.error("pass --data-dir and --heldout-data-dir folders of their own when downloading another run's "
+                     "parquets, or they would replace the current ones")
 
     sources = sources_to_build(args.data_dir, args.heldout_data_dir)
     if args.source:
@@ -253,8 +275,12 @@ def launch_or_download():
     if args.download:
         download_built_parquets(sources, args.output_dir,
                                 os.path.join(args.data_dir, "_per_source_parquets_from_hail_batch"))
-        print("next: python3 dataset.py --keep-hom-ref-loci --training-population variant_loci "
-              "--training-population all_loci; python3 heldout.py --build-only --keep-hom-ref-loci")
+        if another_run:
+            print("these parquets come from another run's JSONs, so dataset.py and heldout.py will not reuse them")
+        else:
+            print("next: python3 check_truth_genotypes_against_short_reads.py --mark (after its measuring jobs: the same "
+                  "without --mark); python3 dataset.py --keep-hom-ref-loci --training-population variant_loci "
+                  "--training-population all_loci; python3 heldout.py --build-only --keep-hom-ref-loci")
         return
 
     bp.set_name("build_per_source_parquets_on_hail_batch: %d source(s) -> %s" % (len(sources), args.output_dir))
@@ -262,7 +288,7 @@ def launch_or_download():
     bp.precache_file_paths(os.path.join(args.output_dir, "*.parquet*"))
     print("reading the cloud versions of %d source(s)" % len(sources), flush=True)
     with concurrent.futures.ThreadPoolExecutor(PARALLEL_CLOUD_VERSION_READS) as pool:
-        versions = list(pool.map(cloud_sources_and_versions, sources))
+        versions = list(pool.map(lambda source: cloud_sources_and_versions(source, args.eh_results_root), sources))
     unknown = [s["name"] for s, (_, cloud_versions) in zip(sources, versions) if [None, None] in cloud_versions.values()]
     if unknown:
         sys.exit("could not read the cloud version of every input of %s; nothing submitted" % ", ".join(unknown))

@@ -5,9 +5,7 @@ Each genotyping_regime expert is two scikit-learn ``HistGradientBoosting`` heads
 - **q-median** (``train_q_median``) -- a quantile regressor on
   ``t = log(eh) - log(true)``; the length-correction factor is ``LCF = exp(t)``.
 - **direction** (``train_direction``) -- a 3-class classifier
-  ``[pOk, pTooLong, pTooShort]`` plus one per-class isotonic calibrator. Change B's relative-tolerance models add a
-  4th class, PAST_LIMIT, and report ``pOk = P(OK) + P(PAST_LIMIT)``, ``pTooLong = P(TOO_LONG)`` and
-  ``pTooShort = P(TOO_SHORT) + P(PAST_LIMIT)`` (``reported_probabilities``), which no longer sum to 1.
+  ``[pOk, pTooLong, pTooShort]`` plus one per-class isotonic calibrator.
 
 Both heads use fixed, principled capacity/regularization (NOT tuned on test). Given
 ``n_iter`` (``_fit_fixed``), a head is fit to exactly that many boosting iterations: the
@@ -157,97 +155,85 @@ def predict_lcf(qreg, X):
 
 # --- direction head -------------------------------------------------------
 
-def _proba_in_class_order(clf, X, n_classes=N_CLASSES):
-    """Returns ``clf.predict_proba`` scattered into the fixed class-code order (``[pOk, pTooLong, pTooShort]``, then
-    PAST_LIMIT for a 4-class head).
+def _proba_in_class_order(clf, X):
+    """Returns ``clf.predict_proba`` scattered into fixed ``[pOk, pTooLong, pTooShort]``.
 
     Columns for classes absent from the training labels are left all-zero, so the
-    output is always shape ``(n, n_classes)`` in canonical order.
+    output is always shape ``(n, 3)`` in canonical order.
     """
     raw = clf.predict_proba(X)
-    full = np.zeros((raw.shape[0], n_classes))
+    full = np.zeros((raw.shape[0], N_CLASSES))
     for col, cls in enumerate(clf.classes_):
         full[:, int(cls)] = raw[:, col]
     return full
 
 
-def train_direction(X, y, X_calib, y_calib, n_iter=None, n_classes=N_CLASSES):
-    """Fits the direction classifier plus per-class isotonic calibrators.
+def train_direction(X, y, X_calib, y_calib, n_iter=None, sample_weight=None,
+                    too_long_too_short_calibration_weight=None):
+    """Fits the 3-class classifier plus per-class isotonic calibrators.
 
-    ``n_classes`` is 3 (OK, TOO_LONG, TOO_SHORT) or 4 (plus PAST_LIMIT, change B's label); ``y`` holds class codes
-    below it. With ``n_iter`` the classifier has exactly that many iterations (see ``train_q_median``).
+    ``sample_weight`` weights the classifier's training rows (None: all equal); the calibrators are fit
+    unweighted, so the calibrated probabilities match the calib set's frequencies either way, except that
+    ``too_long_too_short_calibration_weight`` (per calib row) weights the TOO_LONG and TOO_SHORT calibrators. The OK
+    calibrator itself stays unweighted, but ``predict_proba`` divides the calibrated values by their
+    sum, so the reported pOk (and the pOk < 0.5 gate) still moves wherever the weighted calibrators change that sum.
+    Each calibrator is a function of the raw score alone, so the change reaches every row whose score falls where the
+    weighted rows' scores do, whatever its called size.
+    With ``n_iter`` the classifier has exactly that many iterations (see ``train_q_median``).
     Otherwise it is early-stopped on the calib set, with ``EARLY_STOP_MAX_ITERATIONS`` as the
     ceiling. Then one ``IsotonicRegression`` per class maps its raw
     one-vs-rest probability to the empirical outcome on the calib set. A class absent from (or the only class in) the calib split gets a pass-through
     calibrator so the simplex renormalization in ``predict_proba`` does not zero it out. So does a class absent from
-    the training labels: its probability stays 0, as in the serialized head, which leaves that class out.
+    the training labels, whose probability stays 0.
 
     Returns:
         ``{"clf": clf, "calibrators": {idx: IsotonicRegression or None}}`` (None ==
-        pass-through), with one calibrator per class code below ``n_classes``.
+        pass-through).
     """
     def make():
         return HistGradientBoostingClassifier(loss="log_loss", **_GBM_KWARGS)
     if n_iter:
-        clf = _fit_fixed(make, lambda e: e.fit(X, y), n_iter)
+        clf = _fit_fixed(make, lambda e: e.fit(X, y, sample_weight=sample_weight), n_iter)
     else:
         clf = _fit_early_stop(
             make,
-            fit=lambda e: e.fit(X, y),
-            score=lambda e: _log_loss(y_calib, _proba_in_class_order(e, X_calib, n_classes)))
+            fit=lambda e: e.fit(X, y, sample_weight=sample_weight),
+            score=lambda e: _log_loss(y_calib, _proba_in_class_order(e, X_calib)))
 
-    raw_calib = _proba_in_class_order(clf, X_calib, n_classes)
+    raw_calib = _proba_in_class_order(clf, X_calib)
     y_calib = np.asarray(y_calib, dtype=int)
     trained_classes = {int(c) for c in clf.classes_}
     calibrators = {}
-    for idx in range(n_classes):
+    for idx in range(N_CLASSES):
         n_pos = int((y_calib == idx).sum())
         if n_pos == 0 or n_pos == y_calib.size or idx not in trained_classes:
             calibrators[idx] = None  # pass-through
             continue
         cal = IsotonicRegression(y_min=0.0, y_max=1.0, increasing=True, out_of_bounds="clip")
-        cal.fit(raw_calib[:, idx], (y_calib == idx).astype(float))
+        weighted = idx in (features.TOO_LONG, features.TOO_SHORT)
+        cal.fit(raw_calib[:, idx], (y_calib == idx).astype(float),
+                sample_weight=too_long_too_short_calibration_weight if weighted else None)
         calibrators[idx] = cal
     return {"clf": clf, "calibrators": calibrators}
 
 
 def predict_proba(model, X):
-    """Returns calibrated, simplex-renormalized class probabilities, shape ``(n, n_classes)`` in class-code order.
+    """Returns calibrated, simplex-renormalized class probabilities, shape ``(n, 3)``.
 
     Applies each isotonic calibrator (pass-through where ``None``), clips to
-    ``[0, 1]``, and renormalizes rows to sum to 1 (all-zero rows fall back to 1/n_classes).
+    ``[0, 1]``, and renormalizes rows to sum to 1 (all-zero rows fall back to 1/3).
     Calibration is assessed AFTER this renormalization, so report code must score on
     these returned columns.
     """
+    raw = _proba_in_class_order(model["clf"], X)
     cals = model["calibrators"]
-    n_classes = len(cals)
-    raw = _proba_in_class_order(model["clf"], X, n_classes)
-    cols = [raw[:, i] if cals[i] is None else cals[i].predict(raw[:, i]) for i in range(n_classes)]
+    cols = [raw[:, i] if cals[i] is None else cals[i].predict(raw[:, i]) for i in range(N_CLASSES)]
     cal = np.clip(np.column_stack(cols), 0.0, 1.0)
     row_sums = cal.sum(axis=1)
-    out = np.full_like(cal, 1.0 / n_classes)
+    out = np.full_like(cal, 1.0 / N_CLASSES)
     nz = row_sums > 0
     out[nz] = cal[nz] / row_sums[nz, None]
     return out
-
-
-def reported_probabilities(proba, class_names):
-    """Returns ``[pOk, pTooLong, pTooShort]`` per row, the three numbers ExpansionHunter reports.
-
-    ``proba`` holds one column per name in ``class_names``. For a 3-class head these are its own columns. With
-    PAST_LIMIT (change B), ``pOk = P(OK) + P(PAST_LIMIT)`` and ``pTooShort = P(TOO_SHORT) + P(PAST_LIMIT)``: a call
-    as long as ExpansionHunter can measure is fine as a lower bound, and its allele may be longer.
-    """
-    proba = np.asarray(proba, dtype=float)
-    column = {name: proba[:, i] for i, name in enumerate(class_names)}
-    past_limit = column.get("PAST_LIMIT", 0.0)
-    return np.column_stack([column["OK"] + past_limit, column["TOO_LONG"], column["TOO_SHORT"] + past_limit])
-
-
-def predict_reported(model, X):
-    """``reported_probabilities`` of a fitted direction head (``train_direction``) on ``X``."""
-    proba = predict_proba(model, X)
-    return reported_probabilities(proba, features.RELATIVE_TOLERANCE_DIR_CLASS_NAMES[:proba.shape[1]])
 
 
 # --- serialization to the C++ schema --------------------------------------
@@ -302,33 +288,23 @@ def _ser_iso(cal):
 
 
 def _ser_dirhead(dmodel):
-    """Serializes the direction classifier + isotonic calibrators.
-
-    ``classes`` names the head's classes in the order of its baseline, trees and calibrators. A 3-class head is
-    always ``[OK, TOO_LONG, TOO_SHORT]`` (the format ExpansionHunter reads today). A 4-class head (change B) lists the
-    classes its training rows had, in class-code order: OK, TOO_LONG and TOO_SHORT always, PAST_LIMIT only if some
-    training row had it (no fast-path row may), so a reader must compute ``reported_probabilities`` by name.
-    """
+    """Serializes the direction classifier + isotonic calibrators."""
     clf = dmodel["clf"]
-    codes = [int(c) for c in clf.classes_]
-    if len(dmodel["calibrators"]) == N_CLASSES:
-        if codes != [features.OK, features.TOO_LONG, features.TOO_SHORT]:
-            raise RuntimeError("direction classes_ != [0,1,2] (a class was absent): %s" % clf.classes_)
-    elif not {features.OK, features.TOO_LONG, features.TOO_SHORT} <= set(codes):
-        raise RuntimeError("relative-tolerance direction head lacks OK, TOO_LONG or TOO_SHORT: %s" % clf.classes_)
+    if list(clf.classes_) != [0, 1, 2]:
+        raise RuntimeError("direction classes_ != [0,1,2] (a class was absent): %s" % clf.classes_)
     bl = np.ravel(clf._baseline_prediction)
-    if bl.size != len(codes):
-        raise RuntimeError("direction baseline size %d != %d classes" % (bl.size, len(codes)))
+    if bl.size != N_CLASSES:
+        raise RuntimeError("direction baseline size %d != 3" % bl.size)
     trees = []
     for it in clf._predictors:
-        if len(it) != len(codes):
-            raise RuntimeError("direction iter has %d trees != %d classes" % (len(it), len(codes)))
-        trees.append([_ser_tree(tree) for tree in it])
+        if len(it) != N_CLASSES:
+            raise RuntimeError("direction iter has %d trees != 3" % len(it))
+        trees.append([_ser_tree(it[0]), _ser_tree(it[1]), _ser_tree(it[2])])
     cals = dmodel["calibrators"]
-    return {"classes": [features.RELATIVE_TOLERANCE_DIR_CLASS_NAMES[c] for c in codes],
-            "baseline": [float(v) for v in bl],
+    return {"classes": list(features.DIR_CLASS_NAMES),
+            "baseline": [float(bl[0]), float(bl[1]), float(bl[2])],
             "trees": trees,
-            "calibrators": [_ser_iso(cals[c]) for c in codes]}
+            "calibrators": [_ser_iso(cals[0]), _ser_iso(cals[1]), _ser_iso(cals[2])]}
 
 
 def serialize_genotyping_regime(qreg, dmodel):
@@ -371,35 +347,28 @@ def _ser_lcf(qj, X):
 
 
 def _ser_proba(dj, X):
-    """Returns the serialized head's calibrated probabilities, one column per name in ``dj["classes"]``."""
     bl = dj["baseline"]
-    n_classes = len(bl)
-    out = np.zeros((len(X), n_classes))
+    out = np.zeros((len(X), N_CLASSES))
     for r in range(len(X)):
         raw = np.array([bl[c] + sum(_tree_eval(tr[c]["nodes"], X[r]) for tr in dj["trees"])
-                        for c in range(n_classes)])
+                        for c in range(N_CLASSES)])
         e = np.exp(raw - raw.max())
         p = e / e.sum()
-        cal = np.clip([_iso_apply(dj["calibrators"][c], p[c]) for c in range(n_classes)], 0, 1)
+        cal = np.clip([_iso_apply(dj["calibrators"][c], p[c]) for c in range(N_CLASSES)], 0, 1)
         s = cal.sum()
-        out[r] = cal / s if s > 0 else np.full(n_classes, 1.0 / n_classes)
+        out[r] = cal / s if s > 0 else np.full(N_CLASSES, 1.0 / N_CLASSES)
     return out
 
 
 def verify_genotyping_regime(genotyping_regime, qreg, dmodel, genotyping_regime_json, X_check, tol=1e-6):
     """Asserts the serialized dict reproduces sklearn predictions on ``X_check``.
 
-    Compares the three reported numbers (``reported_probabilities``), which are what ExpansionHunter writes; for a
-    3-class head they are its class probabilities.
-
     Raises:
         RuntimeError: If max abs LCF or proba difference exceeds ``tol``.
     """
     Xnp = np.asarray(X_check, dtype=float)  # serialized reimpl indexes features positionally
     dl = float(np.max(np.abs(predict_lcf(qreg, X_check) - _ser_lcf(genotyping_regime_json["q_median"], Xnp))))
-    direction_json = genotyping_regime_json["direction"]
-    serialized = reported_probabilities(_ser_proba(direction_json, Xnp), direction_json["classes"])
-    dp = float(np.max(np.abs(predict_reported(dmodel, X_check) - serialized)))
+    dp = float(np.max(np.abs(predict_proba(dmodel, X_check) - _ser_proba(genotyping_regime_json["direction"], Xnp))))
     print("  [%s] round-trip verify n=%d  max|LCF diff|=%.2e  max|proba diff|=%.2e"
           % (genotyping_regime, len(X_check), dl, dp), flush=True)
     if dl > tol or dp > tol:
@@ -500,7 +469,6 @@ def compile_genotyping_regime(genotyping_regime_json):
     return {
         "q_baseline": float(q["baseline"]),
         "q_trees": [_compile_tree(t) for t in q["trees"]],
-        "d_classes": list(d["classes"]),
         "d_baseline": np.asarray(d["baseline"], float),
         "d_trees": [[_compile_tree(tr) for tr in iteration] for iteration in d["trees"]],
         "calibrators": d["calibrators"],
@@ -538,27 +506,42 @@ def _iso_apply_vec(iso, v):
 
 
 def predict_proba_json(comp, X):
-    """Returns calibrated probabilities from a compiled genotyping regime (see ``predict_proba``), one column per
-    name in ``comp["d_classes"]``. Callers that want pOk / pTooLong / pTooShort use ``predict_reported_json``."""
+    """Returns calibrated ``(n, 3)`` probabilities from a compiled genotyping regime (see ``predict_proba``)."""
     X = np.asarray(X, dtype=float)
-    n_classes = len(comp["d_baseline"])
     raw = np.tile(comp["d_baseline"], (X.shape[0], 1))
     for iteration in comp["d_trees"]:
-        for c in range(n_classes):
+        for c in range(N_CLASSES):
             raw[:, c] += _eval_tree(iteration[c], X)
     raw -= raw.max(axis=1, keepdims=True)
     e = np.exp(raw)
     p = e / e.sum(axis=1, keepdims=True)
     cal = np.clip(np.column_stack(
-        [_iso_apply_vec(comp["calibrators"][c], p[:, c]) for c in range(n_classes)]), 0.0, 1.0)
+        [_iso_apply_vec(comp["calibrators"][c], p[:, c]) for c in range(N_CLASSES)]), 0.0, 1.0)
     row_sums = cal.sum(axis=1)
-    out = np.full_like(cal, 1.0 / n_classes)
+    out = np.full_like(cal, 1.0 / N_CLASSES)
     nz = row_sums > 0
     out[nz] = cal[nz] / row_sums[nz, None]
     return out
 
 
-def predict_reported_json(comp, X):
-    """Returns ``[pOk, pTooLong, pTooShort]`` per row of ``X`` from a compiled genotyping regime: what
-    ExpansionHunter reports (``reported_probabilities``). Full precision, like ``predict_lcf_json``."""
-    return reported_probabilities(predict_proba_json(comp, X), comp["d_classes"])
+def predict_proba_by_genotyping_regime(df, model, model_path):
+    """Returns the ``(n, 3)`` probabilities a serialized model gives the rows of ``df``, each row scored by the heads
+    of its genotyping regime (``features.genotyping_regime_of``) and rounded the way ExpansionHunter writes them.
+
+    Args:
+        df: Rows with the model's inputs, ``genotyping_branch`` and ``spanning_at_called``.
+        model: The serialized model (``load``).
+        model_path: Its path, for ``feature_names_of``'s messages.
+    """
+    declared = feature_names_of(model, model_path)
+    regime = features.genotyping_regime_of(df["genotyping_branch"].to_numpy(object),
+                                           df["spanning_at_called"].to_numpy(float))
+    proba = np.full((len(df), N_CLASSES), np.nan)
+    for name in features.GENOTYPING_REGIMES:
+        mask = regime == name
+        if mask.any():
+            branch = features.GENOTYPING_REGIME_BRANCH[name]
+            X, _ = features.build_matrix(df[mask], branch, declared[branch])
+            proba[mask] = round_like_emitted(
+                predict_proba_json(compile_genotyping_regime(model["genotyping_regimes"][name]), X))
+    return proba

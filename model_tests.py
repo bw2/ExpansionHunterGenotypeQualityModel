@@ -58,6 +58,33 @@ class RoundTripTest(unittest.TestCase):
         proba = M.predict_proba(dmodel, self.Xca)  # still calibrated on the calib rows
         np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-9)
 
+    def test_sample_weights_reach_the_classifier_but_not_the_calibrators(self):
+        unweighted = M.train_direction(self.Xtr, self.ytr, self.Xca, self.yca, n_iter=23)
+        equal = M.train_direction(self.Xtr, self.ytr, self.Xca, self.yca, n_iter=23, sample_weight=np.ones(len(self.ytr)))
+        np.testing.assert_array_equal(M.predict_proba(equal, self.Xca), M.predict_proba(unweighted, self.Xca))
+        # Weighting the TOO_LONG rows up raises the classifier's raw TOO_LONG probability.
+        weights = np.where(self.ytr == features.TOO_LONG, 5.0, 1.0)
+        weighted = M.train_direction(self.Xtr, self.ytr, self.Xca, self.yca, n_iter=23, sample_weight=weights)
+        self.assertGreater(weighted["clf"].predict_proba(self.Xca)[:, features.TOO_LONG].mean(),
+                           unweighted["clf"].predict_proba(self.Xca)[:, features.TOO_LONG].mean())
+        np.testing.assert_allclose(M.predict_proba(weighted, self.Xca).sum(axis=1), 1.0, atol=1e-9)
+
+    def test_calibration_weights_reach_only_the_too_long_and_too_short_calibrators(self):
+        unweighted = M.train_direction(self.Xtr, self.ytr, self.Xca, self.yca, n_iter=23)
+        equal = M.train_direction(self.Xtr, self.ytr, self.Xca, self.yca, n_iter=23,
+                                  too_long_too_short_calibration_weight=np.ones(len(self.yca)))
+        np.testing.assert_array_equal(M.predict_proba(equal, self.Xca), M.predict_proba(unweighted, self.Xca))
+        # Weighting the TOO_SHORT calib rows up raises the calibrated TOO_SHORT probability and leaves OK's calibrator
+        # as it was.
+        weights = np.where(self.yca == features.TOO_SHORT, 5.0, 1.0)
+        weighted = M.train_direction(self.Xtr, self.ytr, self.Xca, self.yca, n_iter=23,
+                                     too_long_too_short_calibration_weight=weights)
+        raw = unweighted["clf"].predict_proba(self.Xca)
+        np.testing.assert_array_equal(weighted["calibrators"][features.OK].predict(raw[:, features.OK]),
+                                      unweighted["calibrators"][features.OK].predict(raw[:, features.OK]))
+        self.assertGreater(weighted["calibrators"][features.TOO_SHORT].predict(raw[:, features.TOO_SHORT]).mean(),
+                           unweighted["calibrators"][features.TOO_SHORT].predict(raw[:, features.TOO_SHORT]).mean())
+
     def test_lcf_positive(self):
         qreg = M.train_q_median(self.Xtr, self.ttr, self.Xca, self.tca)
         self.assertTrue(np.all(M.predict_lcf(qreg, self.Xca) > 0))
@@ -72,47 +99,6 @@ class RoundTripTest(unittest.TestCase):
                                    M.predict_lcf(qreg, self.Xca), atol=1e-9)
         np.testing.assert_allclose(M.predict_proba_json(comp, self.Xca),
                                    M.predict_proba(dmodel, self.Xca), atol=1e-9)
-        # A 3-class head reports its own probabilities.
-        np.testing.assert_array_equal(M.predict_reported_json(comp, self.Xca), M.predict_proba_json(comp, self.Xca))
-
-
-class RelativeToleranceHeadTest(unittest.TestCase):
-    """Change B's 4-class direction head: serialized by class name, reported as three sums."""
-
-    def setUp(self):
-        X, _, y = _synthetic(n=2000)
-        s = X["f2"].to_numpy()
-        y = np.where(s > 1.0, features.PAST_LIMIT, y)   # a 4th class from another signal
-        self.Xtr, self.Xca, self.ytr, self.yca = X.iloc[:1400], X.iloc[1400:], y[:1400], y[1400:]
-        self.qreg = M.train_q_median(self.Xtr, np.zeros(len(self.Xtr)), n_iter=5)
-
-    def test_round_trip_with_all_four_classes(self):
-        dmodel = M.train_direction(self.Xtr, self.ytr, self.Xca, self.yca, n_iter=20, n_classes=4)
-        regime_json = M.serialize_genotyping_regime(self.qreg, dmodel)
-        M.verify_genotyping_regime("unit", self.qreg, dmodel, regime_json, self.Xca.iloc[:200])
-        self.assertEqual(regime_json["direction"]["classes"], features.RELATIVE_TOLERANCE_DIR_CLASS_NAMES)
-        proba = M.predict_proba(dmodel, self.Xca)
-        self.assertEqual(proba.shape, (len(self.Xca), 4))
-        reported = M.predict_reported_json(M.compile_genotyping_regime(regime_json), self.Xca)
-        np.testing.assert_allclose(reported, M.predict_reported(dmodel, self.Xca), atol=1e-9)
-        np.testing.assert_allclose(reported[:, 0], proba[:, features.OK] + proba[:, features.PAST_LIMIT], atol=1e-9)
-        np.testing.assert_allclose(reported[:, 2], proba[:, features.TOO_SHORT] + proba[:, features.PAST_LIMIT],
-                                   atol=1e-9)
-
-    def test_a_head_without_past_limit_training_rows_serializes_the_three_classes_it_has(self):
-        # The fast path may have no PAST_LIMIT rows at all.
-        ytr = np.where(self.ytr == features.PAST_LIMIT, features.OK, self.ytr)
-        dmodel = M.train_direction(self.Xtr, ytr, self.Xca, self.yca, n_iter=20, n_classes=4)
-        regime_json = M.serialize_genotyping_regime(self.qreg, dmodel)
-        M.verify_genotyping_regime("unit", self.qreg, dmodel, regime_json, self.Xca.iloc[:200])
-        self.assertEqual(regime_json["direction"]["classes"], features.DIR_CLASS_NAMES)
-        np.testing.assert_array_equal(M.predict_proba(dmodel, self.Xca)[:, features.PAST_LIMIT], 0.0)
-
-    def test_reported_probabilities_add_past_limit_to_pok_and_ptooshort(self):
-        proba = np.array([[0.5, 0.1, 0.2, 0.2]])
-        np.testing.assert_allclose(M.reported_probabilities(proba, features.RELATIVE_TOLERANCE_DIR_CLASS_NAMES),
-                                   [[0.7, 0.1, 0.4]])
-        np.testing.assert_allclose(M.reported_probabilities(proba[:, :3], features.DIR_CLASS_NAMES), proba[:, :3])
 
 
 class FeatureNamesOfTest(unittest.TestCase):

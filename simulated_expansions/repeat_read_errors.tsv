@@ -1,0 +1,110 @@
+quantity	group	key	value
+low_quality_share	0	0	0.010335306125597108
+low_quality_share	0	30	0.022998220375804252
+low_quality_share	0	60	0.0327457872428409
+low_quality_share	0	90	0.04237865092043976
+low_quality_share	0	120	0.0486510724161124
+low_quality_share	<=1/3	0	0.007408773771927335
+low_quality_share	<=1/3	30	0.02601392385674004
+low_quality_share	<=1/3	60	0.05548515423236714
+low_quality_share	<=1/3	90	0.08762284144809249
+low_quality_share	<=1/3	120	0.10972593777077191
+low_quality_share	<=2/3	0	0.010473330532210263
+low_quality_share	<=2/3	30	0.0435448911974487
+low_quality_share	<=2/3	60	0.08109085009334124
+low_quality_share	<=2/3	90	0.11333570231991472
+low_quality_share	<=2/3	120	0.13225592477222467
+low_quality_share	>2/3	0	0.02220636053612499
+low_quality_share	>2/3	30	0.08489853589612414
+low_quality_share	>2/3	60	0.13833352594475903
+low_quality_share	>2/3	90	0.15977062802595887
+low_quality_share	>2/3	120	0.1650582230020737
+mismatch_rate	0	<20	0.12037720377203771
+mismatch_rate	0	20-29	0.044738424533974745
+mismatch_rate	0	30+	0.0014241782132780583
+mismatch_rate	<=1/3	<20	0.15288903039849852
+mismatch_rate	<=1/3	20-29	0.014388592208684697
+mismatch_rate	<=1/3	30+	0.0016925312767644253
+mismatch_rate	<=2/3	<20	0.16947148371123424
+mismatch_rate	<=2/3	20-29	0.03934920893818301
+mismatch_rate	<=2/3	30+	0.00421783761872939
+mismatch_rate	>2/3	<20	0.13538630739620566
+mismatch_rate	>2/3	20-29	0.08220167581623808
+mismatch_rate	>2/3	30+	0.004343091327349232
+indel_rate	0	deletion whole-motif	0.0003333627701652193
+indel_rate	0	deletion partial-motif	0.00012229757811198878
+indel_rate	0	insertion whole-motif	0.0004579467245110347
+indel_rate	0	insertion partial-motif	2.9043857638326882e-05
+indel_rate	<=1/3	deletion whole-motif	0.0007113481071050378
+indel_rate	<=1/3	deletion partial-motif	0.000251611792820411
+indel_rate	<=1/3	insertion whole-motif	0.000269609605234458
+indel_rate	<=1/3	insertion partial-motif	0.00016195367526771368
+indel_rate	<=2/3	deletion whole-motif	0.0005853084874153639
+indel_rate	<=2/3	deletion partial-motif	8.948010201406652e-05
+indel_rate	<=2/3	insertion whole-motif	0.0006710620947902357
+indel_rate	<=2/3	insertion partial-motif	0.00012871231972659588
+indel_rate	>2/3	deletion whole-motif	0.0003899474374944686
+indel_rate	>2/3	deletion partial-motif	0.00010521125591617461
+indel_rate	>2/3	insertion whole-motif	0.0001588018861355214
+indel_rate	>2/3	insertion partial-motif	0.00019223981949082185
+indel_size_share	deletion whole-motif	1	0.7470699432892249
+indel_size_share	deletion whole-motif	2	0.1610586011342155
+indel_size_share	deletion whole-motif	3	0.05217391304347826
+indel_size_share	deletion whole-motif	4	0.011720226843100189
+indel_size_share	deletion whole-motif	5	0.01776937618147448
+indel_size_share	deletion whole-motif	6	0.005671077504725898
+indel_size_share	deletion whole-motif	7	0.001890359168241966
+indel_size_share	deletion whole-motif	8	0.0007561436672967864
+indel_size_share	deletion whole-motif	9	0.0007561436672967864
+indel_size_share	deletion whole-motif	10	0.0003780718336483932
+indel_size_share	deletion whole-motif	12	0.0003780718336483932
+indel_size_share	deletion whole-motif	13	0.0003780718336483932
+indel_size_share	deletion partial-motif	1	0.46846846846846846
+indel_size_share	deletion partial-motif	2	0.33906633906633904
+indel_size_share	deletion partial-motif	3	0.06388206388206388
+indel_size_share	deletion partial-motif	4	0.030303030303030304
+indel_size_share	deletion partial-motif	5	0.030303030303030304
+indel_size_share	deletion partial-motif	6	0.004095004095004095
+indel_size_share	deletion partial-motif	7	0.031122031122031123
+indel_size_share	deletion partial-motif	8	0.003276003276003276
+indel_size_share	deletion partial-motif	9	0.005733005733005733
+indel_size_share	deletion partial-motif	11	0.014742014742014743
+indel_size_share	deletion partial-motif	12	0.002457002457002457
+indel_size_share	deletion partial-motif	13	0.002457002457002457
+indel_size_share	deletion partial-motif	14	0.000819000819000819
+indel_size_share	deletion partial-motif	18	0.000819000819000819
+indel_size_share	deletion partial-motif	23	0.000819000819000819
+indel_size_share	deletion partial-motif	29	0.000819000819000819
+indel_size_share	deletion partial-motif	45	0.000819000819000819
+indel_size_share	insertion whole-motif	1	0.761927255550307
+indel_size_share	insertion whole-motif	2	0.18186112423240436
+indel_size_share	insertion whole-motif	3	0.03589985829003307
+indel_size_share	insertion whole-motif	4	0.014643363249881908
+indel_size_share	insertion whole-motif	5	0.002834199338686821
+indel_size_share	insertion whole-motif	6	0.0014170996693434106
+indel_size_share	insertion whole-motif	7	0.000944733112895607
+indel_size_share	insertion whole-motif	15	0.0004723665564478035
+indel_size_share	insertion partial-motif	1	0.3898305084745763
+indel_size_share	insertion partial-motif	2	0.3353510895883777
+indel_size_share	insertion partial-motif	3	0.08958837772397095
+indel_size_share	insertion partial-motif	4	0.023002421307506054
+indel_size_share	insertion partial-motif	5	0.0847457627118644
+indel_size_share	insertion partial-motif	6	0.006053268765133172
+indel_size_share	insertion partial-motif	7	0.021791767554479417
+indel_size_share	insertion partial-motif	8	0.01937046004842615
+indel_size_share	insertion partial-motif	9	0.004842615012106538
+indel_size_share	insertion partial-motif	10	0.004842615012106538
+indel_size_share	insertion partial-motif	11	0.018159806295399514
+indel_size_share	insertion partial-motif	13	0.0012106537530266344
+indel_size_share	insertion partial-motif	14	0.0012106537530266344
+low_quality_value_share		1	1.5859516403696062e-05
+low_quality_value_share		2	0.006149527485533148
+low_quality_value_share		3	0.004115544506759127
+low_quality_value_share		4	0.010471245705540325
+low_quality_value_share		5	0.0062169304302488555
+low_quality_value_share		6	0.026725267579778323
+low_quality_value_share		10	0.9463056247757365
+fragment_keep_base	0		0.1859769379730501
+fragment_keep_base	<=1/3		0.641789266954235
+fragment_keep_base	<=2/3		0.6588454393670782
+fragment_keep_base	>2/3		0.10893576886516596

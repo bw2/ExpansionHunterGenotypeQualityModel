@@ -122,6 +122,8 @@ def _new_acc():
     # the decision the gate actually makes (pOk < 0.5 vs "the call is not OK"). per_sample holds, per
     # sample, [n, sum of gated |error|, homopolymer n, homopolymer sum of gated |error|] so
     # compare_models can pair the two models sample by sample and drop sample subsets exactly.
+    # per_sample_by_motif_size_category holds, per sample, one row per features.MOTIF_SIZE_CATEGORY_LABELS
+    # of [n, sum of raw |error|, sum of gated |error|] over ALL loci (homopolymers are category "1").
     return dict(n=0, sum_db=0.0, sum_da=0.0, ex_eh=0, ex_gated=0, pok_correct=0, gate_correct=0,
                 err_raw=[], err_gated=[],
                 n_lt=0, helped_lt=0, hurt_lt=0, n_ge=0, helped_ge=0, hurt_ge=0,
@@ -129,7 +131,8 @@ def _new_acc():
                 h_n=0, h_sum_db=0.0, h_sum_da=0.0, h_err_raw=[], h_err_gated=[],
                 h_pok_correct=0, h_gate_correct=0,
                 h_n_lt=0, h_helped_lt=0, h_hurt_lt=0, h_n_ge=0, h_helped_ge=0, h_hurt_ge=0,
-                h_red_all=[], h_pok_all=[], h_lcf_all=[], h_pdiff_all=[], per_sample={})
+                h_red_all=[], h_pok_all=[], h_lcf_all=[], h_pdiff_all=[], per_sample={},
+                per_sample_by_motif_size_category={})
 
 
 def _strided(a, idx):
@@ -158,9 +161,7 @@ def _accumulate(acc, sub, comp, branch, names, sample_name):
     # accuracy_by_size scores it; a continuous eh/LCF would count an LCF of 1.003 on an integer call
     # as helping or hurting although the call does not change.
     true_pred = np.round(eh / lcf)
-    # [pOk, pTooLong, pTooShort] as ExpansionHunter reports them (with change B's PAST_LIMIT class, pOk and
-    # pTooShort both include it, so they no longer sum to 1).
-    proba = M.round_like_emitted(M.predict_reported_json(comp, X))
+    proba = M.round_like_emitted(M.predict_proba_json(comp, X))
     p_ok = proba[:, features.OK]
     corrected = np.where(p_ok < 0.5, true_pred, eh)        # gate: correct only low-confidence calls
     d_raw = np.abs(true - eh)
@@ -174,6 +175,11 @@ def _accumulate(acc, sub, comp, branch, names, sample_name):
     totals[1] += float(d_gated[~homo].sum())
     totals[2] += int(homo.sum())
     totals[3] += float(d_gated[homo].sum())
+    by_category = acc["per_sample_by_motif_size_category"].setdefault(
+        sample_name, np.zeros((len(features.MOTIF_SIZE_CATEGORY_LABELS), 3)))
+    category = features.motif_size_category(motif)
+    for column, values in ((0, np.ones(motif.size)), (1, d_raw), (2, d_gated)):
+        np.add.at(by_category[:, column], category, values)
 
     # By-motif-size violin sample: keep ALL loci (incl. homopolymers). Strided => bounded, deterministic.
     midx = slice(None) if red.size <= VIOLIN_PER_SAMPLE else slice(None, None, red.size // VIOLIN_PER_SAMPLE)
@@ -253,12 +259,28 @@ def _homopolymer_summary(acc):
             "n_pok_ge": acc["h_n_ge"], "helped_ge": acc["h_helped_ge"], "hurt_ge": acc["h_hurt_ge"]}
 
 
+def _by_motif_size_category(acc):
+    """Returns ``{category label: {"n", "mae_raw", "mae_gated", "per_sample"}}`` over all loci (homopolymers are
+    category "1"), for each ``features.MOTIF_SIZE_CATEGORY_LABELS`` category with alleles. ``per_sample`` maps each
+    sample to ``{"n", "sum_gated_abs_error"}``, so compare_models can pair two models sample by sample."""
+    by_sample = sorted(acc["per_sample_by_motif_size_category"].items())
+    out = {}
+    for i, label in enumerate(features.MOTIF_SIZE_CATEGORY_LABELS):
+        n, sum_raw, sum_gated = (sum(totals[i, column] for _, totals in by_sample) for column in range(3))
+        if n:
+            out[label] = {"n": int(n), "mae_raw": float(sum_raw / n), "mae_gated": float(sum_gated / n),
+                          "per_sample": {s: {"n": int(totals[i, 0]), "sum_gated_abs_error": float(totals[i, 2])}
+                                         for s, totals in by_sample}}
+    return out
+
+
 def _finalize(acc, n_samples):
     n = acc["n"]
     per_sample = {s: dict(zip(("n", "sum_gated_abs_error", "homopolymer_n", "homopolymer_sum_gated_abs_error"),
                               totals)) for s, totals in sorted(acc["per_sample"].items())}
     if n == 0:
-        return {"n": 0, "homopolymer": _homopolymer_summary(acc), "per_sample": per_sample}
+        return {"n": 0, "homopolymer": _homopolymer_summary(acc), "per_sample": per_sample,
+                "by_motif_size_category": _by_motif_size_category(acc)}
     mae_raw, mae_gated = acc["sum_db"] / n, acc["sum_da"] / n
     return {
         "n": n, "n_samples": n_samples,
@@ -272,6 +294,7 @@ def _finalize(acc, n_samples):
         "n_pok_ge": acc["n_ge"], "helped_ge": acc["helped_ge"], "hurt_ge": acc["hurt_ge"],
         "homopolymer": _homopolymer_summary(acc),
         "per_sample": per_sample,
+        "by_motif_size_category": _by_motif_size_category(acc),
     }
 
 
@@ -345,7 +368,7 @@ def _roc_auc(score, is_positive):
     return float((ranks[is_positive].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
-def _fast_path_loci_of_sample(path, compiled_quick, quick_names):
+def _fast_path_loci_of_sample(path, compiled_quick, quick_names, drop_truth_contradicted_by_short_reads=False):
     """Per representative fast-path locus of one all-loci parquet: pOk, reference-length call, miss, chrX/chrY.
 
     The representative loci are an equal-probability sample of all loci (``dataset._kept_rows_of_locus``). A
@@ -353,19 +376,22 @@ def _fast_path_loci_of_sample(path, compiled_quick, quick_names):
     averages what ExpansionHunter writes. Distances are from the truth TSV's reference count
     (``truth_reference_repeats``), like compare_eh_to_truth.py: a reference-length call has every allele within
     1 repeat of it, and a miss is a reference-length call whose truth is more than 2 repeats from it
-    (operating_points.py's definition). Returns None for a parquet built without hom-ref loci.
+    (operating_points.py's definition). Returns None for a parquet built without hom-ref loci. With
+    ``drop_truth_contradicted_by_short_reads``, the loci whose truth the person's short reads contradict are left out.
     """
     if dataset.lacks_all_loci_columns(path, keep_hom_ref_loci=True):
         return None
     df = pd.read_parquet(path, filters=[("all_loci_representative", "=", True),
                                         ("genotyping_branch", "=", features.BRANCH_QUICK)])
+    if drop_truth_contradicted_by_short_reads:
+        df = df[~df[dataset.TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN].to_numpy(bool)]
     # ANALYSIS_OK[imputation]: no-call rows (eh NaN) and loci without a reference count are left out below.
     df = df[df["eh"].notna() & df["truth_reference_repeats"].notna()].reset_index(drop=True)
     scored = df["has_own_quality_metrics"].to_numpy(bool)
     pok = np.full(len(df), np.nan)
     if scored.any():
         X, _ = features.build_matrix(df[scored], features.BRANCH_QUICK, names=quick_names)
-        pok[scored] = M.round_like_emitted(M.predict_reported_json(compiled_quick, X))[:, features.OK]
+        pok[scored] = M.round_like_emitted(M.predict_proba_json(compiled_quick, X))[:, features.OK]
     reference = df["truth_reference_repeats"].to_numpy(float)
     per_row = pd.DataFrame({
         "locus_id": df["locus_id"], "pok": pok,
@@ -382,9 +408,9 @@ def _fast_path_loci_of_sample(path, compiled_quick, quick_names):
     return loci.reset_index(drop=True)
 
 
-def all_loci_early_warning(paths, model_path):
+def all_loci_early_warning(paths, model_path, drop_truth_contradicted_by_short_reads=False):
     """The all-loci early-warning view: how well low pOk flags fast-path misses, on held-out parquets built with
-    ``--keep-hom-ref-loci`` (others are skipped).
+    ``--keep-hom-ref-loci`` (others are skipped). ``drop_truth_contradicted_by_short_reads`` as in ``run_eval``.
 
     Per sample (``_fast_path_loci_of_sample``): ROC-AUC of 1 - pOk for the misses among reference-length calls,
     and the share of fast-path loci below pOk 0.5. Pooled over samples: recall of the misses at each of
@@ -392,12 +418,15 @@ def all_loci_early_warning(paths, model_path):
     ExpansionHunter genotypes chrX/chrY with one allele in a male run, so a sample is male when most of its
     chrX/chrY loci have one-allele calls.
     """
+    if drop_truth_contradicted_by_short_reads:
+        dataset.assert_parquets_were_checked_against_short_reads(paths)
     serialized = M.load(model_path)
     compiled_quick = M.compile_genotyping_regime(serialized["genotyping_regimes"][features.GENOTYPING_REGIME_QUICK])
     quick_names = M.feature_names_of(serialized, model_path)[features.BRANCH_QUICK]
     per_sample, pooled = {}, []
     for path in paths:
-        loci = _fast_path_loci_of_sample(path, compiled_quick, quick_names)
+        loci = _fast_path_loci_of_sample(path, compiled_quick, quick_names,
+                                         drop_truth_contradicted_by_short_reads=drop_truth_contradicted_by_short_reads)
         if loci is None:
             continue
         sample = os.path.splitext(os.path.basename(path))[0]
@@ -423,7 +452,7 @@ def all_loci_early_warning(paths, model_path):
             "share_below_half_mean": float(np.mean([s["share_below_half"] for s in per_sample.values()]))}
 
 
-def run_eval(paths, model_path, out_json, max_alleles):
+def run_eval(paths, model_path, out_json, max_alleles, drop_truth_contradicted_by_short_reads=False):
     """Applies the exported model to ``paths`` (per-allele parquets) and writes ``out_json`` + its
     ``*_violin.npz``; returns the metrics dict.
 
@@ -431,7 +460,16 @@ def run_eval(paths, model_path, out_json, max_alleles):
     every dataset produces identical artifacts (scalar metrics JSON + the violin/pdiff/lcf npz). No
     fitting -- the deployed model is loaded from its ``.json[.gz]`` and applied with the ``pOk<0.5``
     gate.
+
+    With ``drop_truth_contradicted_by_short_reads``, the rows whose truth genotype the person's own short reads
+    contradict are left out of the capped per-sample rows, and every parquet must have been marked by
+    ``check_truth_genotypes_against_short_reads.py --mark``. The default scores every row, as earlier reports did.
+
+    Raises:
+        RuntimeError: if ``drop_truth_contradicted_by_short_reads`` and a parquet was never marked.
     """
+    if drop_truth_contradicted_by_short_reads:
+        dataset.assert_parquets_were_checked_against_short_reads(paths)
     print("\n==== load + compile the exported model: %s ====" % os.path.basename(model_path), flush=True)
     model = M.load(model_path)
     # Build each regime's matrix from the MODEL's own declared feature list, not this checkout's:
@@ -459,6 +497,10 @@ def run_eval(paths, model_path, out_json, max_alleles):
         df, _ = dataset.label_and_filter(dataset.variant_locus_rows(pd.read_parquet(p)))
         if cap and len(df) > cap:
             df = df.sample(cap, random_state=20260616).reset_index(drop=True)
+        # Dropped after the seeded cap, so the rows scored without them are exactly the rows scored with them minus
+        # the contradicted ones, and the two scores of a model comparison differ only by those rows.
+        if drop_truth_contradicted_by_short_reads:
+            df = df[~df[dataset.TRUTH_CONTRADICTED_BY_SHORT_READS_COLUMN].to_numpy(bool)].reset_index(drop=True)
         for regime in features.GENOTYPING_REGIMES:
             sub = df[df["genotyping_regime"] == regime]
             if not sub.empty:
@@ -468,6 +510,7 @@ def run_eval(paths, model_path, out_json, max_alleles):
 
     # "model" (a content fingerprint) lets report.py refuse to show these numbers under another model.
     out = {"model": M.fingerprint(model_path), "n_samples": len(paths), "max_alleles_per_sample": cap,
+           "truth_contradicted_by_short_reads": "dropped" if drop_truth_contradicted_by_short_reads else "kept",
            "genotyping_regimes": {r: _finalize(acc[r], len(paths)) for r in features.GENOTYPING_REGIMES}}
     os.makedirs(os.path.dirname(out_json), exist_ok=True)
     with open(out_json, "w") as f:
@@ -512,6 +555,9 @@ def main():
                         help="subset (default: all %d)" % len(SAMPLES))
     parser.add_argument("--max-alleles-per-sample", type=int, default=2_000_000,
                         help="seeded per-sample allele cap for the JSON-model apply (0 = all alleles)")
+    parser.add_argument("--drop-truth-labels-contradicted-by-short-reads", action="store_true",
+                        help="leave out the rows whose truth the person's own short reads contradict (needs parquets "
+                             "marked by check_truth_genotypes_against_short_reads.py --mark); default: score every row")
     args = parser.parse_args()
 
     wanted = args.samples or SAMPLES
@@ -523,7 +569,8 @@ def main():
 
     paths = sorted(p for p in (os.path.join(args.data_dir, "real_43", "%s.parquet" % s)
                                for s in wanted) if os.path.exists(p))
-    run_eval(paths, args.model, args.out, args.max_alleles_per_sample)
+    run_eval(paths, args.model, args.out, args.max_alleles_per_sample,
+             drop_truth_contradicted_by_short_reads=args.drop_truth_labels_contradicted_by_short_reads)
 
 
 if __name__ == "__main__":

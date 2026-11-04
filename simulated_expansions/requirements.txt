@@ -1,0 +1,8 @@
+google-auth
+hail
+ijson
+pandas
+pyfaidx
+pysam
+scikit-learn
+str-analysis

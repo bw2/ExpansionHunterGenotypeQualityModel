@@ -4,9 +4,10 @@ The deployable model (``train.py``) is fit on all real data, so it has no held-o
 set of its own. This module measures held-out accuracy honestly with 5-fold
 chromosome-clean cross-validation: the 24 chromosomes are partitioned into 5
 disjoint test groups, each genotyping_regime's heads are trained out-of-fold on the other
-chromosomes with the exported model's fitting steps (``train.fit_heads`` at the regime's fixed
-``train.ITERATIONS_BY_REGIME``, calibrated on a held-out chromosome subset; fit separately per motif
-panel, unlike the exported model), and the pooled
+chromosomes with the fitting steps of ``train.py``'s default recipe (``train.fit_heads`` with its defaults:
+variant-locus rows, the per-allele 3-class label; at the regime's fixed ``train.ITERATIONS_BY_REGIME``,
+calibrated on a held-out chromosome subset; fit separately per motif panel, unlike the exported model),
+whatever recipe ``--model`` was trained with, and the pooled
 out-of-fold predictions feed the report. Splitting by chromosome group -- never by
 row -- ensures no locus leaks between train and test.
 
@@ -101,8 +102,8 @@ def _cap_rows(idx, cap, seed):
 def collect_oof(df, genotyping_regime, branch, folds, train_cap):
     """Runs 5-fold OOF training for one genotyping_regime; returns pooled per-row arrays + importance.
 
-    Each fold fits with ``train.fit_heads`` at the regime's ``train.ITERATIONS_BY_REGIME``, the exported
-    model's recipe.
+    Each fold fits with ``train.fit_heads`` at the regime's ``train.ITERATIONS_BY_REGIME``: train.py's default
+    recipe, whatever recipe the report's ``--model`` was trained with.
 
     Returns:
         ``(oof, ranked, ranked_dir)`` where ``oof`` is a dict of concatenated arrays
@@ -127,7 +128,8 @@ def collect_oof(df, genotyping_regime, branch, folds, train_cap):
         m_te = chrom.isin(set(f["test"])).to_numpy() & rep
         if not m_te.any() or not m_tr.any() or not m_ca.any():
             continue
-        # The exported model's recipe (train.fit_heads), so these metrics describe what ships.
+        # train.py's default recipe (train.fit_heads with its defaults), so these metrics describe a model trained
+        # without the all-loci option.
         ca_idx = _cap_rows(np.where(m_ca)[0], held_cap, SEED + 2)
         # Gating folds split by chromosome too, so no test-chromosome locus is learned anywhere.
         qreg, dmodel, names, Xca = train.fit_heads(
@@ -1742,7 +1744,7 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
 def report_html_name(model_path):
     """Returns the report's file name, suffixed with the model it describes so that one model's report
     never overwrites another's: the model's date, then whatever its name has between ``CHM1_CHM13`` and the
-    date, which is where ``train._default_out`` puts a non-default training population or direction label:
+    date, which is where ``train._default_out`` puts a non-default training population or other training choice:
 
     - ``..._CHM1_CHM13.20261024.json.gz`` -> ``model_report.2026-10-24_model.html``
     - ``..._CHM1_CHM13_all_loci.20261024.json.gz`` -> ``model_report.2026-10-24_all_loci_model.html``
@@ -1844,18 +1846,24 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "repeat counts (and repeat purity) are derived from haplotype-resolved long-read genome "
         "assemblies of the same samples (HG002, CHM1&ndash;CHM13 and the HPRC samples) aligned with "
         "DipCall, giving the true repeat number at each tandem-repeat locus; a repeat insertion that "
-        "DipCall placed up to one motif length before a locus is counted in that locus. Training and "
-        "every evaluation below use only loci inside each sample's DipCall high-confidence regions (from "
+        "DipCall placed up to one motif length before a locus is counted in that locus. Every evaluation "
+        "below, and the default <code>train.py</code> recipe, use only loci inside each sample's DipCall "
+        "high-confidence regions (from "
         "<a href='https://github.com/broadinstitute/str-truth-set-v2'><code>str-truth-set-v2</code></a>) "
         "where at least one true allele differs from the reference, so "
-        "loci where the sample is homozygous for the reference allele are left out. Truth repeat purity "
+        "loci where the sample is homozygous for the reference allele are left out (a model trained with "
+        "<code>train.py --training-population all_loci</code> also saw a sample of those). Truth repeat purity "
         "is not used as a training filter, but is available below as an opt-in <b>Repeat Purity "
         "Filter</b> stratification pill.</p>" % html.escape(os.path.basename(dataset.TRUTH_GENOTYPES_ROOT)),
         "<p class='note'>Held-out accuracy is measured by 5-fold cross validation: "
-        "each fold trains on 17-18 chromosomes with the exported model's fitting steps (quota "
+        "each fold trains on 17-18 chromosomes with the fitting steps of <code>train.py</code>'s default "
+        "recipe (variant-locus rows, the per-allele 3-class label with the fixed tolerance tiers, quota "
         "sampling, gated length-correction fit, the same fixed number of boosting iterations per "
         "regime), calibrates on 2 other chromosomes, and tests on the remaining 4-5, so it measures "
-        "accuracy on loci the model never saw. It approximates rather than reproduces the exported "
+        "accuracy on loci the model never saw. It uses that default recipe even when the model named in "
+        "this report was trained with other <code>train.py</code> options (such as all-loci rows), so for such "
+        "a model it describes the default recipe, not the "
+        "model's own. It approximates rather than reproduces the exported "
         "model, which trains one model per regime on homopolymer and non-homopolymer loci together "
         "(the cross-validation fits the two panels separately) and fits its isotonic calibration on "
         "%d of its training HPRC samples, kept out of tree fitting, plus one autosome each of %s "

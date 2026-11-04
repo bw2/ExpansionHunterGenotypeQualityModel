@@ -1,7 +1,8 @@
-"""Tests for heldout.py: per-sample build wiring, gated-correction accumulation, run_eval wiring.
+"""Tests for heldout.py: per-sample build wiring, gated-correction accumulation, run_eval wiring, and the refusal to
+score without the rows whose truth short reads contradict on parquets never checked against short reads.
 
 The direction/q-median model heads are mocked out everywhere here (``model.predict_lcf_json`` /
-``model.predict_reported_json``) so the gate-and-accumulate arithmetic is verified against known inputs
+``model.predict_proba_json``) so the gate-and-accumulate arithmetic is verified against known inputs
 without needing a trained model -- see ``model_tests.py`` for the actual head-fitting tests.
 """
 
@@ -67,7 +68,7 @@ class AccumulateTest(unittest.TestCase):
     def _run(self):
         acc = heldout._new_acc()
         with mock.patch.object(M, "predict_lcf_json", return_value=np.array([1.2, 1.4])), \
-             mock.patch.object(M, "predict_reported_json",
+             mock.patch.object(M, "predict_proba_json",
                                return_value=np.array([[0.2, 0.7, 0.1], [0.1, 0.8, 0.1]])):
             heldout._accumulate(acc, self._sub(), comp=None, branch="full",
                                 names=features.FULL_FEATURES, sample_name="S1")
@@ -104,11 +105,18 @@ class AccumulateTest(unittest.TestCase):
         np.testing.assert_allclose(acc["mred_all"][0], [2.0, 4.0])   # both rows, homopolymer first
         np.testing.assert_allclose(acc["motif_all"][0], [1, 3])
 
+    def test_motif_size_categories_keep_every_row(self):
+        by_category = self._run()["per_sample_by_motif_size_category"]["S1"]
+        # [n, raw error sum, gated error sum] per category; the homopolymer is "1", the 3 bp motif "3".
+        np.testing.assert_allclose(by_category[features.MOTIF_SIZE_CATEGORY_LABELS.index("1")], [1, 2.0, 0.0])
+        np.testing.assert_allclose(by_category[features.MOTIF_SIZE_CATEGORY_LABELS.index("3")], [1, 4.0, 0.0])
+        self.assertEqual(by_category.sum(axis=0)[0], 2)
+
     def test_all_homopolymer_rows_skip_non_homopolymer_accumulation(self):
         acc = heldout._new_acc()
         sub = pd.DataFrame([_raw_feature_row(eh=10.0, true=10.0, motif_size=1, dir_code=features.OK)])
         with mock.patch.object(M, "predict_lcf_json", return_value=np.array([1.0])), \
-             mock.patch.object(M, "predict_reported_json", return_value=np.array([[0.9, 0.05, 0.05]])):
+             mock.patch.object(M, "predict_proba_json", return_value=np.array([[0.9, 0.05, 0.05]])):
             heldout._accumulate(acc, sub, comp=None, branch="full", names=features.FULL_FEATURES,
                                 sample_name="S1")
         self.assertEqual(acc["n"], 0)
@@ -134,7 +142,21 @@ class HomopolymerSummaryTest(unittest.TestCase):
 class FinalizeTest(unittest.TestCase):
     def test_empty(self):
         result = heldout._finalize(heldout._new_acc(), n_samples=2)
-        self.assertEqual(result, {"n": 0, "homopolymer": {"n": 0}, "per_sample": {}})
+        self.assertEqual(result, {"n": 0, "homopolymer": {"n": 0}, "per_sample": {}, "by_motif_size_category": {}})
+
+    def test_motif_size_categories_pool_samples_and_keep_per_sample_sums(self):
+        acc = heldout._new_acc()
+        three_bp = features.MOTIF_SIZE_CATEGORY_LABELS.index("3")
+        for sample, totals in (("S1", [2, 6.0, 2.0]), ("S2", [1, 3.0, 4.0])):
+            acc["per_sample_by_motif_size_category"][sample] = np.zeros((len(features.MOTIF_SIZE_CATEGORY_LABELS), 3))
+            acc["per_sample_by_motif_size_category"][sample][three_bp] = totals
+        result = heldout._finalize(acc, n_samples=2)["by_motif_size_category"]
+        self.assertEqual(list(result), ["3"])     # categories without alleles are left out
+        self.assertEqual(result["3"]["n"], 3)
+        self.assertAlmostEqual(result["3"]["mae_raw"], 3.0)
+        self.assertAlmostEqual(result["3"]["mae_gated"], 2.0)
+        self.assertEqual(result["3"]["per_sample"], {"S1": {"n": 2, "sum_gated_abs_error": 2.0},
+                                                     "S2": {"n": 1, "sum_gated_abs_error": 4.0}})
 
     def test_nonempty(self):
         acc = heldout._new_acc()
@@ -295,7 +317,7 @@ class RunEvalTest(unittest.TestCase):
                  mock.patch.object(M, "fingerprint", return_value="fake_model.json.gz@0"), \
                  mock.patch.object(M, "compile_genotyping_regime", side_effect=lambda regime_json: regime_json), \
                  mock.patch.object(M, "predict_lcf_json", side_effect=lambda comp, X: np.ones(len(X))), \
-                 mock.patch.object(M, "predict_reported_json",
+                 mock.patch.object(M, "predict_proba_json",
                                    side_effect=lambda comp, X: np.tile([0.9, 0.05, 0.05], (len(X), 1))):
                 out = heldout.run_eval([parquet_path], "fake_model.json.gz", out_json, max_alleles=0)
 
@@ -325,7 +347,7 @@ class RunEvalTest(unittest.TestCase):
                  mock.patch.object(M, "compile_genotyping_regime", side_effect=lambda regime_json: regime_json), \
                  mock.patch.object(M, "predict_lcf_json",
                                    side_effect=lambda comp, X: seen.append(list(X.columns)) or np.ones(len(X))), \
-                 mock.patch.object(M, "predict_reported_json",
+                 mock.patch.object(M, "predict_proba_json",
                                    side_effect=lambda comp, X: np.tile([0.9, 0.05, 0.05], (len(X), 1))):
                 heldout.run_eval([parquet_path], "older_model.json.gz", out_json, max_alleles=0)
             self.assertEqual(sorted(map(tuple, seen)),
@@ -357,7 +379,7 @@ class AllLociEarlyWarningTest(unittest.TestCase):
             with mock.patch.object(M, "load", return_value={"genotyping_regimes": {"quick": {}}}), \
                  mock.patch.object(M, "compile_genotyping_regime", return_value=None), \
                  mock.patch.object(M, "feature_names_of", return_value=names), \
-                 mock.patch.object(M, "predict_reported_json", side_effect=lambda comp, X: np.column_stack(
+                 mock.patch.object(M, "predict_proba_json", side_effect=lambda comp, X: np.column_stack(
                      [X["depth"], 1 - X["depth"], np.zeros(len(X))])):
                 return heldout.all_loci_early_warning(paths, "model.json.gz")
 
@@ -388,6 +410,19 @@ class AllLociEarlyWarningTest(unittest.TestCase):
         self.assertEqual(heldout._roc_auc(np.array([0.9, 0.1]), np.array([True, False])), 1.0)
         self.assertEqual(heldout._roc_auc(np.array([0.5, 0.5]), np.array([True, False])), 0.5)
         self.assertTrue(np.isnan(heldout._roc_auc(np.array([0.5]), np.array([True]))))
+
+
+class ShortReadTruthCheckTest(unittest.TestCase):
+    def test_scoring_without_contradicted_rows_refuses_parquets_never_checked(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.parquet")
+            pd.DataFrame([_raw_feature_row(eh=10.0, true=12.0)]).to_parquet(path)
+            for score in (lambda: heldout.run_eval([path], "unused.json.gz", os.path.join(d, "out.json"), 0,
+                                                   drop_truth_contradicted_by_short_reads=True),
+                          lambda: heldout.all_loci_early_warning([path], "unused.json.gz",
+                                                                 drop_truth_contradicted_by_short_reads=True)):
+                with self.assertRaisesRegex(RuntimeError, "truth_contradicted_by_short_reads"):
+                    score()
 
 
 if __name__ == "__main__":

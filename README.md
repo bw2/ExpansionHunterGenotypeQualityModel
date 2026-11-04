@@ -24,7 +24,10 @@ pip install -r requirements.txt
 1. **`dataset.py`** — downloads the EH JSON shards + truth TSVs from
    `gs://tandem-repeat-explorer/tool_genotype_quality/` and the DipCall high-confidence BEDs from
    `gs://str-truth-set-v2` (skipping anything already local) and assembles
-   `data/parquet/{quick,full}.parquet`.
+   `data/parquet/{quick,full}.parquet`. It runs twice: `--build-only` builds the per-source parquets, then
+   `check_truth_genotypes_against_short_reads.py --mark --training-people-only` marks them (see
+   [Truth labels the short reads contradict](#truth-labels-the-short-reads-contradict); its measuring jobs must have
+   run on Hail Batch first), then the second run assembles.
 2. **`train.py`** — fits the three genotyping_regime experts and exports
    `model/genotype_quality_model_from_HG002_and_CHM1_CHM13.<date>.json.gz`, round-trip-verifying that
    the serialized trees/softmax/isotonic reproduce sklearn's predictions.
@@ -124,6 +127,47 @@ apply to new samples" setting. It *does* use the per-locus `coverage` EH reports
 calibrated over; a sample far outside it is extrapolation. `data/`, `model/`, `report/`, `results/`
 are gitignored and rebuilt from sources.
 
+### Truth labels the short reads contradict
+
+An assembly can miss a heterozygous allele or get a repeat's length wrong. Where ExpansionHunter's call agrees with the
+reads but not with such a truth, the row is labeled `TOO_LONG` or `TOO_SHORT` although the call is right.
+
+`check_truth_genotypes_against_short_reads.py` checks each of the 133 people at every locus where a call in any of the
+person's per-source parquets disagrees with the truth (including the second copy of a homozygous call and 0-repeat truth
+alleles, which training leaves out but the all-loci early warning scores):
+
+1. One Hail Batch job per person copies the person's CRAM and measures the repeat length in each read between the
+   20 bp reference flanks next to the locus (`measure_repeat_lengths_in_short_reads.py`; no genotyper, so the check
+   does not depend on ExpansionHunter). The output's name carries a hash of the loci list and the measuring script's code
+   (not its comments or docstrings), so a new truth set or EH run gets new measurements.
+2. `--mark` judges each locus against the truth genotype and writes the column `truth_contradicted_by_short_reads` into
+   every per-source parquet. A locus is marked only when at least 10 reads were measured, the reads show an allele the
+   truth lacks, and the truth genotype can't explain the reads (only reads with mapping quality 40 or more count). The
+   reads show such an allele as either at least 4 clean spanning reads within 1 repeat of a common length, or at least
+   4 reads longer than the truth's long allele of which
+   at least 3 are clean and can't come from a poly-G or low-quality read end, and at least 2 span the repeat unless a
+   clean one shows an allele longer than 90 bp (the only evidence against an allele too long for a read to span). They must be at least 25% of the spanning reads (for the spanning-read cluster) or of all
+   measured reads (for the longer reads), and at least 2 repeats and 3 bp away from the truth. The truth can't explain the reads when it is homozygous, when one of its alleles short enough to be
+   spanned has almost no read support, or, for longer reads, when its long allele is itself too long to be spanned.
+   Loci without unique flanks and 1-repeat differences are never marked.
+
+```bash
+python3 check_truth_genotypes_against_short_reads.py --no-wait   # after the per-source parquets are final
+python3 check_truth_genotypes_against_short_reads.py --mark      # after the jobs finish
+```
+
+Training leaves the marked rows out (`dataset.py --keep-truth-labels-contradicted-by-short-reads` keeps them), and
+`dataset.assemble_branch` refuses parquets that were never marked; a rebuilt parquet loses the column and has to be
+marked again. The report's 5-fold cross-validation runs on the assembled training tables, so it leaves the marked rows
+out too. The held-out evaluations (`heldout.py`, the report's held-out section) score every row by default, so their
+numbers stay comparable between models trained with and without this filter. Once every held-out
+parquet is marked (`--mark` without `--training-people-only`), `compare_models.py` also scores the held-out samples
+without the marked rows and prints a combined verdict saying whether the new model loses strata in either row set. The
+verdicts are advice: deciding to ship stays manual, and a new model should be no worse on either, because the full rows
+penalize a model that is right where the truth is wrong and the filtered rows can't see a model that trusts misleading
+reads.
+Each person's judgments are kept in `data/short_read_checks_of_truth_genotypes/`.
+
 ## Feature-order contract
 
 `features.py` (`QUICK_FEATURES` / `FULL_FEATURES` + the engineered CI columns) defines the feature
@@ -163,6 +207,9 @@ before generating JSONs meant for training, or the stamp will name the wrong com
 | `eh_json.py` | EH-JSON → per-allele feature rows (gzip-aware) |
 | `features.py` | feature contracts, size-tolerance band, genotyping_regime routing, labels |
 | `dataset.py` | GCS download + parquet assembly |
+| `check_truth_genotypes_against_short_reads.py` | marks the truth labels each person's own short reads contradict (Hail Batch jobs + `--mark`) |
+| `measure_repeat_lengths_in_short_reads.py` | measures repeat lengths in reads, inside those jobs |
+| `short_read_paths.tsv` | each person's CRAM and index (HG002's full-depth CRAM for all three of its coverages) |
 | `model.py` | the two heads + JSON serialization + round-trip verification + vectorized JSON inference |
 | `metrics.py` | held-out accuracy / direction / gated-MAE metrics |
 | `report.py` | 5-fold CV + HTML report (MAE chart, feature importance, ablation, optional 81-sample held-out section) |

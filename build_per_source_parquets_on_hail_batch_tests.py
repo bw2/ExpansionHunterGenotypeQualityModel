@@ -174,6 +174,63 @@ class DownloadBuiltParquetsTest(unittest.TestCase):
         self.assertEqual(self._local("A", ".parquet.sources.json"), "record A")
 
 
+class AnotherRunsJsonsTest(unittest.TestCase):
+    def test_default_output_dir_is_a_sibling_named_after_the_run(self):
+        self.assertEqual(B.default_output_dir("gs://b/tool/expansion_hunter_v2.1"),
+                         "gs://b/tool/genotype_quality_model_parquets_from_expansion_hunter_v2.1")
+
+    def test_cloud_sources_list_the_jsons_under_the_given_run(self):
+        source = next(s for s in B.sources_to_build("/d", "/h") if s["name"] == "HG002_10x")
+        with mock.patch.object(dataset, "_list_json_inputs", return_value=["gs://b/run/HG002_10x/json/a.json.gz"]) as ls, \
+                mock.patch.object(dataset, "_truth_sources", return_value=[]), \
+                mock.patch.object(dataset, "_cloud_versions", return_value={}):
+            sources, _ = B.cloud_sources_and_versions(source, "gs://b/run")
+        ls.assert_called_once_with("HG002_10x", "gs://b/run")
+        self.assertEqual(sources, [("json shard 0", "gs://b/run/HG002_10x/json/a.json.gz")])
+
+
+class LaunchOrDownloadTest(unittest.TestCase):
+    """Runs launch_or_download with step_pipeline, the cloud reads, the job steps and the download mocked."""
+
+    def _run(self, argv):
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--dry-run", action="store_true")  # one of the options step_pipeline's own parser has
+        bp = mock.MagicMock()
+        bp.get_config_arg_parser.return_value = parser
+        bp.parse_known_args.side_effect = lambda: parser.parse_args(argv)
+        with mock.patch("step_pipeline.pipeline", return_value=bp), \
+                mock.patch.object(B, "cloud_sources_and_versions", return_value=([], {})) as versions, \
+                mock.patch.object(B, "upload_code_bundle", return_value="gs://code.tar.gz"), \
+                mock.patch.object(B, "add_build_step") as add_step, \
+                mock.patch.object(B, "download_built_parquets") as download:
+            B.launch_or_download()
+        return versions, add_step, download
+
+    def test_another_run_is_listed_and_written_to_its_own_cloud_folder(self):
+        versions, add_step, _ = self._run(["--eh-results-root", "gs://b/tool/run", "-s", "HG002_10x"])
+        self.assertEqual(versions.call_args.args[1], "gs://b/tool/run")
+        self.assertEqual(add_step.call_args.args[-1].output_dir, "gs://b/tool/genotype_quality_model_parquets_from_run")
+
+    def test_downloading_another_run_into_the_current_folders_is_refused(self):
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            self._run(["--download", "--eh-results-root", "gs://b/tool/run", "--data-dir", "/elsewhere"])
+
+    def test_downloading_another_run_into_folders_of_its_own(self):
+        _, _, download = self._run(["--download", "--eh-results-root", "gs://b/tool/run", "--data-dir", "/d2",
+                                    "--heldout-data-dir", "/h2", "-s", "HG002_10x"])
+        sources, output_dir, staging_dir = download.call_args.args
+        self.assertEqual(output_dir, "gs://b/tool/genotype_quality_model_parquets_from_run")
+        self.assertEqual([s["local_parquet_path"] for s in sources], ["/d2/real_quick/HG002_10x.parquet"])
+        self.assertEqual(staging_dir, "/d2/_per_source_parquets_from_hail_batch")
+
+    def test_the_current_run_downloads_into_the_current_folders(self):
+        _, _, download = self._run(["--download", "-s", "HG002_10x"])
+        self.assertEqual(download.call_args.args[1], B.default_output_dir(dataset.EH_RESULTS_ROOT))
+        self.assertEqual(download.call_args.args[0][0]["local_parquet_path"],
+                         os.path.join(B.HERE, "data", dataset.SOURCE_SUBDIR, "HG002_10x.parquet"))
+
+
 class CodeBundleTest(unittest.TestCase):
     def test_bundle_holds_every_module_a_job_imports(self):
         import io
