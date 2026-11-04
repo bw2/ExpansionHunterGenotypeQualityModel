@@ -35,25 +35,37 @@ TOOL = "EHv5-bw2-optimized"
 EVAL_CAP_DEFAULT = 30_000        # apply-based eval (violins / MAE)
 CORRECTED_CAP_DEFAULT = 400_000  # stacked accuracy-by-size: whole-locus cohort for raw AND corrected panels
 DEFAULT_DATA_DIR = os.path.join(HERE, "data")  # training data dir (dataset.py / report.py --data-dir)
+# Held-out evaluation dir holding real_43/ (heldout.py --data-dir). Several of these exist side by side,
+# one per EH build / truth version, so the one that matches the model being scored has to be named
+# rather than assumed: scoring a model against a different extraction than it was trained for silently
+# measures rows that extraction changed.
+DEFAULT_HELDOUT_EVAL_DATA_DIR = os.path.join(HERE, "data_eval_43")
 
 
-def _heldout_parquets():
+def _heldout_parquets(heldout_eval_data_dir=DEFAULT_HELDOUT_EVAL_DATA_DIR):
     """Returns the per-sample parquets for the held-out HPRC samples still in ``heldout.SAMPLES``.
 
-    Filters the ``data_eval_43/real_43/`` glob down to ``heldout.SAMPLES`` so samples promoted into
-    training (``dataset.PROMOTED_HELDOUT_SAMPLES``) -- whose parquets are left on disk for reuse as
+    Filters the ``<heldout_eval_data_dir>/real_43/`` glob down to ``heldout.SAMPLES`` so samples promoted
+    into training (``dataset.PROMOTED_HELDOUT_SAMPLES``) -- whose parquets are left on disk for reuse as
     training-pool symlinks -- are never scored as held-out (that would leak train rows into external
     validation).
     """
-    all_parquets = glob.glob(os.path.join(HERE, "data_eval_43", "real_43", "*.parquet"))
+    all_parquets = glob.glob(os.path.join(heldout_eval_data_dir, "real_43", "*.parquet"))
     return sorted(p for p in all_parquets
                  if os.path.splitext(os.path.basename(p))[0] in heldout.SAMPLES)
 
 
 # key -> {label, coverage_label, list of per-allele parquets, optional no_call_note}.
-def datasets(data_dir=DEFAULT_DATA_DIR):
-    """Returns the dataset specs; ``data_dir`` is the training data dir holding ``real_quick/``."""
-    heldout_parquets = _heldout_parquets()
+def datasets(data_dir=DEFAULT_DATA_DIR, heldout_eval_data_dir=DEFAULT_HELDOUT_EVAL_DATA_DIR):
+    """Returns the dataset specs.
+
+    Args:
+        data_dir: the training data dir holding ``real_quick/`` (the HG002 genome dataset).
+        heldout_eval_data_dir: the held-out evaluation dir holding ``real_43/`` (the held-out HPRC
+            dataset); pass the one built from the same EH extraction and truth version as the model
+            being scored.
+    """
+    heldout_parquets = _heldout_parquets(heldout_eval_data_dir)
     return {
         "hg002_genome": {
             "label": "HG002 genome (31x)",
@@ -142,15 +154,19 @@ def gen_stacked(spec, model_path, out_json, corrected_cap):
 
 
 def generate(dataset_key, model_path, out_dir, eval_cap=EVAL_CAP_DEFAULT,
-             corrected_cap=CORRECTED_CAP_DEFAULT, skip_eval=False, data_dir=DEFAULT_DATA_DIR):
+             corrected_cap=CORRECTED_CAP_DEFAULT, skip_eval=False, data_dir=DEFAULT_DATA_DIR,
+             heldout_eval_data_dir=DEFAULT_HELDOUT_EVAL_DATA_DIR):
     """Writes one dataset's eval + stacked artifacts into ``out_dir`` (no download; no fitting).
 
     Applies the exported ``model_path`` to that dataset's local per-allele parquets. Returns the number
     of parquets processed -- 0 (a no-op that writes nothing) when none are present locally, so callers
     like report.py can regenerate the held-out section only when its parquets have been built. Shared by
     this module's CLI and report.py's default held-out regeneration.
+
+    ``data_dir`` and ``heldout_eval_data_dir`` name the two input trees (see ``datasets``); the one the
+    scored parquets came out of is printed, so the log of a run says which extraction was scored.
     """
-    spec = datasets(data_dir)[dataset_key]
+    spec = datasets(data_dir, heldout_eval_data_dir)[dataset_key]
     # Configured paths are not necessarily present: hg002_genome names one path unconditionally, so
     # without this filter an unbuilt dataset raised FileNotFoundError instead of the documented no-op.
     parquets = [p for p in spec["parquets"] if os.path.exists(p)]
@@ -158,7 +174,9 @@ def generate(dataset_key, model_path, out_dir, eval_cap=EVAL_CAP_DEFAULT,
     if missing:
         print("  %d configured parquet(s) not built locally, skipping them: %s"
               % (len(missing), ", ".join(os.path.basename(p) for p in missing)), flush=True)
-    print("==== dataset %s: %d parquet(s) ====" % (dataset_key, len(parquets)), flush=True)
+    print("==== dataset %s: %d parquet(s) from %s ===="
+          % (dataset_key, len(parquets),
+             heldout_eval_data_dir if dataset_key == "heldout_hprc" else data_dir), flush=True)
     if not parquets:
         return 0
     spec = dict(spec, parquets=parquets)
@@ -190,10 +208,15 @@ def main():
                         help="only (re)generate the stacked-bar JSON")
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR,
                         help="training data dir holding real_quick/ (for the HG002 genome dataset)")
+    parser.add_argument("--heldout-eval-data-dir", default=DEFAULT_HELDOUT_EVAL_DATA_DIR,
+                        help="held-out evaluation data dir holding real_43/ (for the held-out HPRC "
+                             "dataset); pass the one built from the same ExpansionHunter extraction and "
+                             "truth version as --model")
     args = parser.parse_args()
 
     if generate(args.dataset, args.model, args.out_dir, args.eval_cap,
-                args.corrected_cap, args.skip_eval, args.data_dir) == 0:
+                args.corrected_cap, args.skip_eval, args.data_dir,
+                args.heldout_eval_data_dir) == 0:
         print("no parquet(s) found for dataset %s -- nothing to do" % args.dataset, flush=True)
 
 

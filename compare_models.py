@@ -21,8 +21,8 @@ The "previous model" defaults to whichever model is deployed in the local Expans
 ship the new one?" comparison), falling back to the most recent other ``model/*.json.gz`` in this repo.
 Override with ``--prev-model``.
 
-Self-skips (prints a note, exit 0) when the held-out parquets haven't been built (no
-``RUN_HELDOUT_SAMPLES=1`` run) or no previous model exists, so it is safe to always invoke.
+Self-skips (prints a note, exit 0) when ``--data-dir`` holds no held-out parquets or no previous model
+exists, so it is safe to always invoke.
 """
 
 import argparse
@@ -208,8 +208,8 @@ def compare(new_model, prev_model, data_dir, max_alleles):
     paths = sorted(p for p in (os.path.join(data_dir, "real_43", "%s.parquet" % s)
                                for s in heldout.SAMPLES) if os.path.exists(p))
     if not paths:
-        print("\n[compare_models] skipped: no held-out parquets under %s/real_43/ -- run with "
-              "RUN_HELDOUT_SAMPLES=1 to build them." % data_dir)
+        print("\n[compare_models] skipped: no held-out parquets under %s/real_43/ -- build them with "
+              "heldout.py --build-only, or pass the --data-dir that holds them." % data_dir)
         return
     if prev_model is None:
         print("\n[compare_models] skipped: no previous model found to compare against.")

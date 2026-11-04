@@ -147,7 +147,7 @@ def naive_spanning_mode(spanning):
 
     Sizes seen in only 1 read are dropped first when any size has 2 or more; ties go to the first listed size.
     The same definition as ``original/eh_json_features.py`` (``_trim_singletons`` then ``_densest``), stored for
-    later experiments (ALL_LOCI_AND_RELATIVE_TOLERANCE_RETRAIN_PLAN.md step 1 item 4), not a model input.
+    later experiments, not a model input.
     """
     multi_read_sizes = [(size, n) for size, n in spanning if n >= 2]
     candidates = multi_read_sizes or spanning
@@ -328,7 +328,7 @@ def extract_variant_rows(variant, locus_result, sample_id):
             "mean_deleted_bases": aqm.get("MeanDeletedBasesWithinRepeats"),
             "read_repeat_purity": aqm.get("ReadRepeatPurity"),
             "genotyping_branch": branch,
-            # Stored for later experiments, not model inputs (ALL_LOCI_AND_RELATIVE_TOLERANCE_RETRAIN_PLAN.md).
+            # Stored for later experiments, not model inputs.
             "eh_minus_spanning_mode_naive": (eh - spanning_mode_size) if spanning_mode_size is not None else None,
             "spanning_mode_naive_support": spanning_mode_support,
             "het_gap": (eh - other_eh) if other_eh is not None else None,

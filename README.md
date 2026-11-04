@@ -19,30 +19,110 @@ pip install -r requirements.txt
 ./train_model.sh
 ```
 
-`train_model.sh` runs four idempotent stages and writes the dated model + an HTML report:
+`train_model.sh` trains the model ExpansionHunter ships from training tables built beforehand (see
+[Building the training tables](#building-the-training-tables)) and writes the dated model + an HTML report, in five
+stages:
 
-1. **`dataset.py`** — downloads the EH JSON shards + truth TSVs from
-   `gs://tandem-repeat-explorer/tool_genotype_quality/` and the DipCall high-confidence BEDs from
-   `gs://str-truth-set-v2` (skipping anything already local) and assembles
-   `data/parquet/{quick,full}.parquet`. It runs twice: `--build-only` builds the per-source parquets, then
-   `check_truth_genotypes_against_short_reads.py --mark --training-people-only` marks them (see
-   [Truth labels the short reads contradict](#truth-labels-the-short-reads-contradict); its measuring jobs must have
-   run on Hail Batch first), then the second run assembles.
-2. **`train.py`** — fits the three genotyping_regime experts and exports
-   `model/genotype_quality_model_from_HG002_and_CHM1_CHM13.<date>.json.gz`, round-trip-verifying that
-   the serialized trees/softmax/isotonic reproduce sklearn's predictions.
-3. **`report.py`** — 5-fold chromosome-clean cross-validation, then `report/model_report.<model date>_model.html`
+1. **`simulated_expansions/add_to_training_tables.py`**: links the training people's per-source parquets
+   (`BASE_DATA_DIR`) and the spiked samples' (`SPIKED_TABLES_DIRS`) into a data folder of their own (`DATA_DIR`) and
+   assembles its variant-locus (`parquet/`) and all-loci (`parquet_all_loci/`) training tables.
+2. **`train.py`**, twice, one model per training recipe, each drawing up to 3,000,000 training rows with one quota per
+   motif-size category (`--quota-by-motif-size-category`). Only the full-genotyper regimes of the first model are kept;
+   it trains on the variant-locus tables. Only the quick regime of the second is kept; its direction head trains on
+   the variant-locus training rows plus 500,000 rows at loci where the truth equals the reference, and its length
+   correction on the variant-locus rows (`--training-population all_loci --length-head-training-population
+   variant_loci --hom-ref-locus-direction-training-rows 500000`). Each run round-trip-verifies that the serialized
+   trees/softmax/isotonic reproduce sklearn's predictions.
+3. **`combine_genotyping_regimes_of_two_models.py`**: writes
+   `model/genotype_quality_model_from_HG002_and_CHM1_CHM13_plus50.<date>.json.gz` from those regimes. The two models
+   of stage 2 are kept in `model/models_whose_regimes_are_combined/`, out of the `model/*.json.gz` that
+   `compare_models.py` picks its fallback previous model from.
+4. **`report.py`** — 5-fold chromosome-clean cross-validation, then `report/model_report.<model date>_model.html`
    (e.g. `model_report.2026-10-24_all_loci_model.html` for `..._CHM1_CHM13_all_loci.20261024.json.gz`: the
    `--model` file's date, then whatever its name has between `CHM1_CHM13` and the date, so reports of different
    models don't overwrite each other) with the
    raw-EH-vs-gated-LCF MAE chart, per-genotyping_regime held-out accuracy, and — separately for each of
    the two heads — a relative-feature-importance panel and an add-one-feature ablation curve (see
-   [Feature importance and ablation](#feature-importance-and-ablation)).
-4. **`compare_models.py`** — applies the new model and the deployed one to the held-out samples and
-   prints a per-sample paired comparison (skipped when the held-out parquets are not built).
+   [Feature importance and ablation](#feature-importance-and-ablation)). The cross-validation fits
+   `train.py`'s default recipe (variant-locus rows, no `--quota-by-motif-size-category`), not the two recipes of
+   stage 2. The report's held-out HPRC section, its HG002 genome section (HG002 is a training sample) and stage 5
+   score the model `train_model.sh` writes.
+5. **`compare_models.py`** — applies the new model and the deployed one to the held-out samples
+   (`HELDOUT_DATA_DIR`) and prints a per-sample paired comparison (skipped when the held-out parquets are not built).
 
-Requires `gcloud`/`gsutil` authenticated with read access to `gs://tandem-repeat-explorer` and
-`gs://str-truth-set-v2`.
+The defaults are the inputs of the model in ExpansionHunter-bw2 (`..._plus50.20261104.json.gz`); the header of
+`train_model.sh` lists the environment variables that change them (setting `BASE_DATA_DIR` or `SPIKED_TABLES_DIRS`
+requires setting `DATA_DIR` too, so the shipped model's training folder is not rebuilt from other inputs). Every stage
+runs again on every run.
+
+## Building the training tables
+
+`train_model.sh` starts from tables that take one-time work, mostly on Hail Batch. For the shipped model:
+
+1. **Per-source parquets of two ExpansionHunter runs**, built with `build_per_source_parquets_on_hail_batch.py`
+   against the truth in `dataset.TRUTH_GENOTYPES_ROOT` (the "new truth" of the folder names): the EH e90307c run's
+   (`dataset.EH_RESULTS_ROOT`) in `data/` and `data_eval_43/`, and the EH b1fbc23 run's in folders of their own:
+   ```bash
+   python3 build_per_source_parquets_on_hail_batch.py --no-wait
+   python3 build_per_source_parquets_on_hail_batch.py --download      # after the jobs finish
+   python3 build_per_source_parquets_on_hail_batch.py --no-wait \
+       --eh-results-root gs://tandem-repeat-explorer/tool_genotype_quality/expansion_hunter_v2.1
+   python3 build_per_source_parquets_on_hail_batch.py --download \
+       --eh-results-root gs://tandem-repeat-explorer/tool_genotype_quality/expansion_hunter_v2.1 \
+       --data-dir data.eh_b1fbc23_jsons_extracted_with_new_truth \
+       --heldout-data-dir data_eval_43.eh_b1fbc23_jsons_extracted_with_new_truth
+   ```
+2. **The homopolymer hand-off fix.** EH e90307c handed some homopolymer loci from the fast path to the full genotyper,
+   where poly-G artifact reads made it call false 200-300 repeat alleles; EH 5656d6a stops that.
+   `build_per_source_parquets_with_homopolymer_handoff_fix.py` gives every homopolymer locus that the b1fbc23 run
+   genotyped on the fast path and the e90307c run did not its b1fbc23 rows, and keeps every other row:
+   ```bash
+   python3 build_per_source_parquets_with_homopolymer_handoff_fix.py --skip-assembly \
+       --old-data-dir data.eh_b1fbc23_jsons_extracted_with_new_truth \
+       --old-heldout-data-dir data_eval_43.eh_b1fbc23_jsons_extracted_with_new_truth \
+       --out-data-dir data.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth \
+       --out-heldout-data-dir data_eval_43.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth
+   ```
+   The two output folders are `train_model.sh`'s `BASE_DATA_DIR` and `HELDOUT_DATA_DIR`. The script also needs the
+   b1fbc23 tables the earlier models were trained on (the same JSONs extracted by the code of that time) in
+   `data/real_quick.eh_b1fbc23/` and `data_eval_43/real_43.eh_b1fbc23/` (`--b1fbc23-training-combos-dir`,
+   `--b1fbc23-samples-dir`): it checks every replaced variant locus against them and stops with an error when they are
+   missing. They are not in the repository, and today's code cannot rebuild them. Tables from a run of EH 5656d6a or
+   later would not need this step.
+3. **Truth labels the short reads contradict**, marked in both output folders of step 2 (see
+   [Truth labels the short reads contradict](#truth-labels-the-short-reads-contradict)):
+   ```bash
+   python3 check_truth_genotypes_against_short_reads.py --no-wait \
+       --data-dir data.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth \
+       --heldout-data-dir data_eval_43.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth
+   python3 check_truth_genotypes_against_short_reads.py --mark \
+       --data-dir data.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth \
+       --heldout-data-dir data_eval_43.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth
+   ```
+4. **Spiked samples**: training people's reads at the known disease loci with simulated expanded alleles added
+   (`simulated_expansions/README.md` describes each command and its other options). The shipped model spiked 45
+   people: every `dataset.PROMOTED_HELDOUT_SAMPLES` person except the 5 that `train.py` holds out for calibration
+   (HG00621, HG01150, HG03669, HG03688, HG03804), since a calibration person must not be spiked. Each was passed with
+   `--person` to make-minicrams, check-parity and spike, whose default is 6 pilot people. Its spiked samples come
+   from two work folders, whose `tables/` subfolders are `train_model.sh`'s `SPIKED_TABLES_DIRS`. Both reach the
+   minicrams, truth downloads and bwa index of `simulated_expansions/work/` through symlinks named `minicrams`,
+   `truth` and `bwa_index`, so make-minicrams runs once, in `work/`, and every other step finds the people's reads in
+   its own `--work-dir`. Steps 3-6 of that README ran with `--work-dir simulated_expansions/work_v3`; then
+   lower-coverage copies of those spiked samples, each with a matched control, were made, genotyped and tabled in
+   `simulated_expansions/work_v4`:
+   ```bash
+   python3 simulated_expansions/spike_in_expansions.py downsample --source-work-dir simulated_expansions/work_v3 \
+       --work-dir simulated_expansions/work_v4 --reference-fasta HG38_FA
+   python3 simulated_expansions/spike_in_expansions.py genotype --work-dir simulated_expansions/work_v4 \
+       --billing-project PROJECT --gcs-dir gs://...
+   python3 simulated_expansions/spike_in_expansions.py tables --work-dir simulated_expansions/work_v4
+   ```
+
+Step 1 needs `gcloud`/`gsutil` authenticated with read access to `gs://tandem-repeat-explorer` and
+`gs://str-truth-set-v2`; the Hail Batch steps need a billing project. Step 3 reads the CRAMs of all 133 people
+(training and held-out) and step 4 those of the spiked training people, listed in a `short_read_paths.tsv` at the
+repository root that is not committed (tab-separated, with the columns `sample_label`, `reads_path` and
+`reads_index_path`); step 4 also needs samtools, bwa and a local hg38 (see `simulated_expansions/README.md`).
 
 ## Model structure
 
@@ -127,6 +207,13 @@ apply to new samples" setting. It *does* use the per-locus `coverage` EH reports
 calibrated over; a sample far outside it is extrapolation. `data/`, `model/`, `report/`, `results/`
 are gitignored and rebuilt from sources.
 
+The shipped model also trains on **spiked samples**: training people's reads at the 60 known disease loci with
+simulated reads of an expanded allele added, because healthy genomes have almost no alleles in the pathogenic range
+(see `simulated_expansions/README.md`). A spiked sample holds its person's reads, so `train.py` groups it with that
+person where it splits people for the out-of-fold gate and where it holds out an always-trained person's rows on one
+autosome; it never draws a spiked sample as a calibration person, and refuses a table in which a calibration person has
+spiked samples.
+
 ### Truth labels the short reads contradict
 
 An assembly can miss a heterozygous allele or get a repeat's length wrong. Where ExpansionHunter's call agrees with the
@@ -203,19 +290,22 @@ before generating JSONs meant for training, or the stamp will name the wrong com
 
 | file | role |
 |---|---|
-| `train_model.sh` | end-to-end orchestrator |
+| `train_model.sh` | trains, reports and compares the shipped model from the built training tables |
+| `combine_genotyping_regimes_of_two_models.py` | builds a model from the quick regime of one model and the full-genotyper regimes of another |
 | `eh_json.py` | EH-JSON → per-allele feature rows (gzip-aware) |
 | `features.py` | feature contracts, size-tolerance band, genotyping_regime routing, labels |
 | `dataset.py` | GCS download + parquet assembly |
+| `build_per_source_parquets_on_hail_batch.py` | builds the per-source parquets on Hail Batch, one job per source |
+| `build_per_source_parquets_with_homopolymer_handoff_fix.py` | the homopolymer hand-off fix of the per-source parquets |
+| `simulated_expansions/` | the spiked samples (see its README) |
 | `check_truth_genotypes_against_short_reads.py` | marks the truth labels each person's own short reads contradict (Hail Batch jobs + `--mark`) |
 | `measure_repeat_lengths_in_short_reads.py` | measures repeat lengths in reads, inside those jobs |
-| `short_read_paths.tsv` | each person's CRAM and index (HG002's full-depth CRAM for all three of its coverages) |
+| `short_read_paths.tsv` | each person's CRAM and index (HG002's full-depth CRAM for all three of its coverages); not committed, see [Building the training tables](#building-the-training-tables) |
 | `model.py` | the two heads + JSON serialization + round-trip verification + vectorized JSON inference |
 | `metrics.py` | held-out accuracy / direction / gated-MAE metrics |
 | `report.py` | 5-fold CV + HTML report (MAE chart, feature importance, ablation, optional 81-sample held-out section) |
 | `heldout.py` | external validation: apply the exported `.json.gz` to the 81 held-out samples |
 | `*_tests.py` | unit tests (`python3 -m unittest discover -p "*_tests.py"`) |
-| `original/` | the prior multi-module implementation, kept for reference |
 
 ## External validation (optional)
 
@@ -225,11 +315,15 @@ from the training pool (see Training data above), scoring against their truth. `
 `report/heldout.json` benchmark dump; the report's held-out HPRC section is fed by the
 `report/eval_heldout_hprc.json` / `report/stacked_heldout_hprc.json` artifacts, which `report.py`
 **regenerates by default** from the locally-built held-out parquets (via `gen_datasets.generate`, no
-download) — pass `--skip-heldout-samples` to opt out. Building those parquets (about 0.7 GB of gzipped
-JSON per sample on the v2.1 catalog, so about 57 GB for all 81, downloaded one sample at a time and
-deleted after use) is off by default; enable it with
-`RUN_HELDOUT_SAMPLES=1 ./train_model.sh`, which builds them before the report step so the render picks
-them up.
+download) — pass `--skip-heldout-samples` to opt out. The parquets are read from
+`data_eval_43/real_43/`; when several held-out trees exist side by side, one per ExpansionHunter
+extraction and truth version, name the one built from the same extraction the model was trained on with
+`report.py --heldout-eval-data-dir` (`gen_datasets.py` takes the same option, `heldout.py` calls it
+`--data-dir`), and the report's held-out section names the tree it read. `heldout.py --build-only` builds those
+parquets locally (about 0.7 GB of gzipped JSON per sample on the v2.1 catalog, so about 57 GB for all 81, downloaded
+one sample at a time and deleted after use). The shipped model's held-out tree comes from the homopolymer hand-off fix
+instead (see [Building the training tables](#building-the-training-tables)), and `train_model.sh` passes it to
+`report.py` and `compare_models.py` as `HELDOUT_DATA_DIR`.
 
 ## Tests
 

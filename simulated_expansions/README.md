@@ -51,7 +51,8 @@ python3 train.py --data-dir OUT_DATA_DIR
 ```
 
 The folder made in step 7 links to `DATA_DIR`'s per-source parquets, so it is rebuilt with step 7, never with
-`dataset.py` (which refuses it).
+`dataset.py` (which refuses it). The repository's `train_model.sh` runs step 7 itself and then trains the shipped
+model's recipe on the folder, rather than plain `train.py`.
 
 Step 3 must report no differences: a difference means a spiked minicram would not be genotyped the way the training
 reads were. Genotyping (steps 3 and 5) runs on Hail Batch in the training runs' ExpansionHunter image with their settings

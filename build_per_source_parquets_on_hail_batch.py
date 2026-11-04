@@ -29,8 +29,8 @@ Usage:
 ``--eh-results-root`` builds from another run's JSONs instead of ``dataset.EH_RESULTS_ROOT``'s; with it,
 ``--download`` requires ``--data-dir`` and ``--heldout-data-dir`` folders of their own, so the current parquets stay.
 ``dataset.py`` and ``heldout.py`` don't reuse such parquets (their records name the other run's JSONs). For
-example, today's extraction of the EH b1fbc23 run, for the homopolymer hand-off fix (ALL_LOCI_AND_RELATIVE_TOLERANCE_
-RETRAIN_PLAN.md step 8):
+example, today's extraction of the EH b1fbc23 run, for the homopolymer hand-off fix
+(``build_per_source_parquets_with_homopolymer_handoff_fix.py``):
     python3 build_per_source_parquets_on_hail_batch.py --no-wait \\
         --eh-results-root gs://tandem-repeat-explorer/tool_genotype_quality/expansion_hunter_v2.1
     python3 build_per_source_parquets_on_hail_batch.py --download \\

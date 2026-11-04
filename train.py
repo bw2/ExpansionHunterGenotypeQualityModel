@@ -312,9 +312,8 @@ def fit_heads(df, train_pool, calib_rows, fold_groups, branch, train_cap, iterat
         label: Prefix for progress lines.
         length_head_table: Optional ``(rows, pool, fold_groups)`` of another table of the same people (with ``t``)
             that the q-median head draws its rows from instead of ``df``'s ``train_pool``: the rows of its pool where
-            the gate fires, judged out of fold by direction heads fit on ``df``. Decision D3 (b) of
-            ALL_LOCI_AND_RELATIVE_TOLERANCE_RETRAIN_PLAN.md: the direction head learns from all loci, the length
-            correction from the variant-locus table it is measured on.
+            the gate fires, judged out of fold by direction heads fit on ``df``. So the direction head can learn from
+            all loci and the length correction from the variant-locus table it is measured on.
         hom_ref_locus_direction_training_rows: Optional number of ``train_pool`` rows at loci where the truth equals
             the reference (``variant_locus`` False) that the direction heads (exported and gating) train on, sampled
             apart from the variant-locus rows, which keep their own ``train_cap`` (``direction_training_rows``).
@@ -468,7 +467,7 @@ def fit_genotyping_regime(genotyping_regime, data_dir, train_cap, parquet_subdir
         # One frame: the variant-locus table's rows first (at the same positions as in that table, so its pool and
         # quota sample are the variant-locus recipe's), then the all-loci table's rows at loci where the truth equals
         # the reference outside the calibration people, then its calibration rows. The variant-locus table's pool is
-        # also the q-median head's (D3 (b)).
+        # also the q-median head's (``--length-head-training-population variant_loci``).
         length_parquet = os.path.join(data_dir, length_head_parquet_subdir, "%s.parquet" % src)
         hom_ref_locus_pool = np.where(~calib & ~df["variant_locus"].to_numpy(bool))[0]
         all_loci_parts = [df.iloc[hom_ref_locus_pool], df.iloc[calib_rows]]
@@ -524,8 +523,7 @@ def main():
                         help="which assembled branch parquets the q-median (length-correction) head draws its rows "
                              "from (default: --training-population); e.g. variant_loci with --training-population "
                              "all_loci trains the direction head on all loci and the length correction on the "
-                             "variant-locus rows it is measured on (decision D3 (b) of "
-                             "ALL_LOCI_AND_RELATIVE_TOLERANCE_RETRAIN_PLAN.md)")
+                             "variant-locus rows it is measured on")
     parser.add_argument("--hom-ref-locus-direction-training-rows", type=int,
                         help="with --training-population all_loci and --length-head-training-population variant_loci: "
                              "train the direction head on the variant-locus recipe's own training sample (up to "

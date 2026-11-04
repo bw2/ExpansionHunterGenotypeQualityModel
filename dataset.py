@@ -32,10 +32,11 @@ longer applies: there is no ``EHv5`` pool to collide with, within one optimized 
 either fast-path-called OR fallback (never both), and ``quick`` / ``full`` are separate experts;
 cross-coverage repeats of a locus are held out together by the chromosome-clean CV.
 
-The committed model is real-data-only: the four COMBOS below (HG002 10x/20x/31x + CHM1_CHM13 46x)
+The tables built here hold real data only: the four COMBOS below (HG002 10x/20x/31x + CHM1_CHM13 46x)
 plus the 50 samples in PROMOTED_HELDOUT_SAMPLES (54 training sources), which ``main()`` symlinks into
-the same subdir so ``assemble_branch``'s glob picks them up. No simulated rows. Determinism: no
-randomness anywhere in the ingestion path.
+the same subdir so ``assemble_branch``'s glob picks them up. The shipped model also trains on spiked
+samples, which ``simulated_expansions/add_to_training_tables.py`` adds in a data folder of its own
+(``train_model.sh``). Determinism: no randomness anywhere in the ingestion path.
 Coding rules: no type hints, Google docstrings, ``print()``, ``gcloud`` (macOS).
 """
 
@@ -853,8 +854,7 @@ def _join_truth(json_df, tsv_df):
                          ).drop(columns=["LocusId"])
 
 
-# Keeping loci where the sample's truth equals the reference (``keep_hom_ref_loci``; see
-# ALL_LOCI_TRAINING_PLAN.md). A hom-ref locus is kept with a probability set by its genotyping branch and the
+# Keeping loci where the sample's truth equals the reference (``keep_hom_ref_loci``). A hom-ref locus is kept with a probability set by its genotyping branch and the
 # called size of its alleles (bins of QUOTA_SIZE_BINS_BP), so the rare large calls survive while the ~4M short
 # fast-path calls per source are thinned. Measured on HG002 at 10x (v2.1 catalog), scored fast-path alleles per
 # bin: 3.98M / 448k / 71k / 23k / 2.3k / 0 / 0 at hom-ref loci, and ~77k scored full-genotyper alleles there; these
@@ -980,7 +980,7 @@ def extract_rows_and_join_truth(json_paths, genotypes_tsv_path, high_confidence_
     or if too many truth loci have no JSON record (``_assert_catalog_agreement``).
 
     With ``keep_hom_ref_loci``, a sample of the hom-ref truth loci is kept too, and every row gets the
-    all-loci columns (see ``_kept_rows_of_locus`` and ALL_LOCI_TRAINING_PLAN.md). Rows are grouped by locus as
+    all-loci columns (see ``_kept_rows_of_locus``). Rows are grouped by locus as
     they stream, so a locus is kept or dropped whole.
 
     ``allow_sample_with_no_variant_truth_loci`` turns a truth file with no variant locus at all from an error into
@@ -1356,9 +1356,9 @@ def _cap_all_loci_rows_per_genotyping_regime(df, cap, seed):
     top-up comes from the ``in_all_loci_pool`` rows, which favor neither variant nor hom-ref loci. Variant-locus
     rows outside the pool are left out, so no step of the all-loci recipe draws more from variant loci. They stay
     in the per-source parquets, and today's sample of them in the ``variant_loci`` population's parquets, so the
-    length head can later take its rows from those (decision D3 in ALL_LOCI_AND_RELATIVE_TOLERANCE_RETRAIN_PLAN.md)
-    without a new extraction. Until then, ``train.py --training-population all_loci`` fits the length head on the
-    rows of this parquet where the out-of-fold gate fires, as today's recipe does on its own population.
+    length head can take its rows from those (``train.py --length-head-training-population variant_loci``) without a
+    new extraction. Without that option, ``train.py --training-population all_loci`` fits the length head on the
+    rows of this parquet where the out-of-fold gate fires, as the variant-loci recipe does on its own population.
     """
     motif, eh = df["motif_size"].to_numpy(float), df["eh"].to_numpy(float)
     in_pool, representative = df["in_all_loci_pool"].to_numpy(bool), df["all_loci_representative"].to_numpy(bool)
@@ -1653,8 +1653,7 @@ def main():
     parser.add_argument("--force", action="store_true", help="rebuild even if parquets exist")
     parser.add_argument("--keep-hom-ref-loci", action="store_true",
                         help="also keep a sample of the loci where the truth equals the reference, with the "
-                             "all-loci columns (see ALL_LOCI_TRAINING_PLAN.md); parquets built without them are "
-                             "rebuilt")
+                             "all-loci columns; parquets built without them are rebuilt")
     parser.add_argument("--training-population", choices=sorted(BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION),
                         action="append",
                         help="which branch parquets to assemble: variant_loci (today's recipe, data/parquet/) "

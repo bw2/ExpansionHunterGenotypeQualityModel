@@ -1495,11 +1495,15 @@ def _stacked_has_every_pill_option(sd):
                for kk, _, _ in ABS.POK_VARIANTS)
 
 
-def build_dataset_sections(out_dir, model_path="", regenerate=True):
+def build_dataset_sections(out_dir, model_path="", regenerate=True, heldout_eval_data_dir=""):
     """Renders the per-dataset evaluation + accuracy-by-size plots and returns the report HTML.
 
     When ``regenerate`` is False (``report.py --render-text-only``) the PNGs are not re-plotted; the
     existing on-disk PNGs are embedded as-is and any that are missing are skipped.
+
+    ``heldout_eval_data_dir`` is named in the section's note, by folder name only, so the report says
+    which of the side-by-side held-out evaluation trees (one per ExpansionHunter extraction and truth
+    version) supplied the held-out alleles. Empty leaves the sentence out.
 
     Every plot carries a <b>Dataset</b> pill (the held-out HPRC samples, counted from the loaded
     artifact, / HG002 genome 31x) and the <b>Homopolymers</b> pill; the accuracy-by-size stacked-bar additionally gets an
@@ -1579,6 +1583,13 @@ def build_dataset_sections(out_dir, model_path="", regenerate=True):
                    format(gen_datasets.CORRECTED_CAP_DEFAULT, ",")),
                 "" if not stale else " Skipped because they are out of date: %s."
                 % html.escape(", ".join(sorted(set(stale)))))]
+    if heldout_eval_data_dir and any(k == "heldout_hprc" for k, _ in present):
+        # Folder name only, never the absolute path: the report is a shareable artifact.
+        parts.append("<p class='note'>The held-out HPRC alleles were read from the "
+                     "<code>%s</code> evaluation tree; one such tree is built per ExpansionHunter "
+                     "extraction and truth version, and this is the one this run was pointed at "
+                     "(<code>report.py --heldout-eval-data-dir</code>).</p>"
+                     % html.escape(os.path.basename(os.path.normpath(heldout_eval_data_dir))))
 
     # --- accuracy by true allele size (str-truth-set-v2 stacked-bar replica) ---
     abs_imgs = {}
@@ -1870,7 +1881,8 @@ def render_html(results, mae_png, importance_png, ablation_png, model_path, out_
         "(the cross-validation calibrates on chromosomes). Each cross-validation head is also fit on "
         "fewer rows: at most <code>report.py --cv-train-cap</code> rows (400,000 in "
         "<code>train_model.sh</code>, with a fifth as many calibration rows), where the exported heads "
-        "use up to <code>train.py --train-cap</code> rows (1,000,000), with the same iteration counts. "
+        "use up to <code>train.py --train-cap</code> rows (3,000,000 in <code>train_model.sh</code>), with the "
+        "same iteration counts. "
         "None of the held-out HPRC samples below is used.</p>"
         % (train.N_CALIB_INDIVIDUALS, " and ".join(train.ALWAYS_TRAIN_INDIVIDUALS)),
         "<h2>ExpansionHunter output fields used for model training</h2>",
@@ -2021,7 +2033,7 @@ def _maybe_regenerate_dataset_artifacts(args):
     is set, in ``--render-text-only`` mode (a pure re-render that regenerates nothing), or when no model
     was given (the apply needs one). Downloads nothing -- ``gen_datasets.generate`` is a no-op for a
     dataset whose parquets haven't been built locally (build the held-out ones with
-    ``heldout.py --build-only`` / ``RUN_HELDOUT_SAMPLES=1 ./train_model.sh``).
+    ``heldout.py --build-only``, or pass ``--heldout-eval-data-dir`` to read another held-out tree).
     """
     if args.skip_heldout_samples or args.render_text_only:
         return
@@ -2038,7 +2050,8 @@ def _maybe_regenerate_dataset_artifacts(args):
         # features.py change) is skipped with a warning instead of aborting the report. Its old
         # artifacts then carry a different model and are dropped by build_dataset_sections.
         try:
-            if gen_datasets.generate(key, args.model, args.out_dir, data_dir=args.data_dir) == 0:
+            if gen_datasets.generate(key, args.model, args.out_dir, data_dir=args.data_dir,
+                                     heldout_eval_data_dir=args.heldout_eval_data_dir) == 0:
                 print("  %s: no local parquets -- skipping" % label, flush=True)
         except RuntimeError as e:
             print("  WARNING: %s skipped -- %s" % (label, e), flush=True)
@@ -2047,6 +2060,11 @@ def _maybe_regenerate_dataset_artifacts(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default=os.path.join(HERE, "data"))
+    parser.add_argument("--heldout-eval-data-dir", default=os.path.join(HERE, "data_eval_43"),
+                        help="held-out evaluation data dir holding real_43/ (gen_datasets.py / "
+                             "heldout.py --data-dir); pass the one built from the same ExpansionHunter "
+                             "extraction and truth version as --model, since several of these exist "
+                             "side by side")
     parser.add_argument("--out-dir", default=os.path.join(HERE, "report"))
     parser.add_argument("--model", default="", help="model .json.gz path (for the report header)")
     parser.add_argument("--folds", type=int, default=5)
@@ -2241,7 +2259,8 @@ def main():
     # eval_<key>_violin.npz + stacked_<key>.json artifacts (gen_datasets.py); absent datasets, and
     # artifacts recorded for a different model than --model, are skipped.
     dataset_sections_html = build_dataset_sections(args.out_dir, args.model,
-                                                   regenerate=not args.render_text_only)
+                                                   regenerate=not args.render_text_only,
+                                                   heldout_eval_data_dir=args.heldout_eval_data_dir)
 
     render_html(results, mae_png, importance_png, ablation_png,
                 args.model or "(model not specified)",

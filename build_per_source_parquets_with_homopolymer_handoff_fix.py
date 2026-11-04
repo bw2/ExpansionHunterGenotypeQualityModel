@@ -1,5 +1,5 @@
 """Builds the per-source parquets that ExpansionHunter-bw2 5656d6a would give, without re-genotyping, then assembles
-the training tables from them (ALL_LOCI_AND_RELATIVE_TOLERANCE_RETRAIN_PLAN.md step 8).
+the training tables from them.
 
 5656d6a stops the fast path's in-repeat hand-off (85bd281) at homopolymers, where poly-G artifact reads made the full
 genotyper call false 200-300 repeat alleles. For homopolymers that restores the routing of EH b1fbc23. So, per source,
