@@ -536,12 +536,12 @@ def rebuild_command_for(path):
     only ``<data_eval_43>/real_43/<sample>.parquet``, while the training-combo parquets under
     ``data/<SOURCE_SUBDIR>/`` come only from ``dataset.py``. A parquet built with the hom-ref loci gets
     ``--keep-hom-ref-loci``, or the rebuild would replace it with a variant-only one. A spiked sample's parquet
-    (``is_spiked_sample``) comes from ``simulated_expansions/spike_in_expansions.py tables``.
+    (``is_spiked_sample``) comes from ``simulated_expansions/spike_in_expansions.py tables`` in its work folder.
     """
     keep_hom_ref_loci = " --keep-hom-ref-loci" if parquet_keeps_hom_ref_loci(path) else ""
     if is_spiked_sample(os.path.splitext(os.path.basename(path))[0]):
-        return ("python3 simulated_expansions/spike_in_expansions.py tables, then "
-                "simulated_expansions/add_to_training_tables.py")
+        return ("python3 simulated_expansions/spike_in_expansions.py tables --work-dir <the work folder of its spiked "
+                "samples>, then train_model.sh (or simulated_expansions/add_to_training_tables.py)")
     if os.path.basename(os.path.dirname(os.path.realpath(path))) == "real_43":
         return ("python3 heldout.py --build-only --force%s --samples %s"
                 % (keep_hom_ref_loci, os.path.splitext(os.path.basename(path))[0]))
@@ -1593,7 +1593,8 @@ def command_that_builds_branch_parquets(data_dir, parquet_subdir):
     population = {s: p for p, s in BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION.items()}[parquet_subdir]
     if holds_spiked_samples(data_dir):
         command = ("python3 simulated_expansions/add_to_training_tables.py --base-data-dir <the data folder its "
-                   "per-source parquets link to> --out-data-dir %s" % data_dir)
+                   "per-source parquets link to> --spiked-tables-dir <each folder of spiked samples' tables, as "
+                   "train_model.sh's SPIKED_TABLES_DIRS> --out-data-dir %s" % data_dir)
         if population != "variant_loci":
             command += " --training-population %s" % population
         return "`%s`" % command

@@ -140,7 +140,7 @@ def select_loci(people, training_tables_dir, work_dir):
     selected = []
     for person in people:
         locus_ids = candidate_loci(person, training_tables_dir)
-        # The spike step's work folder, so both use one download of each person's truth.
+        # Truth downloads go to work/truth/ (spike_in_expansions.WORK_DIR), next to the calibration's own folder.
         truth = spike.person_truth_at_loci(person, set(locus_ids), spike.WORK_DIR,
                                            columns=spike.TRUTH_COLUMNS + ALLELE_SEQUENCE_COLUMNS)
         loci = loci_with_allele_sequences(person, spike.sex_of(person, training_tables_dir), locus_ids, truth)

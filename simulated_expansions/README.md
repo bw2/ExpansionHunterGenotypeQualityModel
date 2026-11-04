@@ -11,51 +11,66 @@ other loci, base qualities, mates) is real. The simulated reads take their fragm
 from the same person's reads, and are aligned to the whole genome, so in-repeat read pairs land wherever the aligner
 puts a real expansion's. Inside the repeat, real reads have more low-quality bases (more the richer the motif is in G
 and C, and the further into the read), more mismatches, and gained or lost bases (whole motif copies and partial ones).
-The simulated reads get these there as measured in the pilot people's real reads of long repeats
-(`repeat_read_errors.tsv`, from `calibrate_simulated_reads.py measure-read-errors`; see below).
+The simulated reads get these there as measured in the real reads of long repeats of 6 pilot people
+(`spike_in_expansions.PILOT_PEOPLE`, the people `calibrate_simulated_reads.py` uses by default, all among the 45 spiked
+ones) in `repeat_read_errors.tsv`, from `calibrate_simulated_reads.py measure-read-errors` (see below).
 
 ## Steps
 
 The steps need the repository's own requirements plus this folder's (`pip3 install -r requirements.txt -r
 simulated_expansions/requirements.txt`), and samtools and bwa on the machine.
 
+`make_spiked_samples.sh` makes the spiked samples the shipped model was trained on, from the 45 people in
+`spike_in_expansions.SPIKED_PEOPLE`:
+
 ```bash
-# 1. The known disease loci, with the definitions the training runs genotyped (from one of their ExpansionHunter JSONs)
-#    and the smallest and largest pathogenic alleles STRchive reports at each (downloads a fixed version of its locus
-#    data)
-python3 simulated_expansions/build_disease_loci_table.py TRAINING_EH_JSON simulated_expansions
-
-# 2. Each pilot person's reads at those loci ("minicrams"), from their CRAMs (short_read_paths.tsv)
-python3 simulated_expansions/spike_in_expansions.py make-minicrams --reference-fasta HG38_FA --billing-project PROJECT
-
-# 3. Check that the un-spiked minicrams give exactly the training runs' rows at those loci
-python3 simulated_expansions/spike_in_expansions.py check-parity --training-tables-dir TABLES --billing-project PROJECT \
-    --gcs-dir gs://...
-
-# 4. Simulate, align (bwa) and merge the expanded alleles; 5. genotype; 6. per-source parquets
-python3 simulated_expansions/spike_in_expansions.py spike --training-tables-dir TABLES --reference-fasta HG38_FA --bwa BWA
-python3 simulated_expansions/spike_in_expansions.py genotype --billing-project PROJECT --gcs-dir gs://...
-python3 simulated_expansions/spike_in_expansions.py tables
-
-# Optional: lower-coverage copies of another work folder's spiked samples, with matched controls (see "Coverage" below),
-# genotyped and tabled in a work folder of their own, then assembled with both folders' tables
-python3 simulated_expansions/spike_in_expansions.py downsample --source-work-dir WORK_DIR --work-dir OTHER_WORK_DIR \
-    --reference-fasta HG38_FA
-
-# 7. Training tables with the spiked samples' rows, in a data folder of their own (add --training-population
-#    variant_loci --training-population all_loci to assemble the all-loci tables too, from base parquets that keep the
-#    hom-ref loci)
-python3 simulated_expansions/add_to_training_tables.py --base-data-dir DATA_DIR --out-data-dir OUT_DATA_DIR \
-    [--spiked-tables-dir WORK_DIR/tables --spiked-tables-dir OTHER_WORK_DIR/tables]
-python3 train.py --data-dir OUT_DATA_DIR
+REFERENCE_FASTA=HG38_FA BILLING_PROJECT=PROJECT GCS_DIR=gs://... simulated_expansions/make_spiked_samples.sh
 ```
 
-The folder made in step 7 links to `DATA_DIR`'s per-source parquets, so it is rebuilt with step 7, never with
-`dataset.py` (which refuses it). The repository's `train_model.sh` runs step 7 itself and then trains the shipped
-model's recipe on the folder, rather than plain `train.py`.
+It runs `spike_in_expansions.py`'s steps in this order; naming steps runs only those (e.g.
+`simulated_expansions/make_spiked_samples.sh genotype tables`):
 
-Step 3 must report no differences: a difference means a spiked minicram would not be genotyped the way the training
-reads were. Genotyping (steps 3 and 5) runs on Hail Batch in the training runs' ExpansionHunter image with their settings
+| step | what it makes | where |
+|---|---|---|
+| `make-minicrams` | each person's reads at the disease loci ("minicrams"), from their CRAMs (`short_read_paths.tsv` at the repository root) | `work_spiked_samples/minicrams/` |
+| `check-parity` | on Hail Batch: checks that the un-spiked minicrams give exactly the training runs' rows at those loci | |
+| `spike` | the spiked samples: simulated reads of expanded alleles aligned with bwa and merged into the person's (see below) | `work_spiked_samples/spiked/` |
+| `genotype` | on Hail Batch: their ExpansionHunter calls | `work_spiked_samples/spiked/` |
+| `tables` | their per-source parquets | `work_spiked_samples/tables/` |
+| `downsample` | a copy of each spiked sample at 15-30x and a matched control of the person's own reads (see "Lower coverage") | `work_lower_coverage_copies_of_spiked_samples/spiked/` |
+| `genotype-lower-coverage`, `tables-lower-coverage` | the same two steps for those | `work_lower_coverage_copies_of_spiked_samples/tables/` |
+
+Where the work folders already hold spiked samples, such as the shipped ones, `spike` and `downsample` refuse to replace
+them: to make them again next to the shipped ones, set `SPIKED_SAMPLES_WORK_DIR` and `LOWER_COVERAGE_WORK_DIR` to new
+folders, compare the new tables with the shipped ones, and then point `train_model.sh`'s `SPIKED_TABLES_DIRS` (and
+`DATA_DIR`) at them; `REPLACE_EXISTING_SPIKED_SAMPLES=1` replaces them in place instead, after moving the folder's
+`spiked/` aside (to `spiked.replaced_<time>/`) so no earlier ExpansionHunter output is used for the new reads.
+
+The two `tables/` folders are `train_model.sh`'s `SPIKED_TABLES_DIRS`. It adds them to the training people's tables
+(`add_to_training_tables.py`) in a data folder of its own, which links to the base folder's per-source parquets, so it
+is rebuilt by `train_model.sh` (or `add_to_training_tables.py`), never by `dataset.py` (which refuses it).
+
+For the shipped samples, `spike` took about half an hour and `downsample` about 20 minutes locally, and the two
+genotyping steps cost about $11 and $21 on Hail Batch. A genotyping step that failed part way is finished with
+`ONLY_MISSING_OUTPUTS=1` (only the samples without an output are genotyped).
+
+The steps read four committed tables: `disease_loci.tsv` and `disease_loci.catalog.json` (rebuilt with
+`python3 simulated_expansions/build_disease_loci_table.py TRAINING_EH_JSON simulated_expansions` from one of the
+training runs' ExpansionHunter JSONs and a fixed version of STRchive's locus data), `pathogenic_allele_structures.tsv`
+(from the literature, below) and `repeat_read_errors.tsv` (measured by `calibrate_simulated_reads.py`, below). `spike`
+also reads each person's sex and the loci where their reads contradict the truth from the training people's per-source
+parquets (`TRAINING_TABLES_DIR`, `TABLES` below), and needs the bwa index at `BWA_INDEX_PREFIX` (default
+`work/bwa_index/Homo_sapiens_assembly38.fasta.64`), which no step makes: download the six files
+`gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta.64.{alt,amb,ann,bwt,pac,sa}` there first
+(the script stops before running any step when `spike` is to run without them). The script's header lists every
+setting.
+
+`check-parity` must report no differences, and the script stops if it does: a difference means a spiked minicram would
+not be genotyped the way the training reads were. The shipped samples' check covered 14 of the 45 people (the 6 pilot
+people and 8 more), with no difference at any of the 60 loci; the script checks all 45, so a difference for one of the
+other 31 is new information rather than a failure to reproduce, and leaving the step out (naming the other steps) runs
+the steps the shipped samples went through. Genotyping runs on Hail Batch in the training runs' ExpansionHunter
+image with their settings
 (optimized-streaming mode, `--max-depth 150`, motif composition output for all loci, their UCSC hg38 reference), because
 a macOS build of the same ExpansionHunter commit gives slightly different read depths, strand bias and indel sizes at the
 loci the full genotyper calls, which is where every simulated expansion goes.
@@ -144,7 +159,7 @@ loci the full genotyper calls, which is where every simulated expansion goes.
   alleles over 300 bp lost more (e of about 2-3), and other library preps can lose more or fewer.
 - **Truth**: the person's own allele and the simulated one, or a patient's two simulated ones, in the truth-table
   format the training tables are built from, so `dataset.extract_rows_and_join_truth` labels the rows as it does the
-  real ones. The manifest (`work/spiked/manifest.tsv`) lists each sample's loci with the number of simulated alleles
+  real ones. The manifest (`work_spiked_samples/spiked/manifest.tsv`) lists each sample's loci with the number of simulated alleles
   (`simulated_alleles`), the longer one's size (`copies`, `size_bp`), structure (`simulated_allele_structure`, and its
   blocks as `MOTIF:copies` in + strand order in `simulated_allele_blocks`) and truth purity
   (`simulated_allele_purity`), and the same of a patient's shorter one (`shorter_simulated_allele_*`).
@@ -165,8 +180,8 @@ Spiked samples are named `<person>_spiked_<k>`. `train.py` never draws them as c
 (`dataset.is_spiked_sample`), refuses a table where a person it holds out has spiked samples (their reads would then
 also train the model), and treats a spiked sample as its person (`dataset.person_of_sample`) where it holds out the
 always-trained people's rows on one autosome and where it splits people for the out-of-fold gate. So no person's reads
-sit on both sides of a split, and with the pilot people, who are chosen outside the people it holds out, calibration
-stays on real people's rows.
+sit on both sides of a split, and with the spiked people (`SPIKED_PEOPLE`), who are chosen outside the people it holds
+out, calibration stays on real people's rows.
 
 ## How the simulated reads compare with real ones
 
@@ -197,28 +212,32 @@ python3 simulated_expansions/calibrate_simulated_reads.py compare
 
 Everything goes to `work/calibration/`, except `measure-read-errors`'s table, which overwrites the committed
 `repeat_read_errors.tsv` that the spike step reads (`--repeat-read-errors` writes it elsewhere), and each person's truth
-download, which the spike step shares, in `work/truth/`.
+download, in `work/truth/`.
 
 ## Files
 
 | file | role |
 |---|---|
-| `build_disease_loci_table.py` | step 1: the disease loci and their ExpansionHunter catalog |
-| `spike_in_expansions.py` | steps 2-6 |
+| `make_spiked_samples.sh` | runs every step that makes the spiked samples the shipped model was trained on |
+| `spike_in_expansions.py` | the steps themselves |
 | `expanded_allele_reads.py` | the expanded allele's sequence and its simulated read pairs |
-| `add_to_training_tables.py` | step 7 |
+| `build_disease_loci_table.py` | the disease loci and their ExpansionHunter catalog (`disease_loci.tsv`, `disease_loci.catalog.json`) |
+| `add_to_training_tables.py` | adds the spiked samples' tables to the training tables (`train_model.sh`'s first stage) |
 | `compare_simulated_and_real_expansions.py` | how genotype quality models score the simulated alleles next to real confirmed expansions, and how far apart their model inputs are |
 | `calibrate_simulated_reads.py` | how simulated reads of a long repeat differ from real ones, at the pilot people's own long alleles |
 | `repeat_read_errors.tsv` | the errors of real reads inside long repeats, which the simulated reads get there |
-| `disease_loci.tsv`, `disease_loci.catalog.json` | step 1's output |
+| `disease_loci.tsv`, `disease_loci.catalog.json` | the loci that get simulated alleles, with their reported pathogenic sizes, and their ExpansionHunter catalog |
 | `pathogenic_allele_structures.tsv` | published structures of patients' expanded alleles (interruptions, blocks of other motifs) that the simulated alleles take, with their sources |
-| `work/` | minicrams, spiked reads, ExpansionHunter output, tables and the calibration's `work/calibration/` (not committed) |
+| `work_spiked_samples/`, `work_lower_coverage_copies_of_spiked_samples/` | `make_spiked_samples.sh`'s minicrams, truth downloads, spiked reads, ExpansionHunter output and tables (not committed) |
+| `work/` | the calibration's `work/calibration/` and truth downloads (`work/truth/`), and the default place of the bwa index (not committed) |
 
-`TABLES` is the folder of the training people's per-source parquets (`<person>.parquet`, built from the training runs
-under `dataset.EH_RESULTS_ROOT` and marked by `check_truth_genotypes_against_short_reads.py --mark`): their calls give
-each person's sex, and their marks leave out the loci where the person's reads contradict the truth (the check judged
-only the loci of the table where a call disagrees with the truth; loci missing from it, mostly hom-ref, were not
-checked). `HG38_FA` is a local, indexed copy of the reference the training runs genotyped against (UCSC hg38,
-`TRAINING_REFERENCE_FASTA` in `spike_in_expansions.py`). Step 4 needs bwa (`--bwa`, a build for the machine's CPU) and
-samtools, and the bwa index of the hg38 the people's reads were aligned to (`--bwa-index`, the prefix of `Homo_sapiens_assembly38.fasta.64.*` from the Broad's public hg38
-references).
+`TABLES` (`TRAINING_TABLES_DIR` in `make_spiked_samples.sh`, by default the shipped model's
+`data.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth/real_quick/`) is the folder of the training people's
+per-source parquets (`<person>.parquet`, built from the training runs and marked by
+`check_truth_genotypes_against_short_reads.py --mark`): their calls give each person's sex, and their marks leave out
+the loci where the person's reads contradict the truth (the check judged only the loci of the table where a call
+disagrees with the truth; loci missing from it, mostly hom-ref, were not checked). `HG38_FA` is a local, indexed copy of
+the reference the training runs genotyped against (UCSC hg38, `TRAINING_REFERENCE_FASTA` in `spike_in_expansions.py`).
+`spike` needs bwa (`--bwa`, a build for the machine's CPU) and samtools, and the bwa index of the hg38 the people's
+reads were aligned to (`--bwa-index`, the prefix of `Homo_sapiens_assembly38.fasta.64.*` from the Broad's public hg38
+references, above).

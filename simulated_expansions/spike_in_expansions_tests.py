@@ -8,10 +8,21 @@ import time
 import unittest
 from unittest import mock
 
+import numpy as np
 import pandas as pd
 import pysam
 
+import dataset
+import train
 from simulated_expansions import spike_in_expansions as spike
+
+
+class SpikedPeopleTest(unittest.TestCase):
+    def test_spiked_people_are_the_promoted_samples_train_does_not_hold_out_for_calibration(self):
+        people = list(train.ALWAYS_TRAIN_INDIVIDUALS) + list(dataset.PROMOTED_HELDOUT_SAMPLES)
+        held, _ = train._calibration_people(np.array(people, dtype=object), np.array(["1"] * len(people), dtype=object),
+                                            train.SEED)
+        self.assertEqual(list(spike.SPIKED_PEOPLE), sorted(set(dataset.PROMOTED_HELDOUT_SAMPLES) - set(held)))
 
 
 class DifferencesTest(unittest.TestCase):
@@ -639,8 +650,9 @@ class DownsampleSpikedSamplesTest(unittest.TestCase):
                 f.write(">chr1\n" + "ACGT" * 250 + "\n")
             pysam.faidx(fasta)
             real = ["real%d" % i for i in range(400)]
-            os.makedirs(os.path.join(work, "minicrams"))
-            self.write_pairs(spike.minicram_path(work, "P"), real)
+            # The person's reads come from the source work folder; the new one holds none of its own.
+            os.makedirs(os.path.join(source, "minicrams"))
+            self.write_pairs(spike.minicram_path(source, "P"), real)
             os.makedirs(spike.spiked_dir(source, "P_spiked_3"))
             self.write_pairs(os.path.join(spike.spiked_dir(source, "P_spiked_3"), "reads.bam"),
                              real[:200] + ["P_spiked_3:L:0:%d" % i for i in range(200)])
@@ -652,8 +664,9 @@ class DownsampleSpikedSamplesTest(unittest.TestCase):
                            "fragment_starts_per_bp": 0.1}]).to_csv(
                 os.path.join(source, "spiked", "manifest.tsv"), sep="\t", index=False)
             truth = truth_table([["L", "chr1", 100, 130, "CAG", 10, 10, 12, 1.0, 1.0, True]])
-            with mock.patch.object(spike, "person_truth_at_loci", return_value=truth):
+            with mock.patch.object(spike, "person_truth_at_loci", return_value=truth) as person_truth_at_loci:
                 spike.downsample_spiked_samples(source, work, fasta, coverage_range=(10.0, 10.0))
+            self.assertEqual(person_truth_at_loci.call_args.args[2], source)
             manifest = pd.read_csv(os.path.join(work, "spiked", "manifest.tsv"), sep="\t")
             copy, control = (spike.spiked_dir(work, "P_spiked_%d" % (3 + offset)) for offset in (
                 spike.DOWNSAMPLED_COPY_NUMBER_OFFSET, spike.MATCHED_CONTROL_NUMBER_OFFSET))

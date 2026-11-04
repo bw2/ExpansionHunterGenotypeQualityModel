@@ -32,10 +32,9 @@ Subcommands, run in this order:
                      ``read_pairs_within_windows``), the simulated pairs are aligned to the whole genome with bwa and
                      merged in, and the sample's truth (the person's allele and the simulated one, or the two
                      simulated ones) is written next to its reads.
-    downsample       Optional: for every spiked sample of another work folder (``--source-work-dir``), a copy
-                     downsampled to a clinical genome's coverage and a matched control of the person's own reads
-                     downsampled alike, with the person's own truth (``downsample_spiked_samples``), as this work
-                     folder's spiked samples.
+    downsample       For every spiked sample of another work folder (``--source-work-dir``), a copy downsampled to a
+                     clinical genome's coverage and a matched control of the person's own reads downsampled alike,
+                     with the person's own truth (``downsample_spiked_samples``), as this work folder's spiked samples.
     genotype         Genotypes the spiked samples.
     tables           Turns each spiked sample's ExpansionHunter JSON and truth into a per-source parquet the way the
                      training tables are built (``dataset.extract_rows_and_join_truth``).
@@ -45,16 +44,24 @@ settings: optimized-streaming mode, ``--max-depth 150``, motif composition outpu
 reference, and the person's sex, read from the calls of the person's training table (most chrX and chrY loci get one
 allele in males).
 
-Usage:
-    python3 simulated_expansions/spike_in_expansions.py make-minicrams --reference-fasta HG38_FA --billing-project PROJECT
-    python3 simulated_expansions/spike_in_expansions.py check-parity --training-tables-dir TABLES \
+``simulated_expansions/make_spiked_samples.sh`` runs every subcommand in order with the settings of the spiked samples
+the shipped model was trained on, in two work folders: SPIKED for the spiked samples and LOWER_COVERAGE for their
+lower-coverage copies (``work_spiked_samples`` and ``work_lower_coverage_copies_of_spiked_samples`` there). One at a
+time:
+    python3 simulated_expansions/spike_in_expansions.py make-minicrams --work-dir SPIKED --reference-fasta HG38_FA \
+        --billing-project PROJECT
+    python3 simulated_expansions/spike_in_expansions.py check-parity --work-dir SPIKED --training-tables-dir TABLES \
         --billing-project PROJECT --gcs-dir gs://...
-    python3 simulated_expansions/spike_in_expansions.py spike --training-tables-dir TABLES --reference-fasta HG38_FA \
-        --bwa BWA
-    python3 simulated_expansions/spike_in_expansions.py downsample --source-work-dir WORK_DIR --work-dir OTHER_WORK_DIR \
+    python3 simulated_expansions/spike_in_expansions.py spike --work-dir SPIKED --training-tables-dir TABLES \
+        --reference-fasta HG38_FA --bwa BWA
+    python3 simulated_expansions/spike_in_expansions.py genotype --work-dir SPIKED --billing-project PROJECT \
+        --gcs-dir gs://...
+    python3 simulated_expansions/spike_in_expansions.py tables --work-dir SPIKED
+    python3 simulated_expansions/spike_in_expansions.py downsample --source-work-dir SPIKED --work-dir LOWER_COVERAGE \
         --reference-fasta HG38_FA
-    python3 simulated_expansions/spike_in_expansions.py genotype --billing-project PROJECT --gcs-dir gs://...
-    python3 simulated_expansions/spike_in_expansions.py tables
+    python3 simulated_expansions/spike_in_expansions.py genotype --work-dir LOWER_COVERAGE --billing-project PROJECT \
+        --gcs-dir gs://...
+    python3 simulated_expansions/spike_in_expansions.py tables --work-dir LOWER_COVERAGE
 """
 
 import argparse
@@ -83,14 +90,24 @@ import eh_json  # noqa: E402
 from simulated_expansions import expanded_allele_reads as sim  # noqa: E402
 from simulated_expansions.build_disease_loci_table import motif_family, rotations  # noqa: E402
 
+# The parent of the calibration's folder (calibrate_simulated_reads.CALIBRATION_DIR), which holds its truth downloads
+# and, by default, the bwa index.
 WORK_DIR = os.path.join(HERE, "work")
 # Where the bwa index of the hg38 the people's reads were aligned to is expected (see the README).
 DEFAULT_BWA_INDEX_PREFIX = os.path.join(WORK_DIR, "bwa_index", "Homo_sapiens_assembly38.fasta.64")
 DISEASE_LOCI_CATALOG = os.path.join(HERE, "disease_loci.catalog.json")
 SHORT_READ_PATHS_TSV = os.path.join(REPO, "short_read_paths.tsv")
-# Training people whose CRAMs the pilot spikes, of both sexes, none of them a person train.py holds out for calibration
-# (train._calibration_people refuses a table where a held-out person has spiked samples).
+# Training people of both sexes whose own long alleles calibrate_simulated_reads.py compares real and simulated reads at,
+# none of them a person train.py holds out for calibration.
 PILOT_PEOPLE = ("HG01106", "NA12878", "HG03492", "HG01928", "HG02080", "HG01258")
+# The training people the spiked samples are made from: every dataset.PROMOTED_HELDOUT_SAMPLES person except the 5 that
+# train._calibration_people holds out (HG00621, HG01150, HG03669, HG03688, HG03804), since it refuses a table where a
+# held-out person has spiked samples. Sorted, as the spiked samples were made in this order.
+SPIKED_PEOPLE = ("HG00408", "HG00658", "HG00706", "HG01074", "HG01081", "HG01106", "HG01192", "HG01258", "HG01346",
+                 "HG01433", "HG01928", "HG01934", "HG01943", "HG01960", "HG02055", "HG02071", "HG02080", "HG02083",
+                 "HG02129", "HG02135", "HG02258", "HG02273", "HG02451", "HG02615", "HG02622", "HG02647", "HG02841",
+                 "HG02965", "HG03041", "HG03125", "HG03239", "HG03453", "HG03492", "HG03710", "HG03816", "HG03831",
+                 "HG03927", "HG04115", "HG04204", "HG04228", "NA12329", "NA12878", "NA18906", "NA19983", "NA20129")
 TRAINING_IMAGE = ("weisburd/str-analysis-with-expansion-hunter@sha256:"
                   "9e3090a2a69506a513a42ec49d1b9f83f1f0302c828741c3dfde001c629435d8")
 TRAINING_REFERENCE_FASTA = "gs://str-truth-set/hg38/ref/hg38.fa"
@@ -954,7 +971,8 @@ def downsample_spiked_samples(source_work_dir, work_dir, reference_fasta, covera
     sample's number k), so they differ only by the simulated alleles. The copy of ``<person>_spiked_<k>`` is named
     with k + ``DOWNSAMPLED_COPY_NUMBER_OFFSET`` and its control with k + ``MATCHED_CONTROL_NUMBER_OFFSET``; their
     manifest rows are the source sample's, with ``source_label``, ``downsampled_coverage``, ``downsample_fraction``
-    and ``matched_control``, and a control's ``simulated_alleles`` 0 and simulated allele columns empty.
+    and ``matched_control``, and a control's ``simulated_alleles`` 0 and simulated allele columns empty. The person's
+    reads (minicram) and truth are those of ``source_work_dir``, the ones its spiked samples were made from.
     """
     source = pd.read_csv(os.path.join(source_work_dir, "spiked", "manifest.tsv"), sep="\t")
     simulated_allele_columns = [c for c in source.columns if c in ("copies", "size_bp") or c.startswith(
@@ -963,9 +981,9 @@ def downsample_spiked_samples(source_work_dir, work_dir, reference_fasta, covera
     for label, rows in source.groupby("label", sort=False):
         person = rows["person"].iloc[0]
         if person not in read_length:
-            read_length[person] = first_read_length(minicram_path(work_dir, person), reference_fasta)
+            read_length[person] = first_read_length(minicram_path(source_work_dir, person), reference_fasta)
             truth_by_person[person] = person_truth_at_loci(person, set(source.loc[source["person"] == person,
-                                                                                  "locus_id"]), work_dir)
+                                                                                  "locus_id"]), source_work_dir)
         coverage = 2 * read_length[person] * rows["fragment_starts_per_bp"].median()
         target = sim.seeded_rng(label, "downsampled coverage").uniform(*coverage_range)
         fraction = min(1.0, target / coverage)
@@ -973,7 +991,7 @@ def downsample_spiked_samples(source_work_dir, work_dir, reference_fasta, covera
         copy_label = "%s_spiked_%d" % (person, k + DOWNSAMPLED_COPY_NUMBER_OFFSET)
         control_label = "%s_spiked_%d" % (person, k + MATCHED_CONTROL_NUMBER_OFFSET)
         for out_label, in_reads in ((copy_label, os.path.join(spiked_dir(source_work_dir, label), "reads.bam")),
-                                    (control_label, minicram_path(work_dir, person))):
+                                    (control_label, minicram_path(source_work_dir, person))):
             os.makedirs(spiked_dir(work_dir, out_label), exist_ok=True)
             downsample_read_pairs(in_reads, fraction, k, reference_fasta,
                                   os.path.join(spiked_dir(work_dir, out_label), "reads.bam"))
@@ -1056,8 +1074,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=["make-minicrams", "check-parity", "spike", "downsample", "genotype",
                                             "tables"])
-    parser.add_argument("--person", action="append", help="default: %s" % ", ".join(PILOT_PEOPLE))
-    parser.add_argument("--work-dir", default=WORK_DIR)
+    parser.add_argument("--person", action="append", help="default: the %d SPIKED_PEOPLE" % len(SPIKED_PEOPLE))
+    parser.add_argument("--work-dir", required=True,
+                        help="the folder the step reads and writes, such as make_spiked_samples.sh's "
+                             "work_spiked_samples/ (no default, so no step picks up an older run's folder)")
     parser.add_argument("--source-work-dir", help="the work folder whose spiked samples get downsampled copies and "
                                                   "matched controls in --work-dir (downsample)")
     parser.add_argument("--reference-fasta", help="a local copy of the reference the training runs used "
@@ -1087,7 +1107,7 @@ def main():
     parser.add_argument("--tables-dir", help="where the spiked samples' per-source parquets go (tables); default: "
                                              "the tables folder of --work-dir")
     args = parser.parse_args()
-    people = args.person or PILOT_PEOPLE
+    people = args.person or SPIKED_PEOPLE
     if args.command in ("make-minicrams", "check-parity", "genotype") and not args.billing_project:
         parser.error("%s needs --billing-project" % args.command)
     if args.command in ("check-parity", "genotype") and not args.gcs_dir:

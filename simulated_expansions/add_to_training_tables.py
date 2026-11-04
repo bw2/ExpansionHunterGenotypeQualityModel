@@ -9,7 +9,8 @@ with ``train.py --data-dir OUT_DATA_DIR``; ``train._calibration_people`` holds o
 samples.
 
 Usage:
-    python3 simulated_expansions/add_to_training_tables.py --base-data-dir DIR --out-data-dir DIR
+    python3 simulated_expansions/add_to_training_tables.py --base-data-dir DIR --spiked-tables-dir DIR \
+        [--spiked-tables-dir DIR ...] --out-data-dir DIR
 """
 
 import argparse
@@ -50,9 +51,9 @@ def link_parts(base_data_dir, spiked_tables_dirs, out_data_dir):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base-data-dir", required=True)
-    parser.add_argument("--spiked-tables-dir", action="append",
-                        help="a folder of spiked samples' per-source parquets (spike_in_expansions.py tables); "
-                             "repeatable; default: work/tables")
+    parser.add_argument("--spiked-tables-dir", action="append", required=True,
+                        help="a folder of spiked samples' per-source parquets (spike_in_expansions.py tables), such as "
+                             "make_spiked_samples.sh's work_spiked_samples/tables; repeatable")
     parser.add_argument("--out-data-dir", required=True)
     parser.add_argument("--training-population", choices=sorted(dataset.BRANCH_PARQUET_SUBDIR_BY_TRAINING_POPULATION),
                         action="append",
@@ -60,8 +61,7 @@ def main():
                              "(which needs base parquets built with dataset.py --keep-hom-ref-loci); repeatable; "
                              "default variant_loci")
     args = parser.parse_args()
-    n_base, n_spiked = link_parts(args.base_data_dir, args.spiked_tables_dir or [os.path.join(HERE, "work", "tables")],
-                                  args.out_data_dir)
+    n_base, n_spiked = link_parts(args.base_data_dir, args.spiked_tables_dir, args.out_data_dir)
     print("linked %d base and %d spiked per-source parquets into %s" % (n_base, n_spiked, args.out_data_dir))
     for population in args.training_population or ["variant_loci"]:
         for branch in ("quick", "full"):

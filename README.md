@@ -99,30 +99,24 @@ runs again on every run.
        --data-dir data.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth \
        --heldout-data-dir data_eval_43.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth
    ```
-4. **Spiked samples**: training people's reads at the known disease loci with simulated expanded alleles added
-   (`simulated_expansions/README.md` describes each command and its other options). The shipped model spiked 45
-   people: every `dataset.PROMOTED_HELDOUT_SAMPLES` person except the 5 that `train.py` holds out for calibration
-   (HG00621, HG01150, HG03669, HG03688, HG03804), since a calibration person must not be spiked. Each was passed with
-   `--person` to make-minicrams, check-parity and spike, whose default is 6 pilot people. Its spiked samples come
-   from two work folders, whose `tables/` subfolders are `train_model.sh`'s `SPIKED_TABLES_DIRS`. Both reach the
-   minicrams, truth downloads and bwa index of `simulated_expansions/work/` through symlinks named `minicrams`,
-   `truth` and `bwa_index`, so make-minicrams runs once, in `work/`, and every other step finds the people's reads in
-   its own `--work-dir`. Steps 3-6 of that README ran with `--work-dir simulated_expansions/work_v3`; then
-   lower-coverage copies of those spiked samples, each with a matched control, were made, genotyped and tabled in
-   `simulated_expansions/work_v4`:
+4. **Spiked samples**: training people's reads at the known disease loci with simulated expanded alleles added, made
+   by `simulated_expansions/make_spiked_samples.sh` (see `simulated_expansions/README.md`), which reads the people's
+   sex and their marked truth labels from the per-source parquets of step 2's training folder (after step 3):
    ```bash
-   python3 simulated_expansions/spike_in_expansions.py downsample --source-work-dir simulated_expansions/work_v3 \
-       --work-dir simulated_expansions/work_v4 --reference-fasta HG38_FA
-   python3 simulated_expansions/spike_in_expansions.py genotype --work-dir simulated_expansions/work_v4 \
-       --billing-project PROJECT --gcs-dir gs://...
-   python3 simulated_expansions/spike_in_expansions.py tables --work-dir simulated_expansions/work_v4
+   REFERENCE_FASTA=HG38_FA BILLING_PROJECT=PROJECT GCS_DIR=gs://... simulated_expansions/make_spiked_samples.sh
    ```
+   It spikes 45 people (`spike_in_expansions.SPIKED_PEOPLE`): every `dataset.PROMOTED_HELDOUT_SAMPLES` person except
+   the 5 that `train.py` holds out for calibration, since a calibration person must not be spiked. The spiked samples
+   go to `simulated_expansions/work_spiked_samples/`, and their lower-coverage copies, each with a matched control, to
+   `simulated_expansions/work_lower_coverage_copies_of_spiked_samples/`; the two folders' `tables/` subfolders are
+   `train_model.sh`'s `SPIKED_TABLES_DIRS`.
 
 Step 1 needs `gcloud`/`gsutil` authenticated with read access to `gs://tandem-repeat-explorer` and
 `gs://str-truth-set-v2`; the Hail Batch steps need a billing project. Step 3 reads the CRAMs of all 133 people
 (training and held-out) and step 4 those of the spiked training people, listed in a `short_read_paths.tsv` at the
 repository root that is not committed (tab-separated, with the columns `sample_label`, `reads_path` and
-`reads_index_path`); step 4 also needs samtools, bwa and a local hg38 (see `simulated_expansions/README.md`).
+`reads_index_path`); step 4 also needs samtools, bwa, a local hg38 and the bwa index of the hg38 the reads were aligned
+to (see `simulated_expansions/README.md`).
 
 ## Model structure
 

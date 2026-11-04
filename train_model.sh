@@ -23,7 +23,9 @@
 #
 # Env overrides: PYTHON, BASE_DATA_DIR, SPIKED_TABLES_DIRS (space-separated), DATA_DIR, HELDOUT_DATA_DIR, MODEL_OUT,
 # TRAIN_CAP, CV_TRAIN_CAP. DATA_DIR's default is the shipped model's training folder, so setting BASE_DATA_DIR or
-# SPIKED_TABLES_DIRS requires setting DATA_DIR too.
+# SPIKED_TABLES_DIRS requires setting DATA_DIR too. The "_v4" at the end of its name marks the fourth version of the
+# spiked samples, the one the shipped model was trained on: the spiked samples of make_spiked_samples.sh plus their
+# lower-coverage copies.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,7 +38,7 @@ if [ -z "${DATA_DIR:-}" ] && { [ -n "${BASE_DATA_DIR:-}" ] || [ -n "${SPIKED_TAB
 fi
 PYTHON="${PYTHON:-python3}"
 BASE_DATA_DIR="${BASE_DATA_DIR:-$HERE/data.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth}"
-SPIKED_TABLES_DIRS="${SPIKED_TABLES_DIRS:-$HERE/simulated_expansions/work_v3/tables $HERE/simulated_expansions/work_v4/tables}"
+SPIKED_TABLES_DIRS="${SPIKED_TABLES_DIRS:-$HERE/simulated_expansions/work_spiked_samples/tables $HERE/simulated_expansions/work_lower_coverage_copies_of_spiked_samples/tables}"
 DATA_DIR="${DATA_DIR:-$HERE/data.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth_plus_simulated_expansions_v4}"
 HELDOUT_DATA_DIR="${HELDOUT_DATA_DIR:-$HERE/data_eval_43.eh_e90307c_with_homopolymer_handoff_fix_and_new_truth}"
 DATE="$(date +%Y%m%d)"

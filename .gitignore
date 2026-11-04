@@ -7,7 +7,7 @@ report/
 plots/
 _downloads/
 simulated_expansions/work/
-simulated_expansions/work_v*/
+simulated_expansions/work_*/
 *.parquet
 *.npz
 *.joblib

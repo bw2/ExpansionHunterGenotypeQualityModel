@@ -1125,11 +1125,13 @@ class AssertParquetsUpToDateTest(unittest.TestCase):
             self.assertTrue(dataset.holds_spiked_samples(d))
             self.assertIn("simulated_expansions/add_to_training_tables.py",
                           dataset.command_that_builds_branch_parquets(d, "parquet"))
+            # Every option the command needs is named (add_to_training_tables.py requires --spiked-tables-dir).
+            self.assertIn("--spiked-tables-dir", dataset.command_that_builds_branch_parquets(d, "parquet"))
             self.assertNotIn("--training-population", dataset.command_that_builds_branch_parquets(d, "parquet"))
             self.assertIn("--training-population all_loci",
                           dataset.command_that_builds_branch_parquets(d, "parquet_all_loci"))
             # An off-contract spiked part is rebuilt by the spike step's tables command.
-            self.assertIn("spike_in_expansions.py tables", dataset.rebuild_command_for(
+            self.assertIn("spike_in_expansions.py tables --work-dir", dataset.rebuild_command_for(
                 os.path.join(d, dataset.SOURCE_SUBDIR, "HG01106_spiked_0.parquet")))
             # A link to a spiked parquet that a later run removed makes the tables stale instead of crashing the check.
             os.makedirs(os.path.join(d, "parquet"))

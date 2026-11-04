@@ -17,7 +17,9 @@ like the spiked samples (``spike_in_expansions.genotype_on_hail_batch``), so the
 catalog, the ExpansionHunter build and its settings.
 
 Usage:
-    python3 simulated_expansions/compare_simulated_and_real_expansions.py --known-findings-tsv TSV \\
+    python3 simulated_expansions/compare_simulated_and_real_expansions.py \\
+        --tables-dir simulated_expansions/work_spiked_samples/tables \\
+        --manifest-tsv simulated_expansions/work_spiked_samples/spiked/manifest.tsv --known-findings-tsv TSV \\
         --real-expansion-jsons-dir DIR --run optimized_streaming_on_minicram --model LABEL=MODEL_JSON_GZ ... OUT_TSV
 """
 
@@ -135,8 +137,11 @@ def classifier_auc(real, simulated, seed=0, groups=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--tables-dir", default=os.path.join(HERE, "work", "tables"))
-    parser.add_argument("--manifest-tsv", default=os.path.join(HERE, "work", "spiked", "manifest.tsv"))
+    parser.add_argument("--tables-dir", required=True,
+                        help="the spiked samples' per-source parquets, such as make_spiked_samples.sh's "
+                             "work_spiked_samples/tables")
+    parser.add_argument("--manifest-tsv", required=True,
+                        help="their manifest, such as work_spiked_samples/spiked/manifest.tsv")
     parser.add_argument("--known-findings-tsv", required=True)
     parser.add_argument("--real-expansion-jsons-dir", required=True)
     parser.add_argument("--run", default="optimized_streaming_on_minicram")
