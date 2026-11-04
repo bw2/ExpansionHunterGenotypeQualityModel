@@ -97,10 +97,12 @@ EXPANSIONHUNTER_BW2_REPO = os.path.expanduser("~/code/ExpansionHunter-bw2")
 # ``_eh_build_is_current``).
 # The genotype-quality sources (ehunter/genotype_quality/) and the unit tests are excused for the same
 # reason as the embedded model: the former only compute the annotations eh_json never reads, the latter
-# are not in the binary.
+# are not in the binary. So are the helper scripts in utils/, .gitignore and mode_consistency_and_accuracy_tests.py
+# (a test script ExpansionHunter-bw2 no longer tracks), none of which is part of the binary.
 _FILES_THAT_DO_NOT_AFFECT_THE_EH_JSON_RE = re.compile(
     r"(\.md$|^\.github/|^docker/sha256\.txt$|^ehunter/io/VcfWriter\.(cpp|hh)$|^example/"
-    r"|^ehunter/data/genotype_quality_model[^/]*\.json\.gz$|^ehunter/genotype_quality/|^ehunter/tests/)")
+    r"|^ehunter/data/genotype_quality_model[^/]*\.json\.gz$|^ehunter/genotype_quality/|^ehunter/tests/"
+    r"|^utils/|^\.gitignore$|^mode_consistency_and_accuracy_tests\.py$)")
 _EH_CMAKE_FILE = "ehunter/CMakeLists.txt"
 # ExpansionHunter-bw2 commits that only add ways to build the binary (options that all default to OFF),
 # so the JSON a default build writes is unchanged: a JSON from the commit just before them counts as one
@@ -108,6 +110,13 @@ _EH_CMAKE_FILE = "ehunter/CMakeLists.txt"
 _BUILD_ONLY_EH_COMMITS = (
     "45c7c07",  # options to build with an installed htslib / Boost or from local source archives
     "ba9ad21",  # static htslib dependencies; option changes in an existing build directory
+)
+# ExpansionHunter-bw2 commits that change no field eh_json reads: a file changed since a JSON's commit only by these
+# doesn't make the JSON stale (``_file_changed_only_by_commits_that_change_no_eh_json_field``).
+_EH_COMMITS_THAT_CHANGE_NO_FIELD_EH_JSON_READS = (
+    "9d6ee75",  # RunInfo moved before the loci and its timing fields into a trailing RunStats record (Version stays)
+    "19ccdeb",  # --sample-id capped at 10,000 characters
+    "95979d6",  # the per-contig JSON merge reads one fixed 64 KB window at each end of a temp file
 )
 # JsonWriter.cpp also writes the JSON, so it is excused only when every changed line is one of these,
 # which hand the model its inputs (the in-repeat read count, 2026-10-05) and change no emitted field.
@@ -320,7 +329,18 @@ def _eh_build_is_current(version, head):
     return all(_FILES_THAT_DO_NOT_AFFECT_THE_EH_JSON_RE.search(f)
                or (f == _EH_CMAKE_FILE and _cmake_change_only_swaps_the_embedded_model(version))
                or (f == _EH_JSON_WRITER_FILE and _json_writer_change_only_feeds_the_model(version))
+               or _file_changed_only_by_commits_that_change_no_eh_json_field(version, f)
                for f in changed)
+
+
+def _file_changed_only_by_commits_that_change_no_eh_json_field(sha, path):
+    """Returns True iff every ExpansionHunter-bw2 commit that changed ``path`` after ``sha`` (up to HEAD) is one of
+    ``_EH_COMMITS_THAT_CHANGE_NO_FIELD_EH_JSON_READS``. False if git fails."""
+    result = subprocess.run(["git", "-C", EXPANSIONHUNTER_BW2_REPO, "log", "--format=%H", f"{sha}..HEAD", "--",
+                             path], capture_output=True, text=True)
+    commits = result.stdout.split()
+    return result.returncode == 0 and bool(commits) and all(
+        commit.startswith(_EH_COMMITS_THAT_CHANGE_NO_FIELD_EH_JSON_READS) for commit in commits)
 
 
 def _past_build_only_commits(sha):
@@ -394,9 +414,10 @@ def _json_eh_version(path):
     Scans the decompressed bytes for the key instead of parsing the JSON: these shards are ~90 MB
     gzipped and ``json.load`` cost 9 seconds and 3.3 GB of RSS to retrieve a 7-character string,
     which the freshness check pays once per shard on every run. The LAST match wins, which reproduces
-    the RunInfo-over-SampleParameters preference (ExpansionHunter writes ``SampleParameters`` at the
-    head of the file and ``RunInfo`` at the end) while still finding the fallback in an old shard
-    that has only ``SampleParameters``. ``Version`` appears nowhere else in EH's output.
+    the RunInfo-over-SampleParameters preference (ExpansionHunter wrote ``SampleParameters`` at the
+    head of the file and ``RunInfo`` at the end until 2026-11-03; it now writes ``RunInfo`` right after
+    ``SampleParameters``, which no longer has a ``Version``) while still finding the fallback in an old
+    shard that has only ``SampleParameters``. ``Version`` appears nowhere else in EH's output.
     """
     op = gzip.open if path.endswith(".gz") else open
     found, carry = None, b""

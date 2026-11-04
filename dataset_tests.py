@@ -1162,11 +1162,38 @@ class AssertEhBuildMatchesTest(unittest.TestCase):
         patcher = mock.patch.object(dataset, "_past_build_only_commits", side_effect=lambda sha: sha)
         self.past_build_only_commits = patcher.start()
         self.addCleanup(patcher.stop)
+        # FileChangedOnlyByCommitsThatChangeNoEhJsonFieldTest covers this one.
+        patcher = mock.patch.object(dataset, "_file_changed_only_by_commits_that_change_no_eh_json_field",
+                                    return_value=False)
+        self.file_changed_only_by_commits_that_change_no_eh_json_field = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _json(self, path, version):
         with gzip.open(path, "wt") as f:
             json.dump({"RunInfo": {"Version": version}}, f)
         return path
+
+    def test_older_build_with_only_files_outside_the_binary_changed_since_passes(self):
+        changed = ["utils/generate_multisample_tsv.py", ".gitignore", "mode_consistency_and_accuracy_tests.py"]
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="95979d6"), \
+             mock.patch.object(dataset, "_bw2_files_changed_since", return_value=changed):
+            p = self._json(os.path.join(d, "a.json.gz"), "5656d6a")
+            dataset.assert_eh_build_matches("combo", [("json shard 0", p)])  # must not raise
+
+    def test_older_build_with_files_changed_only_by_commits_that_change_no_eh_json_field_passes(self):
+        self.file_changed_only_by_commits_that_change_no_eh_json_field.side_effect = (
+            lambda sha, path: path == "ehunter/io/StreamingOutputMerge.cpp")
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(dataset, "_bw2_head_sha", return_value="95979d6"):
+            p = self._json(os.path.join(d, "a.json.gz"), "5656d6a")
+            with mock.patch.object(dataset, "_bw2_files_changed_since",
+                                   return_value=["ehunter/io/StreamingOutputMerge.cpp"]):
+                dataset.assert_eh_build_matches("combo", [("json shard 0", p)])  # must not raise
+            with mock.patch.object(dataset, "_bw2_files_changed_since",
+                                   return_value=["ehunter/io/StreamingOutputMerge.cpp", "ehunter/app/Main.cpp"]):
+                with self.assertRaises(SystemExit):
+                    dataset.assert_eh_build_matches("combo", [("json shard 0", p)])
 
     def test_mismatched_build_sha_exits(self):
         with tempfile.TemporaryDirectory() as d, \
@@ -1307,6 +1334,25 @@ class PastBuildOnlyCommitsTest(unittest.TestCase):
 
     def test_unknown_commit_is_returned_unchanged(self):
         self.assertEqual(self._past(self.OTHER, git_ok=False), self.OTHER[:7])
+
+
+class FileChangedOnlyByCommitsThatChangeNoEhJsonFieldTest(unittest.TestCase):
+    def test_only_listed_commits_excuse_a_file(self):
+        layout_commit = "9d6ee75d10c07dbce02ba050a651bbb28ddd54ec"
+        sample_id_cap_commit = "19ccdeb635feea7e1bb67c1fe4489d3bbf83d8fa"
+        other_commit = "5656d6a" + "0" * 33
+        cases = [
+            (f"{sample_id_cap_commit}\n{layout_commit}\n", 0, True),
+            (f"{sample_id_cap_commit}\n{other_commit}\n", 0, False),
+            ("", 0, False),
+            (f"{layout_commit}\n", 128, False),
+        ]
+        for stdout, returncode, expected in cases:
+            with self.subTest(stdout=stdout, returncode=returncode), \
+                 mock.patch.object(dataset.subprocess, "run",
+                                   return_value=mock.Mock(returncode=returncode, stdout=stdout)):
+                self.assertEqual(dataset._file_changed_only_by_commits_that_change_no_eh_json_field(
+                    "5656d6a", "ehunter/io/JsonWriter.cpp"), expected)
 
 
 class AssertPartsShareFeatureContractTest(unittest.TestCase):
